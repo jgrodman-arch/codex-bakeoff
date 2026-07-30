@@ -6,11 +6,15 @@ from __future__ import annotations
 import json
 import os
 import re
-import tomllib
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9 and 3.10.
+    tomllib = None  # type: ignore[assignment]
 
 NATIVE_TOOLS = {
     "Bash": "Codex sandboxed shell",
@@ -47,10 +51,35 @@ def _configured_codex_home() -> Path:
 def _read_codex_config() -> dict[str, Any]:
     path = _configured_codex_home() / "config.toml"
     try:
-        loaded = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
         return {}
-    return loaded if isinstance(loaded, dict) else {}
+    if tomllib is not None:
+        try:
+            loaded = tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    connectors: dict[str, dict[str, Any]] = {}
+    table = re.compile(
+        r"""^\s*\[\s*(?:mcp_servers|mcpServers)\s*\.\s*
+        (?:"(?P<double>(?:[^"\\]|\\.)+)"|'(?P<single>[^']+)'|(?P<bare>[A-Za-z0-9_-]+))
+        (?:\s*\.[^\]]+)?\s*\]\s*(?:\#.*)?$""",
+        re.VERBOSE,
+    )
+    for line in text.splitlines():
+        match = table.match(line)
+        if match is None:
+            continue
+        name = match.group("double") or match.group("single") or match.group("bare")
+        if match.group("double"):
+            try:
+                name = json.loads(f'"{name}"')
+            except json.JSONDecodeError:
+                continue
+        connectors.setdefault(name, {})
+    return {"mcp_servers": connectors} if connectors else {}
 
 
 def _identity(value: object) -> str:

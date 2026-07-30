@@ -62,6 +62,19 @@ class LeanCapabilityTests(unittest.TestCase):
         self.assertEqual(ready["items"][0]["status"], "available_and_ready")
         self.assertEqual(ready["unresolved_blockers"], [])
 
+    def test_connector_config_loads_without_stdlib_tomllib(self) -> None:
+        (self.codex_home / "config.toml").write_text(
+            '[mcp_servers."company.slack"]\ncommand = "slack"\n'
+            "[mcpServers.github]\ncommand = 'github'\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(capabilities, "tomllib", None):
+            config = capabilities._read_codex_config()
+        self.assertEqual(
+            capabilities._configured_connectors(config),
+            {"company.slack", "github"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

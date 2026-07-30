@@ -102,7 +102,7 @@ class HistoricalExecutionError(RuntimeError):
     """A lean bakeoff execution could not be recorded."""
 
 
-@dataclass(slots=True)
+@dataclass
 class UsageRecord:
     provider: str
     model: str
@@ -115,7 +115,7 @@ class UsageRecord:
     message_id: str | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class CandidateSolution:
     provider: str
     diff: str
@@ -207,8 +207,11 @@ def usage_from_payload(
 def _parse_time(value: object) -> dt.datetime | None:
     if not isinstance(value, str) or not value:
         return None
+    normalized = value
+    if normalized.endswith(("Z", "z")):
+        normalized = normalized[:-1] + "+00:00"
     try:
-        parsed = dt.datetime.fromisoformat(value)
+        parsed = dt.datetime.fromisoformat(normalized)
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)

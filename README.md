@@ -6,7 +6,7 @@ selection, approval, execution, verification, blinded review, and reporting.
 
 ## Prerequisites
 
-- macOS or Linux with Python 3.11 or newer, Node.js 18 or newer, Git, and
+- macOS or Linux with Python 3.9 or newer, Node.js 18 or newer, Git, and
   `lsof`.
 - The current Codex CLI installed, authenticated, and available as `codex`, or
   its path set in `CODEX_CLI_PATH`.

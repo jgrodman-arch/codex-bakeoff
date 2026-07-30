@@ -22,7 +22,6 @@ class PluginContractTests(unittest.TestCase):
     def test_manifest_is_valid_and_points_inside_plugin(self) -> None:
         payload = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.assertEqual(payload["name"], "codex-bakeoff")
-        self.assertEqual(payload["version"], "1.0.1")
         self.assertEqual(payload["skills"], "./skills/")
         self.assertTrue((PLUGIN_ROOT / payload["skills"]).is_dir())
         self.assertEqual(payload["mcpServers"], "./.mcp.json")

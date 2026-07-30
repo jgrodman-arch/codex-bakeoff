@@ -1387,7 +1387,7 @@ def _decode_candidate_patch(root: Path, patch_bytes: bytes) -> str:
         raise FileSelectionError("Git returned inconsistent candidate patches.")
 
     decoded: list[str] = []
-    for original, binary in zip(original_chunks, binary_chunks, strict=True):
+    for original, binary in zip(original_chunks, binary_chunks):
         if original.partition(b"\n")[0] != binary.partition(b"\n")[0]:
             raise FileSelectionError("Git returned inconsistent candidate patches.")
         try:

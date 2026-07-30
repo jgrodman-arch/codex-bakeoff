@@ -18,7 +18,6 @@ import re
 import stat
 import subprocess
 import sys
-import tomllib
 from collections import Counter, deque
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -232,8 +231,11 @@ def _parse_timestamp(value: object) -> datetime | None:
             return None
     if not isinstance(value, str) or not value.strip():
         return None
+    normalized = value.strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = normalized[:-1] + "+00:00"
     try:
-        parsed = datetime.fromisoformat(value.strip())
+        parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None
     if parsed.tzinfo is None:

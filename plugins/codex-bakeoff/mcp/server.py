@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+MINIMUM_PYTHON = (3, 9)
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PLUGIN_ROOT / "scripts" / "historical_bakeoff.py"
 APP_HTML = Path(__file__).resolve().parent / "controller.html"
@@ -104,6 +105,36 @@ class PortConflictError(ControllerError):
         super().__init__(
             f"Port {port} is already in use by {process_name} (PID {pid})."
         )
+
+
+def _python_runtime_issue(version_info: Any = None) -> dict[str, Any] | None:
+    detected = sys.version_info if version_info is None else version_info
+    version = tuple(int(part) for part in detected[:3])
+    if version[:2] >= MINIMUM_PYTHON:
+        return None
+    detected_version = ".".join(str(part) for part in version)
+    required_version = ".".join(str(part) for part in MINIMUM_PYTHON) + "+"
+    return {
+        "kind": "dependency",
+        "dependency": "python",
+        "status": "unsupported",
+        "detected_version": detected_version,
+        "required_version": required_version,
+        "executable": sys.executable,
+        "message": (
+            f"Codex Bakeoff requires Python {required_version}; "
+            f"{detected_version} is running from {sys.executable}."
+        ),
+    }
+
+
+def _python_runtime_error_result() -> dict[str, Any] | None:
+    issue = _python_runtime_issue()
+    if issue is None:
+        return None
+    result = _text_result(str(issue["message"]), {"opened": False, "issue": issue})
+    result["isError"] = True
+    return result
 
 
 def _utc_now() -> str:
@@ -1946,8 +1977,14 @@ def _call_tool(params: Any) -> dict[str, Any]:
     name = str(params.get("name") or "")
     arguments = _argument_object(params)
     if name == "open_controller":
+        runtime_error = _python_runtime_error_result()
+        if runtime_error is not None:
+            return runtime_error
         return _open_external_controller()
     if name == "stop_port_process_and_open_controller":
+        runtime_error = _python_runtime_error_result()
+        if runtime_error is not None:
+            return runtime_error
         if arguments.get("confirmed") is not True:
             raise ControllerError("Explicit user confirmation is required.")
         token = arguments.get("confirmation_token")

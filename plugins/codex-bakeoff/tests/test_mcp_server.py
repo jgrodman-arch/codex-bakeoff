@@ -10,6 +10,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -32,6 +33,34 @@ def load_server():
 
 
 class McpServerTests(unittest.TestCase):
+    def test_python_39_is_supported_and_38_is_reported(self) -> None:
+        server = load_server()
+        self.assertIsNone(server._python_runtime_issue((3, 9, 0)))
+        issue = server._python_runtime_issue((3, 8, 20))
+        self.assertEqual(issue["dependency"], "python")
+        self.assertEqual(issue["status"], "unsupported")
+        self.assertEqual(issue["detected_version"], "3.8.20")
+        self.assertEqual(issue["required_version"], "3.9+")
+
+    def test_launcher_reports_unsupported_python_before_starting_controller(self) -> None:
+        server = load_server()
+        issue = {
+            "kind": "dependency",
+            "dependency": "python",
+            "status": "unsupported",
+            "message": "Python is unsupported.",
+        }
+        with (
+            mock.patch.object(server, "_python_runtime_issue", return_value=issue),
+            mock.patch.object(server, "_ensure_controller_daemon") as ensure,
+        ):
+            result = server._call_tool({"name": "open_controller", "arguments": {}})
+
+        ensure.assert_not_called()
+        self.assertTrue(result["isError"])
+        self.assertFalse(result["structuredContent"]["opened"])
+        self.assertEqual(result["structuredContent"]["issue"], issue)
+
     def test_only_external_browser_launcher_is_model_visible(self) -> None:
         server = load_server()
         tools = server.tool_definitions()
@@ -60,7 +89,7 @@ class McpServerTests(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}},
         ]
         completed = subprocess.run(
-            ["python3", str(SERVER_PATH)],
+            [sys.executable, str(SERVER_PATH)],
             cwd=PLUGIN_ROOT,
             input="\n".join(json.dumps(item) for item in requests) + "\n",
             check=True,
@@ -391,7 +420,7 @@ class McpServerTests(unittest.TestCase):
                 "CLAUDE_BAKEOFF_CONTROLLER_PORT": str(port),
             }
             process = subprocess.Popen(
-                ["python3", str(SERVER_PATH), "--http"],
+                [sys.executable, str(SERVER_PATH), "--http"],
                 cwd=PLUGIN_ROOT,
                 env=environment,
                 stdout=subprocess.PIPE,

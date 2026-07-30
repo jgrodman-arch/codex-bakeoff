@@ -21,6 +21,11 @@ SPEC.loader.exec_module(execution)
 
 
 class LeanExecutionTests(unittest.TestCase):
+    def test_parse_time_accepts_utc_z_suffix(self) -> None:
+        parsed = execution._parse_time("2026-07-30T12:34:56Z")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.isoformat(), "2026-07-30T12:34:56+00:00")
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
