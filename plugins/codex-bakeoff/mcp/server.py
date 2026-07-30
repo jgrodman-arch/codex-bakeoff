@@ -137,6 +137,21 @@ def _python_runtime_error_result() -> dict[str, Any] | None:
     return result
 
 
+def _node_runtime() -> str:
+    configured = os.environ.get("CODEX_MCP_NODE_PATH")
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    executable = shutil.which("node")
+    if executable is not None:
+        return executable
+    raise ControllerError(
+        "Node.js 18 or newer could not be found. Install Node.js or set "
+        "CODEX_MCP_NODE_PATH to an executable Node runtime."
+    )
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1509,7 +1524,7 @@ def _run_worker(
     )
     timeout = int(payload["timeoutSeconds"]) + 90
     completed = _run_process(
-        ["node", str(WORKER)],
+        [_node_runtime(), str(WORKER)],
         input_text=json.dumps(payload, ensure_ascii=False) + "\n",
         cwd=PLUGIN_ROOT,
         timeout=timeout,

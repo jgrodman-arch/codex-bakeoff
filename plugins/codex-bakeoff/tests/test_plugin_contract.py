@@ -83,6 +83,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(server["command"], "python3")
         self.assertEqual(server["args"], ["./mcp/server.py"])
         self.assertEqual(server["cwd"], ".")
+        self.assertIn("CODEX_MCP_NODE_PATH", server["env_vars"])
+        self.assertIn("PATH", server["env_vars"])
         self.assertIn("CLAUDE_BAKEOFF_CONTROLLER_PORT", server["env_vars"])
         self.assertTrue(MCP_SERVER.is_file())
         self.assertTrue(MCP_CONTROLLER.is_file())

@@ -61,6 +61,31 @@ class McpServerTests(unittest.TestCase):
         self.assertFalse(result["structuredContent"]["opened"])
         self.assertEqual(result["structuredContent"]["issue"], issue)
 
+    def test_node_runtime_prefers_forwarded_codex_runtime(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            node = Path(temporary) / "node"
+            node.touch()
+            node.chmod(0o700)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"CODEX_MCP_NODE_PATH": str(node), "PATH": ""},
+                    clear=True,
+                ),
+                mock.patch.object(server.shutil, "which", return_value=None),
+            ):
+                self.assertEqual(server._node_runtime(), str(node))
+
+    def test_node_runtime_reports_missing_dependency(self) -> None:
+        server = load_server()
+        with (
+            mock.patch.dict(os.environ, {"PATH": ""}, clear=True),
+            mock.patch.object(server.shutil, "which", return_value=None),
+        ):
+            with self.assertRaisesRegex(server.ControllerError, "Node.js 18 or newer"):
+                server._node_runtime()
+
     def test_only_external_browser_launcher_is_model_visible(self) -> None:
         server = load_server()
         tools = server.tool_definitions()
@@ -695,7 +720,7 @@ class McpServerTests(unittest.TestCase):
     def test_worker_failure_prefers_structured_error_over_stderr_warning(self) -> None:
         server = load_server()
         completed = subprocess.CompletedProcess(
-            args=["node", "worker.mjs"],
+            args=["/runtime/node", "worker.mjs"],
             returncode=1,
             stdout=(
                 '{"type":"ready","protocolVersion":1}\n'
@@ -704,7 +729,14 @@ class McpServerTests(unittest.TestCase):
             ),
             stderr="unrelated runtime warning",
         )
-        with mock.patch.object(server, "_run_process", return_value=completed):
+        with (
+            mock.patch.object(server, "_node_runtime", return_value="/runtime/node"),
+            mock.patch.object(
+                server,
+                "_run_process",
+                return_value=completed,
+            ) as run_process,
+        ):
             with self.assertRaisesRegex(
                 server.ControllerError,
                 "stream_error: Codex reported an unrecoverable stream error",
@@ -718,6 +750,10 @@ class McpServerTests(unittest.TestCase):
                     working_directory=PLUGIN_ROOT,
                     read_only=True,
                 )
+        self.assertEqual(
+            run_process.call_args.args[0],
+            ["/runtime/node", str(server.WORKER)],
+        )
 
     def test_get_report_accepts_report_larger_than_legacy_limit(self) -> None:
         server = load_server()
