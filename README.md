@@ -46,7 +46,7 @@ Codex import ledger, and invokes the local Codex CLI. Runs and reports are store
 under `~/.cache/claude-bakeoff/`. The selected source project is not modified;
 implementation work runs in an isolated workspace.
 
-## Build and test
+## Development
 
 From the repository root:
 
