@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Bakeoff"
+  short_description: "Open the bakeoff controller in your browser"
+  default_prompt: "Use $codex-bakeoff to open the external-browser controller now. Do not run the workflow in chat."

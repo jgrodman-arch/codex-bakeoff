@@ -1,0 +1,40 @@
+{
+  "name": "codex-bakeoff",
+  "version": "0.4.26",
+  "description": "Run a Codex bakeoff from an external-browser controller.",
+  "author": {
+    "name": "OpenAI FDE",
+    "url": "https://github.com/jgrodman-arch/codex-bakeoff"
+  },
+  "homepage": "https://github.com/jgrodman-arch/codex-bakeoff",
+  "repository": "https://github.com/jgrodman-arch/codex-bakeoff",
+  "license": "Apache-2.0",
+  "keywords": [
+    "codex",
+    "bakeoff",
+    "evaluation"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Codex Bakeoff",
+    "shortDescription": "Run a bakeoff entirely in your external browser.",
+    "longDescription": "Open an external-browser controller to select one imported historical Claude thread, choose a Codex model, classify the baseline, approve one native Codex implementation, follow live progress, and review the blinded comparison. Selection, execution, verification, evaluation, and results stay in the controller instead of a guided chat workflow.",
+    "developerName": "OpenAI FDE",
+    "category": "Productivity",
+    "websiteURL": "https://github.com/jgrodman-arch/codex-bakeoff",
+    "brandColor": "#3867D6",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Open the Codex Bakeoff controller in my external browser.",
+      "Open the external-browser controller so I can select and run a historical bakeoff.",
+      "Open the external-browser controller so I can review my bakeoff runs."
+    ]
+  }
+}

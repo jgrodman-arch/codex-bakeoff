@@ -1,0 +1,20 @@
+{
+  "name": "codex-bakeoff",
+  "interface": {
+    "displayName": "Codex Bakeoff"
+  },
+  "plugins": [
+    {
+      "name": "codex-bakeoff",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-bakeoff"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

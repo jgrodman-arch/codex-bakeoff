@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "codex-bakeoff": {
+      "command": "python3",
+      "args": [
+        "./mcp/server.py"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "CODEX_HOME",
+        "CODEX_SQLITE_HOME",
+        "CODEX_API_KEY",
+        "CODEX_CLI_PATH",
+        "CLAUDE_BAKEOFF_RUN_ROOT",
+        "CLAUDE_BAKEOFF_DENIED_HOSTS",
+        "CLAUDE_BAKEOFF_CONTROLLER_PORT"
+      ],
+      "tool_timeout_sec": 300
+    }
+  }
+}

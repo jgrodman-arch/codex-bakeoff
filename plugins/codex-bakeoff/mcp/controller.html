@@ -1,0 +1,3160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Bakeoff</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --panel: #151b23;
+      --panel-raised: #1b2330;
+      --panel-soft: #111720;
+      --text: #f2f5f8;
+      --muted: #9ca9b8;
+      --faint: #748191;
+      --line: #2b3543;
+      --line-strong: #3c4858;
+      --accent: #8cb4ff;
+      --accent-strong: #a8c6ff;
+      --accent-soft: rgba(91, 140, 230, .16);
+      --good: #66d19e;
+      --good-soft: rgba(64, 180, 125, .13);
+      --warn: #e7bd67;
+      --warn-soft: rgba(210, 157, 54, .14);
+      --bad: #ff8d93;
+      --bad-soft: rgba(221, 83, 93, .14);
+      --shadow: 0 18px 50px rgba(0, 0, 0, .25);
+      --radius: 12px;
+      --radius-sm: 8px;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        sans-serif;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        color-scheme: light;
+        --bg: #f8f9fb;
+        --panel: #ffffff;
+        --panel-raised: #ffffff;
+        --panel-soft: #f4f6f9;
+        --text: #17202b;
+        --muted: #5e6a78;
+        --faint: #7d8794;
+        --line: #dfe4eb;
+        --line-strong: #cbd3dd;
+        --accent: #315fae;
+        --accent-strong: #234d94;
+        --accent-soft: rgba(49, 95, 174, .09);
+        --good: #19744a;
+        --good-soft: rgba(25, 116, 74, .08);
+        --warn: #8d630d;
+        --warn-soft: rgba(141, 99, 13, .09);
+        --bad: #b43842;
+        --bad-soft: rgba(180, 56, 66, .08);
+        --shadow: 0 18px 50px rgba(26, 38, 54, .12);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    button, input, select { font: inherit; }
+
+    button, input, select, summary { outline: none; }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    summary:focus-visible {
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 34%, transparent);
+    }
+
+    button { color: inherit; }
+
+    .app {
+      width: min(1180px, 100%);
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 218px minmax(0, 1fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    .step-rail {
+      position: sticky;
+      top: 22px;
+      padding: 4px 0;
+    }
+
+    .step-rail__label {
+      margin: 0 0 14px 10px;
+      color: var(--faint);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+    }
+
+    .steps {
+      display: grid;
+      gap: 4px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .step-button {
+      display: grid;
+      width: 100%;
+      grid-template-columns: 24px 1fr;
+      gap: 10px;
+      align-items: center;
+      padding: 10px;
+      border: 0;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      text-align: left;
+      cursor: default;
+    }
+
+    .step-button[data-clickable="true"] { cursor: pointer; }
+    .step-button[data-clickable="true"]:hover { background: var(--panel-soft); }
+    .step-button[aria-current="step"] { background: var(--accent-soft); }
+
+    .step-number {
+      display: grid;
+      width: 24px;
+      height: 24px;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .step-button[aria-current="step"] .step-number {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #0d1523;
+    }
+
+    .step-button[data-state="complete"] .step-number {
+      border-color: var(--good);
+      background: var(--good-soft);
+      color: var(--good);
+    }
+
+    .step-copy { min-width: 0; }
+    .step-name { display: block; font-weight: 650; }
+    .step-state {
+      display: block;
+      margin-top: 1px;
+      color: var(--faint);
+      font-size: 11px;
+    }
+
+    .workspace { min-width: 0; }
+
+    .page-heading {
+      margin-bottom: 20px;
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 34px);
+      letter-spacing: -.025em;
+      line-height: 1.16;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: -.008em;
+    }
+
+    h3 {
+      margin: 0;
+      font-size: 14px;
+    }
+
+    p { margin: 0; }
+
+    .lede {
+      max-width: 760px;
+      margin-top: 8px;
+      color: var(--muted);
+    }
+
+    .banner {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      margin-bottom: 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--panel-soft);
+    }
+
+    .banner--error {
+      border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
+      background: var(--bad-soft);
+    }
+
+    .banner--warning {
+      border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+      background: var(--warn-soft);
+    }
+
+    .banner--success {
+      border-color: color-mix(in srgb, var(--good) 45%, var(--line));
+      background: var(--good-soft);
+    }
+
+    .banner__mark {
+      flex: 0 0 auto;
+      width: 18px;
+      height: 18px;
+      border: 1px solid currentColor;
+      border-radius: 50%;
+      text-align: center;
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 16px;
+    }
+
+    .banner__body { min-width: 0; }
+    .banner__body strong { display: block; margin-bottom: 2px; }
+    .banner__body p, .banner__body li { color: var(--muted); }
+    .banner__body ul { margin: 6px 0 0; padding-left: 20px; }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: 0 1px 0 rgba(255,255,255,.02);
+    }
+
+    .panel + .panel { margin-top: 14px; }
+
+    .panel__header {
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+      justify-content: space-between;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel__header p {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .panel__body { padding: 18px; }
+
+    .panel__body--flush { padding: 0; }
+
+    .search {
+      position: relative;
+      margin-bottom: 14px;
+    }
+
+    .search input {
+      width: 100%;
+      min-height: 42px;
+      padding: 9px 12px 9px 36px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-sm);
+      background: var(--panel-soft);
+      color: var(--text);
+    }
+
+    .search input::placeholder { color: var(--faint); }
+
+    .search__icon {
+      position: absolute;
+      top: 12px;
+      left: 13px;
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--faint);
+      border-radius: 50%;
+      pointer-events: none;
+    }
+
+    .search__icon::after {
+      position: absolute;
+      right: -5px;
+      bottom: -3px;
+      width: 6px;
+      height: 2px;
+      transform: rotate(45deg);
+      border-radius: 1px;
+      background: var(--faint);
+      content: "";
+    }
+
+    .thread-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .thread {
+      display: grid;
+      width: 100%;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel-soft);
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .thread:hover {
+      border-color: var(--line-strong);
+      background: var(--panel-raised);
+    }
+
+    .thread__title {
+      display: block;
+      overflow: hidden;
+      font-weight: 670;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .thread__meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px 12px;
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .thread__project {
+      max-width: 520px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .arrow {
+      color: var(--faint);
+      font-size: 20px;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .summary-card {
+      min-width: 0;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel-soft);
+    }
+
+    .summary-card h2 { margin-bottom: 12px; }
+
+    .metrics {
+      display: grid;
+      gap: 0;
+      margin: 0;
+    }
+
+    .metric {
+      display: grid;
+      grid-template-columns: minmax(120px, .7fr) minmax(0, 1.3fr);
+      gap: 14px;
+      padding: 8px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .metric:first-child { border-top: 0; padding-top: 0; }
+    .metric:last-child { padding-bottom: 0; }
+    .metric dt { color: var(--muted); }
+    .metric dd { min-width: 0; margin: 0; overflow-wrap: anywhere; text-align: right; }
+    .metric code { font-size: 12px; }
+
+    .metric--better,
+    .metric--worse {
+      margin: 0 -10px;
+      padding-right: 10px;
+      padding-left: 10px;
+      border-radius: var(--radius-sm);
+    }
+
+    .metric--better { background: var(--good-soft); }
+    .metric--worse { background: var(--bad-soft); }
+    .metric--better dd { color: var(--good); font-weight: 750; }
+    .metric--worse dd { color: var(--bad); font-weight: 750; }
+
+    .token-label {
+      position: relative;
+      cursor: help;
+      text-decoration: underline dotted;
+      text-underline-offset: 3px;
+    }
+
+    .token-tooltip {
+      position: absolute;
+      z-index: 3;
+      top: calc(100% + 4px);
+      left: 0;
+      display: none;
+      width: min(300px, 75vw);
+      padding: 9px 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-sm);
+      background: var(--panel-raised);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 400;
+      line-height: 1.4;
+      text-decoration: none;
+      box-shadow: var(--shadow);
+    }
+
+    .token-label:hover .token-tooltip,
+    .token-label:focus .token-tooltip { display: block; }
+
+    .pill {
+      display: inline-flex;
+      gap: 5px;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    .pill--good {
+      border-color: color-mix(in srgb, var(--good) 45%, var(--line));
+      background: var(--good-soft);
+      color: var(--good);
+    }
+
+    .pill--warning {
+      border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+      background: var(--warn-soft);
+      color: var(--warn);
+    }
+
+    .pill--bad {
+      border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
+      background: var(--bad-soft);
+      color: var(--bad);
+    }
+
+    .capability-list, .plain-list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .capability {
+      display: grid;
+      grid-template-columns: 8px minmax(0, 1fr);
+      gap: 9px;
+      align-items: start;
+    }
+
+    .capability__dot {
+      width: 7px;
+      height: 7px;
+      margin-top: 6px;
+      border-radius: 50%;
+      background: var(--good);
+    }
+
+    .capability--warning .capability__dot { background: var(--warn); }
+    .capability--bad .capability__dot { background: var(--bad); }
+    .capability small { display: block; color: var(--muted); }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(160px, .5fr);
+      gap: 14px;
+    }
+
+    .field label, .field__label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 12px;
+      font-weight: 680;
+    }
+
+    .field select, .field input[type="number"], .field input[type="text"] {
+      width: 100%;
+      min-height: 40px;
+      padding: 8px 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-sm);
+      background: var(--panel-soft);
+      color: var(--text);
+    }
+
+    .field small {
+      display: block;
+      margin-top: 5px;
+      color: var(--muted);
+    }
+
+    .file-list {
+      display: grid;
+      gap: 0;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .file-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      min-height: 52px;
+      padding: 10px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .file-row:first-child { border-top: 0; }
+
+    .file-copy { min-width: 0; }
+    .file-path {
+      display: block;
+      overflow: hidden;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .file-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 9px;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .choice {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      cursor: pointer;
+    }
+
+    .choice input { accent-color: var(--accent); }
+    .choice[aria-disabled="true"] { color: var(--muted); cursor: not-allowed; }
+
+    .segmented {
+      display: inline-flex;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+    }
+
+    .segment {
+      position: relative;
+      display: inline-flex;
+    }
+
+    .segment input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+    }
+
+    .segment span {
+      padding: 6px 8px;
+      border-radius: 5px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .segment input:checked + span {
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+    }
+
+    .segment input:disabled + span {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+
+    .attestation {
+      display: grid;
+      gap: 8px;
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--panel-soft);
+    }
+
+    .attestation legend {
+      padding: 0 4px;
+      font-weight: 680;
+    }
+
+    .footer-actions {
+      position: sticky;
+      z-index: 2;
+      bottom: 0;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: flex-end;
+      margin-top: 18px;
+      padding: 14px 0 max(8px, env(safe-area-inset-bottom));
+      background: linear-gradient(to bottom, transparent, var(--bg) 18%, var(--bg));
+    }
+
+    .footer-actions__note {
+      margin-right: auto;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .button {
+      display: inline-flex;
+      min-height: 38px;
+      gap: 7px;
+      align-items: center;
+      justify-content: center;
+      padding: 8px 13px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-sm);
+      background: var(--panel-raised);
+      color: var(--text);
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    .button:hover:not(:disabled) { border-color: var(--faint); }
+
+    .button--primary {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #0b1526;
+    }
+
+    .button--primary:hover:not(:disabled) { background: var(--accent-strong); }
+
+    .button--quiet { background: transparent; }
+
+    .button:disabled {
+      opacity: .46;
+      cursor: not-allowed;
+    }
+
+    .spinner {
+      width: 14px;
+      height: 14px;
+      animation: spin .8s linear infinite;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .review-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .review-item {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--panel-soft);
+    }
+
+    .review-item span {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .review-item strong, .review-item code {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+
+    details {
+      margin-top: 14px;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 650;
+    }
+
+    pre {
+      max-height: 420px;
+      margin: 10px 0 0;
+      padding: 12px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--panel-soft);
+      color: var(--text);
+      font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .phase-list {
+      display: grid;
+      gap: 0;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .phase {
+      position: relative;
+      display: grid;
+      grid-template-columns: 24px minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      min-height: 48px;
+    }
+
+    .phase:not(:last-child)::after {
+      position: absolute;
+      top: 34px;
+      bottom: -14px;
+      left: 11px;
+      width: 1px;
+      background: var(--line);
+      content: "";
+    }
+
+    .phase__mark {
+      z-index: 1;
+      display: grid;
+      width: 24px;
+      height: 24px;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      background: var(--panel);
+      color: var(--faint);
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .phase--running .phase__mark {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .phase--running .phase__mark::before {
+      width: 8px;
+      height: 8px;
+      animation: pulse 1.3s ease-in-out infinite;
+      border-radius: 50%;
+      background: currentColor;
+      content: "";
+    }
+
+    @keyframes pulse {
+      50% { transform: scale(.7); opacity: .45; }
+    }
+
+    .phase--complete .phase__mark {
+      border-color: var(--good);
+      background: var(--good-soft);
+      color: var(--good);
+    }
+
+    .phase--failed .phase__mark {
+      border-color: var(--bad);
+      background: var(--bad-soft);
+      color: var(--bad);
+    }
+
+    .phase__name { font-weight: 650; }
+    .phase__state { color: var(--muted); font-size: 11px; text-transform: capitalize; }
+
+    .activity {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .activity li {
+      display: grid;
+      grid-template-columns: 84px minmax(0, 1fr);
+      gap: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .activity time { color: var(--faint); font-variant-numeric: tabular-nums; }
+
+    .result-hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: center;
+      padding: 20px;
+      border: 1px solid color-mix(in srgb, var(--good) 38%, var(--line));
+      border-radius: var(--radius);
+      background: var(--good-soft);
+    }
+
+    .result-hero h1 { font-size: 27px; }
+    .result-hero p { margin-top: 6px; color: var(--muted); }
+
+    .score {
+      font-size: 24px;
+      font-weight: 780;
+      letter-spacing: -.03em;
+      white-space: nowrap;
+    }
+
+    .provider-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .provider {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .provider h2 { margin-bottom: 12px; }
+
+    .table-wrap { overflow: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th, td {
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th { color: var(--muted); font-size: 11px; font-weight: 680; }
+    td { font-size: 12px; }
+    tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
+
+    .empty {
+      padding: 34px 18px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .skeleton {
+      height: 72px;
+      animation: shimmer 1.2s ease-in-out infinite alternate;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel-soft);
+      opacity: .6;
+    }
+
+    @keyframes shimmer { to { opacity: .9; } }
+
+    dialog {
+      width: min(680px, calc(100vw - 32px));
+      max-height: min(820px, calc(100vh - 32px));
+      padding: 0;
+      overflow: auto;
+      border: 1px solid var(--line-strong);
+      border-radius: 14px;
+      background: var(--panel-raised);
+      color: var(--text);
+      box-shadow: var(--shadow);
+    }
+
+    dialog::backdrop { background: rgba(3, 7, 12, .72); }
+
+    .dialog__header {
+      padding: 20px 20px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .dialog__header h2 { font-size: 20px; }
+    .dialog__header p { margin-top: 5px; color: var(--muted); }
+    .dialog__body { padding: 18px 20px; }
+    .dialog__footer {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      padding: 14px 20px 20px;
+    }
+
+    .approval-promises {
+      display: grid;
+      gap: 8px;
+      margin: 16px 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .approval-promises li {
+      display: grid;
+      grid-template-columns: 18px minmax(0, 1fr);
+      gap: 8px;
+    }
+
+    .approval-promises li::before {
+      color: var(--good);
+      font-weight: 800;
+      content: "✓";
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    @media (max-width: 780px) {
+      .app { padding: 16px; }
+      .layout { grid-template-columns: 1fr; gap: 16px; }
+      .step-rail { position: static; overflow-x: auto; }
+      .step-rail__label { display: none; }
+      .steps { display: flex; min-width: max-content; }
+      .step-button { width: auto; grid-template-columns: 22px auto; padding: 8px; }
+      .step-state { display: none; }
+      .step-number { width: 22px; height: 22px; }
+      .grid-2, .provider-grid, .review-grid, .field-grid { grid-template-columns: 1fr; }
+      .file-row { grid-template-columns: 1fr; gap: 7px; }
+      .segmented { width: 100%; }
+      .segment { flex: 1; }
+      .segment span { width: 100%; text-align: center; }
+      .metric { grid-template-columns: 1fr; gap: 2px; }
+      .metric dd { text-align: left; }
+      .result-hero { grid-template-columns: 1fr; }
+      .footer-actions { flex-wrap: wrap; }
+      .footer-actions__note { width: 100%; margin: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="app">
+    <p class="empty">Connecting to the local bakeoff controller…</p>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const STEPS = [
+        { id: "thread", name: "Choose thread", short: "Imported history" },
+        { id: "configure", name: "Configure", short: "Baseline and files" },
+        { id: "review", name: "Review", short: "Exact configuration" },
+        { id: "run", name: "Run", short: "Isolated replay" },
+        { id: "results", name: "Results", short: "Comparison report" },
+      ];
+
+      const DEFAULT_PHASES = [
+        ["preparing", "Preparing configuration"],
+        ["creating_workspace", "Creating isolated workspace"],
+        ["implementing", "Implementing with Codex"],
+        ["collecting", "Capturing result"],
+        ["verifying", "Running shared verification"],
+        ["reviewing", "Running blind review"],
+        ["reporting", "Finalizing report"],
+      ];
+
+      const DRAFT_STORAGE_KEY = "claude-bakeoff.controller-draft.v1";
+      const CONTROLLER_SESSION_STORAGE_KEY = "claude-bakeoff.controller-session.v1";
+      const DRAFT_VERSION = 1;
+      const DRAFT_STEPS = new Set(["thread", "configure", "review"]);
+
+      const state = {
+        step: "thread",
+        hostReady: false,
+        loading: true,
+        busy: "",
+        error: "",
+        notice: "",
+        threads: [],
+        totalThreads: 0,
+        query: "",
+        selectedThreadId: "",
+        selectedThread: null,
+        inspection: null,
+        models: [],
+        model: "",
+        timeoutSeconds: 1800,
+        classifications: Object.create(null),
+        gitSelectionConfirmed: false,
+        nonGitBaseline: "",
+        preparation: null,
+        approvalChecked: false,
+        runId: "",
+        run: null,
+        report: null,
+        reportPaths: null,
+        pollGeneration: 0,
+      };
+
+      const app = document.getElementById("app");
+      let draftPersistenceReady = false;
+      let startPending = false;
+
+      const isObject = (value) =>
+        value !== null && typeof value === "object" && !Array.isArray(value);
+
+      const asArray = (value) => Array.isArray(value) ? value : [];
+
+      const text = (value, fallback = "") =>
+        typeof value === "string" || typeof value === "number"
+          ? String(value)
+          : fallback;
+
+      const escapeHtml = (value) =>
+        text(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+
+      const safeJson = (value) => {
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch {
+          return "The configuration could not be serialized.";
+        }
+      };
+
+      function normalizeDraft(value) {
+        if (!isObject(value) || value.version !== DRAFT_VERSION) return null;
+        const timeoutSeconds = Number(value.timeoutSeconds);
+        const classifications = Object.create(null);
+        if (isObject(value.classifications)) {
+          for (const [path, classification] of Object.entries(value.classifications)) {
+            if (path && ["claude", "exclude"].includes(classification)) {
+              classifications[path] = classification;
+            }
+          }
+        }
+        return {
+          version: DRAFT_VERSION,
+          step: DRAFT_STEPS.has(value.step) ? value.step : "thread",
+          selectedThreadId: text(value.selectedThreadId),
+          model: text(value.model),
+          timeoutSeconds:
+            Number.isInteger(timeoutSeconds) && timeoutSeconds >= 1 && timeoutSeconds <= 14400
+              ? timeoutSeconds
+              : 1800,
+          classifications,
+          gitSelectionConfirmed: value.gitSelectionConfirmed === true,
+          nonGitBaseline: ["empty", "existing"].includes(value.nonGitBaseline)
+            ? value.nonGitBaseline
+            : "",
+        };
+      }
+
+      function loadDraft() {
+        try {
+          return normalizeDraft(JSON.parse(localStorage.getItem(DRAFT_STORAGE_KEY) || "null"));
+        } catch {
+          return null;
+        }
+      }
+
+      function draftSnapshot() {
+        return {
+          version: DRAFT_VERSION,
+          step: DRAFT_STEPS.has(state.step) ? state.step : "thread",
+          selectedThreadId: state.selectedThreadId,
+          model: state.model,
+          timeoutSeconds: Number(state.timeoutSeconds),
+          classifications: Object.fromEntries(
+            Object.entries(state.classifications)
+              .filter(([, value]) => ["claude", "exclude"].includes(value))
+          ),
+          gitSelectionConfirmed: state.gitSelectionConfirmed,
+          nonGitBaseline: state.nonGitBaseline,
+        };
+      }
+
+      function saveDraft() {
+        if (
+          !draftPersistenceReady ||
+          startPending ||
+          ["run", "results"].includes(state.step)
+        ) return;
+        try {
+          localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draftSnapshot()));
+        } catch {
+          // Draft persistence is best-effort when browser storage is unavailable.
+        }
+      }
+
+      function clearDraft() {
+        try {
+          localStorage.removeItem(DRAFT_STORAGE_KEY);
+        } catch {
+          // Reset the in-memory controller even if browser storage is unavailable.
+        }
+      }
+
+      function controllerSessionToken() {
+        try {
+          return localStorage.getItem(CONTROLLER_SESSION_STORAGE_KEY) || "";
+        } catch {
+          return "";
+        }
+      }
+
+      let restoredDraft = loadDraft();
+
+      const pathBase = (value) => {
+        const parts = text(value).split("/").filter(Boolean);
+        return parts.at(-1) || text(value, "Unknown project");
+      };
+
+      const titleCase = (value) =>
+        text(value, "unknown")
+          .replaceAll("_", " ")
+          .replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+      const formatDate = (value) => {
+        const stamp = Date.parse(text(value));
+        if (!Number.isFinite(stamp)) return "Date unavailable";
+        return new Intl.DateTimeFormat(undefined, {
+          dateStyle: "medium",
+          timeStyle: "short",
+        }).format(stamp);
+      };
+
+      const formatTime = (value) => {
+        const stamp = Date.parse(text(value));
+        if (!Number.isFinite(stamp)) return "—";
+        return new Intl.DateTimeFormat(undefined, {
+          hour: "numeric",
+          minute: "2-digit",
+          second: "2-digit",
+        }).format(stamp);
+      };
+
+      const formatDuration = (value) => {
+        const amount = Number(value);
+        if (!Number.isFinite(amount) || amount < 0) return "Unavailable";
+        const seconds = Math.round(amount);
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const remainder = seconds % 60;
+        return [
+          hours ? `${hours}h` : "",
+          minutes ? `${minutes}m` : "",
+          remainder || (!hours && !minutes) ? `${remainder}s` : "",
+        ].filter(Boolean).join(" ");
+      };
+
+      const formatTokens = (value) => {
+        const amount = Number(value);
+        return Number.isFinite(amount) ? new Intl.NumberFormat().format(amount) : "Unavailable";
+      };
+
+      const formatCost = (value) => {
+        const amount = Number(value);
+        return Number.isFinite(amount) ? `$${amount.toFixed(amount < .01 ? 4 : 2)}` : "Unavailable";
+      };
+
+      function unwrapToolResult(result) {
+        if (isObject(result) && result.isError) {
+          const content = asArray(result.content);
+          const message = content
+            .filter((item) => isObject(item) && item.type === "text")
+            .map((item) => text(item.text))
+            .join("\n");
+          throw new Error(message || "The controller tool returned an error.");
+        }
+        if (isObject(result) && isObject(result.structuredContent)) {
+          return result.structuredContent;
+        }
+        if (isObject(result) && isObject(result.result)) {
+          return unwrapToolResult(result.result);
+        }
+        if (isObject(result)) {
+          const content = asArray(result.content);
+          for (const item of content) {
+            if (!isObject(item) || item.type !== "text") continue;
+            try {
+              const parsed = JSON.parse(text(item.text));
+              if (isObject(parsed)) return parsed;
+            } catch {
+              // Human-readable content is intentionally not treated as state.
+            }
+          }
+          return result;
+        }
+        throw new Error("The controller returned an unreadable response.");
+      }
+
+      async function callTool(name, args = {}) {
+        const sessionToken = controllerSessionToken();
+        if (!sessionToken) {
+          throw new Error(
+            "This browser session has expired. Invoke the plugin again to reopen the controller."
+          );
+        }
+        let response;
+        try {
+          response = await fetch("/api/call", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Claude-Bakeoff-Session": sessionToken,
+            },
+            body: JSON.stringify({ name, arguments: args }),
+          });
+        } catch {
+          throw new Error(
+            "The local bakeoff service is unavailable. Invoke the plugin again to reopen it."
+          );
+        }
+        let result;
+        try {
+          result = await response.json();
+        } catch {
+          throw new Error("The local bakeoff service returned an unreadable response.");
+        }
+        if (!response.ok && !result.isError) {
+          throw new Error(text(result.error, `The controller request failed (${response.status}).`));
+        }
+        return unwrapToolResult(result);
+      }
+
+      function threadId(thread) {
+        if (!isObject(thread)) return "";
+        return text(
+          thread.imported_thread_id ||
+          thread.thread_id ||
+          thread.id ||
+          thread.session_id
+        );
+      }
+
+      function threadTitle(thread) {
+        return text(thread?.title || thread?.name || thread?.request, "Untitled Claude thread");
+      }
+
+      function normalizeModels(values) {
+        return asArray(values).flatMap((item) => {
+          if (typeof item === "string") {
+            return [{ id: item, label: item, description: "", recommended: false }];
+          }
+          if (!isObject(item)) return [];
+          const id = text(item.id || item.slug || item.model);
+          if (!id) return [];
+          return [{
+            id,
+            label: text(item.label || item.display_name || item.name, id),
+            description: text(item.description),
+            recommended: item.recommended === true || item.is_default === true,
+          }];
+        });
+      }
+
+      function inspectionParts() {
+        const inspection = isObject(state.inspection) ? state.inspection : {};
+        const baseline = isObject(inspection.baseline) ? inspection.baseline : {};
+        const selection = isObject(inspection.file_selection)
+          ? inspection.file_selection
+          : {};
+        const workspace = isObject(inspection.workspace) ? inspection.workspace : {};
+        const capabilities = isObject(inspection.capabilities)
+          ? inspection.capabilities
+          : {};
+        const replay = isObject(inspection.replay)
+          ? inspection.replay
+          : (isObject(inspection.thread) ? inspection.thread : {});
+        const files = asArray(
+          workspace.files?.length ? workspace.files : selection.candidates
+        );
+        const kind = text(
+          workspace.kind || selection.source_kind || baseline.source_kind || baseline.kind
+        );
+        return { inspection, baseline, selection, workspace, capabilities, replay, files, kind };
+      }
+
+      function initializeClassifications() {
+        state.classifications = Object.create(null);
+        state.gitSelectionConfirmed = false;
+        state.nonGitBaseline = "";
+        const { selection, files, kind } = inspectionParts();
+        if (kind === "git") {
+          const selected = new Set(
+            asArray(selection.claude_output_changes).map((item) =>
+              text(isObject(item) ? item.path : item)
+            )
+          );
+          for (const file of files) {
+            const path = text(file?.path);
+            if (path) state.classifications[path] = selected.has(path) ? "claude" : "exclude";
+          }
+          state.gitSelectionConfirmed =
+            selection.complete === true || selection.confirmed === true;
+          return;
+        }
+        const classes = isObject(selection.classifications)
+          ? selection.classifications
+          : {};
+        for (const item of asArray(classes.created_by_claude)) {
+          const path = text(isObject(item) ? item.path : item);
+          if (path) state.classifications[path] = "claude";
+        }
+        for (const item of asArray(classes.exclude)) {
+          const path = text(isObject(item) ? item.path : item);
+          if (path) state.classifications[path] = "exclude";
+        }
+        for (const file of files) {
+          const path = text(file?.path);
+          if (!path) continue;
+          if (file.selectable !== true || file.suggested_class === "exclude") {
+            state.classifications[path] = "exclude";
+          }
+        }
+        if (selection.empty_starting_directory_confirmed === true) {
+          state.nonGitBaseline = "empty";
+        }
+      }
+
+      function applyDraftToInspection(draft) {
+        if (!isObject(draft)) return;
+        if (state.models.some((model) => model.id === draft.model)) {
+          state.model = draft.model;
+        }
+        state.timeoutSeconds = draft.timeoutSeconds;
+        const { files, kind } = inspectionParts();
+        const fileByPath = new Map(
+          files
+            .map((file) => [text(file?.path), file])
+            .filter(([path]) => Boolean(path))
+        );
+        for (const [path, classification] of Object.entries(draft.classifications)) {
+          const file = fileByPath.get(path);
+          if (!file || !["claude", "exclude"].includes(classification)) continue;
+          state.classifications[path] =
+            file.selectable === false ? "exclude" : classification;
+        }
+        if (kind === "git") {
+          state.gitSelectionConfirmed = draft.gitSelectionConfirmed;
+        }
+        if (kind === "non_git") {
+          state.nonGitBaseline = draft.nonGitBaseline;
+        }
+      }
+
+      function selectedModelDefault() {
+        return (
+          state.models.find((model) => model.recommended)?.id ||
+          state.models[0]?.id ||
+          ""
+        );
+      }
+
+      function resetController() {
+        clearDraft();
+        restoredDraft = null;
+        startPending = false;
+        state.pollGeneration += 1;
+        state.step = "thread";
+        state.loading = false;
+        state.busy = "";
+        state.error = "";
+        state.notice = "";
+        state.query = "";
+        state.selectedThreadId = "";
+        state.selectedThread = null;
+        state.inspection = null;
+        state.model = selectedModelDefault();
+        state.timeoutSeconds = 1800;
+        state.classifications = Object.create(null);
+        state.gitSelectionConfirmed = false;
+        state.nonGitBaseline = "";
+        state.preparation = null;
+        state.approvalChecked = false;
+        state.runId = "";
+        state.run = null;
+        state.report = null;
+        state.reportPaths = null;
+        render({ focus: true });
+      }
+
+      function selectionPayload() {
+        const { baseline, files, kind } = inspectionParts();
+        const claude = [];
+        const excluded = [];
+        for (const file of files) {
+          const path = text(file?.path);
+          if (!path) continue;
+          if (state.classifications[path] === "claude") claude.push(path);
+          else if (state.classifications[path] === "exclude") excluded.push(path);
+        }
+        const common = {
+          thread_id: state.selectedThreadId,
+          model: state.model,
+          timeout_seconds: Number(state.timeoutSeconds),
+          repo: text(baseline.attribution_root || baseline.repository) || undefined,
+          claude_output_files: kind === "git" ? claude : [],
+          created_by_claude: kind === "non_git" ? claude : [],
+          excluded_files: kind === "non_git" ? excluded : [],
+          confirm_file_selection:
+            kind === "non_git"
+              ? state.nonGitBaseline === "empty"
+              : (files.length === 0 || state.gitSelectionConfirmed),
+        };
+        return Object.fromEntries(
+          Object.entries(common).filter(([, value]) => value !== undefined)
+        );
+      }
+
+      function configurationProblems() {
+        const problems = [];
+        const { inspection, selection, files, kind } = inspectionParts();
+        if (!state.selectedThreadId || !state.inspection) {
+          problems.push("Choose and inspect an imported thread.");
+        }
+        if (!state.model) problems.push("Choose a Codex model.");
+        const timeout = Number(state.timeoutSeconds);
+        if (!Number.isInteger(timeout) || timeout < 1 || timeout > 14400) {
+          problems.push("Set a timeout from 1 through 14,400 seconds.");
+        }
+        if (kind === "git" && files.length > 0 && !state.gitSelectionConfirmed) {
+          problems.push("Confirm the Git working-tree attribution.");
+        }
+        if (kind === "non_git") {
+          const unclassified = files.filter((file) => {
+            const path = text(file?.path);
+            return path && !["claude", "exclude"].includes(state.classifications[path]);
+          });
+          if (unclassified.length) {
+            problems.push(`Classify all ${files.length} non-Git files.`);
+          }
+          if (state.nonGitBaseline !== "empty") {
+            problems.push(
+              state.nonGitBaseline === "existing"
+                ? "A non-empty non-Git baseline is unsupported."
+                : "Confirm whether the directory was empty before Claude."
+            );
+          }
+        }
+        for (const item of asArray(inspection.blockers)) {
+          const value = text(item);
+          if (value) problems.push(value);
+        }
+        for (const item of asArray(selection.blocking_reasons)) {
+          const value = text(item);
+          if (value) problems.push(value);
+        }
+        return [...new Set(problems)];
+      }
+
+      function preparationBlockers() {
+        const preparation = isObject(state.preparation) ? state.preparation : {};
+        return asArray(preparation.blockers?.length
+          ? preparation.blockers
+          : preparation.blocking_reasons
+        ).map((item) => text(item)).filter(Boolean);
+      }
+
+      function preparationReady() {
+        const preparation = isObject(state.preparation) ? state.preparation : {};
+        return (
+          preparation.ready === true ||
+          preparation.can_run === true ||
+          preparation.status === "ready_for_approval"
+        ) && preparationBlockers().length === 0;
+      }
+
+      function exactConfiguration() {
+        const preparation = isObject(state.preparation) ? state.preparation : {};
+        return (
+          (isObject(preparation.configuration) && preparation.configuration) ||
+          (isObject(preparation.run_config) && preparation.run_config) ||
+          selectionPayload()
+        );
+      }
+
+      function runRecord(payload) {
+        if (!isObject(payload)) return null;
+        return isObject(payload.run) ? payload.run : payload;
+      }
+
+      function currentRunId(payload) {
+        const run = runRecord(payload);
+        return text(payload?.run_id || run?.run_id || run?.id);
+      }
+
+      function terminalRunStatus(value) {
+        return ["completed", "complete", "succeeded", "failed", "cancelled", "canceled"]
+          .includes(text(value).toLowerCase());
+      }
+
+      function successfulRunStatus(value) {
+        return ["completed", "complete", "succeeded"]
+          .includes(text(value).toLowerCase());
+      }
+
+      function stepIndex(id) {
+        return Math.max(0, STEPS.findIndex((step) => step.id === id));
+      }
+
+      function canNavigateTo(id) {
+        if (state.run && !terminalRunStatus(state.run.status)) return id === "run";
+        if (id === state.step) return false;
+        if (id === "thread") return true;
+        if (id === "configure") return Boolean(state.inspection);
+        if (id === "review") return Boolean(state.preparation);
+        if (id === "run") return Boolean(state.run);
+        if (id === "results") return Boolean(state.report);
+        return false;
+      }
+
+      function renderRail() {
+        const current = stepIndex(state.step);
+        return `
+          <nav class="step-rail" aria-label="Bakeoff progress">
+            <p class="step-rail__label">Bakeoff</p>
+            <ol class="steps">
+              ${STEPS.map((step, index) => {
+                const isCurrent = step.id === state.step;
+                const completed = (
+                  index < current ||
+                  (step.id === "run" && state.run && successfulRunStatus(state.run.status))
+                );
+                const clickable = canNavigateTo(step.id);
+                const marker = completed ? "✓" : String(index + 1);
+                return `
+                  <li>
+                    <button
+                      type="button"
+                      class="step-button"
+                      data-action="go-step"
+                      data-step="${escapeHtml(step.id)}"
+                      data-state="${completed ? "complete" : isCurrent ? "current" : "waiting"}"
+                      data-clickable="${clickable}"
+                      ${isCurrent ? 'aria-current="step"' : ""}
+                      ${clickable ? "" : "disabled"}
+                    >
+                      <span class="step-number" aria-hidden="true">${marker}</span>
+                      <span class="step-copy">
+                        <span class="step-name">${escapeHtml(step.name)}</span>
+                        <span class="step-state">${escapeHtml(
+                          completed ? "Complete" : isCurrent ? "Current step" : step.short
+                        )}</span>
+                      </span>
+                    </button>
+                  </li>
+                `;
+              }).join("")}
+            </ol>
+          </nav>
+        `;
+      }
+
+      function renderGlobalMessages() {
+        const messages = [];
+        if (state.error) {
+          messages.push(`
+            <div class="banner banner--error" role="alert">
+              <span class="banner__mark" aria-hidden="true">!</span>
+              <div class="banner__body">
+                <strong>Something needs attention</strong>
+                <p>${escapeHtml(state.error)}</p>
+              </div>
+            </div>
+          `);
+        }
+        if (state.notice) {
+          messages.push(`
+            <div class="banner banner--success" role="status">
+              <span class="banner__mark" aria-hidden="true">✓</span>
+              <div class="banner__body"><p>${escapeHtml(state.notice)}</p></div>
+            </div>
+          `);
+        }
+        return messages.join("");
+      }
+
+      function pageHeading(eyebrow, heading, description) {
+        return `
+          <header class="page-heading">
+            <p class="eyebrow">${escapeHtml(eyebrow)}</p>
+            <h1 id="page-title" tabindex="-1">${escapeHtml(heading)}</h1>
+            <p class="lede">${escapeHtml(description)}</p>
+          </header>
+        `;
+      }
+
+      function renderThreadStep() {
+        const needle = state.query.trim().toLowerCase();
+        const threads = state.threads.filter((thread) => {
+          if (!needle) return true;
+          return [
+            threadTitle(thread),
+            thread.project_dir,
+            thread.claude_model,
+            thread.imported_thread_id,
+          ].some((value) => text(value).toLowerCase().includes(needle));
+        });
+        return `
+          ${pageHeading(
+            "Historical source",
+            "Choose an imported Claude thread",
+            "The complete original conversation becomes one replay task. Claude is not rerun."
+          )}
+          <section class="panel" aria-labelledby="threads-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="threads-heading">Imported threads</h2>
+                <p>${state.loading ? "Loading local imports…" : `${threads.length} of ${state.totalThreads || state.threads.length} shown`}</p>
+              </div>
+              <button
+                type="button"
+                class="button button--quiet"
+                data-action="refresh-threads"
+                ${state.busy ? "disabled" : ""}
+              >Refresh</button>
+            </div>
+            <div class="panel__body">
+              <label class="sr-only" for="thread-search">Search imported threads</label>
+              <div class="search">
+                <span class="search__icon" aria-hidden="true"></span>
+                <input
+                  id="thread-search"
+                  type="search"
+                  autocomplete="off"
+                  placeholder="Search by title, project, model, or ID"
+                  value="${escapeHtml(state.query)}"
+                >
+              </div>
+              ${state.loading
+                ? `<div class="thread-list" aria-label="Loading threads">
+                    <div class="skeleton"></div>
+                    <div class="skeleton"></div>
+                    <div class="skeleton"></div>
+                  </div>`
+                : threads.length
+                  ? `<div class="thread-list">
+                      ${threads.map((thread) => {
+                        const id = threadId(thread);
+                        const project = text(thread.project_dir, "No project detected");
+                        const complexity = Number(thread.complexity_score);
+                        const calls = Number(thread.tool_call_count);
+                        return `
+                          <button
+                            type="button"
+                            class="thread"
+                            data-action="select-thread"
+                            data-thread-id="${escapeHtml(id)}"
+                            ${!id || state.busy ? "disabled" : ""}
+                          >
+                            <span>
+                              <span class="thread__title">${escapeHtml(threadTitle(thread))}</span>
+                              <span class="thread__meta">
+                                <span>${escapeHtml(formatDate(thread.created_at))}</span>
+                                <span class="thread__project" title="${escapeHtml(project)}">${escapeHtml(project)}</span>
+                                ${Number.isFinite(complexity) ? `<span>Complexity ${complexity}</span>` : ""}
+                                ${Number.isFinite(calls) ? `<span>${calls} tool calls</span>` : ""}
+                                ${thread.claude_model ? `<span>${escapeHtml(thread.claude_model)}</span>` : ""}
+                              </span>
+                            </span>
+                            <span class="arrow" aria-hidden="true">›</span>
+                          </button>
+                        `;
+                      }).join("")}
+                    </div>`
+                  : `<div class="empty">
+                      ${state.query
+                        ? "No imported threads match this search."
+                        : "No imported Claude threads are available."}
+                    </div>`
+              }
+            </div>
+          </section>
+        `;
+      }
+
+      function capabilityRows(capabilities) {
+        const items = asArray(capabilities.items);
+        if (!items.length) {
+          const count = Number(capabilities.observed_count);
+          return `
+            <li class="capability">
+              <span class="capability__dot" aria-hidden="true"></span>
+              <span>${Number.isFinite(count) ? `${count} capabilities observed` : "No capability gaps recorded"}</span>
+            </li>
+          `;
+        }
+        return items.map((item) => {
+          const record = isObject(item) ? item : { name: text(item) };
+          const status = text(record.status || record.parity || "available").toLowerCase();
+          const tone = /missing|blocked|unsupported|failed/.test(status)
+            ? "bad"
+            : /partial|warning|limited|manual/.test(status)
+              ? "warning"
+              : "";
+          return `
+            <li class="capability ${tone ? `capability--${tone}` : ""}">
+              <span class="capability__dot" aria-hidden="true"></span>
+              <span>
+                ${escapeHtml(record.name || record.capability || record.tool || "Observed capability")}
+                ${record.guidance || record.reason || record.status
+                  ? `<small>${escapeHtml(record.guidance || record.reason || titleCase(record.status))}</small>`
+                  : ""}
+              </span>
+            </li>
+          `;
+        }).join("");
+      }
+
+      function fileMetadata(file, kind) {
+        const values = [];
+        if (kind === "git") {
+          if (file.staged) values.push("staged");
+          if (file.unstaged) values.push("unstaged");
+          if (file.untracked) values.push("untracked");
+          if (!values.length && file.status) values.push(text(file.status).trim());
+        } else if (file.kind) {
+          values.push(titleCase(file.kind));
+        }
+        if (Number.isFinite(Number(file.size))) {
+          values.push(`${new Intl.NumberFormat().format(Number(file.size))} bytes`);
+        }
+        if (file.reason) values.push(text(file.reason));
+        return values.filter(Boolean);
+      }
+
+      function renderGitFiles(files, selection) {
+        const needsConfirmation =
+          files.length > 0 &&
+          (selection.requires_confirmation !== false || selection.working_tree_state === "dirty");
+        return `
+          <div class="panel__body">
+            ${files.length
+              ? `<ul class="file-list">
+                  ${files.map((file) => {
+                    const path = text(file.path);
+                    const selectable = file.selectable === true;
+                    const selected = state.classifications[path] === "claude";
+                    return `
+                      <li class="file-row">
+                        <span class="file-copy">
+                          <span class="file-path" title="${escapeHtml(path)}">${escapeHtml(path)}</span>
+                          <span class="file-meta">
+                            ${fileMetadata(file, "git").map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
+                          </span>
+                        </span>
+                        <label class="choice" ${selectable ? "" : 'aria-disabled="true"'}>
+                          <input
+                            type="checkbox"
+                            data-file-kind="git"
+                            data-path="${escapeHtml(path)}"
+                            ${selected ? "checked" : ""}
+                            ${selectable ? "" : "disabled"}
+                          >
+                          <span>Credit to Claude output</span>
+                        </label>
+                      </li>
+                    `;
+                  }).join("")}
+                </ul>`
+              : `<p class="empty">The current Git working tree is clean. No attribution is required.</p>`
+            }
+            ${needsConfirmation
+              ? `<div class="attestation">
+                  <label class="choice">
+                    <input
+                      id="git-confirmation"
+                      type="checkbox"
+                      ${state.gitSelectionConfirmed ? "checked" : ""}
+                    >
+                    <span>I reviewed every current Git change and this attribution is complete.</span>
+                  </label>
+                </div>`
+              : ""}
+          </div>
+        `;
+      }
+
+      function renderNonGitFiles(files) {
+        return `
+          <div class="panel__body">
+            ${files.length
+              ? `<ul class="file-list">
+                  ${files.map((file, index) => {
+                    const path = text(file.path);
+                    const selectable = file.selectable === true;
+                    const selected = state.classifications[path] || "";
+                    return `
+                      <li class="file-row">
+                        <span class="file-copy">
+                          <span class="file-path" title="${escapeHtml(path)}">${escapeHtml(path)}</span>
+                          <span class="file-meta">
+                            ${fileMetadata(file, "non_git").map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
+                          </span>
+                        </span>
+                        <span class="segmented" role="radiogroup" aria-label="Classification for ${escapeHtml(path)}">
+                          <label class="segment">
+                            <input
+                              type="radio"
+                              name="file-${index}"
+                              value="claude"
+                              data-file-kind="non_git"
+                              data-path="${escapeHtml(path)}"
+                              ${selected === "claude" ? "checked" : ""}
+                              ${selectable ? "" : "disabled"}
+                            >
+                            <span>Created by Claude</span>
+                          </label>
+                          <label class="segment">
+                            <input
+                              type="radio"
+                              name="file-${index}"
+                              value="exclude"
+                              data-file-kind="non_git"
+                              data-path="${escapeHtml(path)}"
+                              ${selected === "exclude" ? "checked" : ""}
+                            >
+                            <span>Exclude</span>
+                          </label>
+                        </span>
+                      </li>
+                    `;
+                  }).join("")}
+                </ul>`
+              : `<p class="empty">No current files were found in this directory.</p>`
+            }
+            <fieldset class="attestation">
+              <legend>What existed before Claude started?</legend>
+              <label class="choice">
+                <input
+                  type="radio"
+                  name="non-git-baseline"
+                  value="empty"
+                  ${state.nonGitBaseline === "empty" ? "checked" : ""}
+                >
+                <span>The directory was empty before Claude.</span>
+              </label>
+              <label class="choice">
+                <input
+                  type="radio"
+                  name="non-git-baseline"
+                  value="existing"
+                  ${state.nonGitBaseline === "existing" ? "checked" : ""}
+                >
+                <span>At least one file already existed.</span>
+              </label>
+            </fieldset>
+            ${state.nonGitBaseline === "existing"
+              ? `<div class="banner banner--error" role="alert" style="margin:14px 0 0">
+                  <span class="banner__mark" aria-hidden="true">!</span>
+                  <div class="banner__body">
+                    <strong>This replay cannot continue</strong>
+                    <p>Non-empty non-Git baselines are unsupported because an evidence-backed starting state cannot be reconstructed.</p>
+                  </div>
+                </div>`
+              : ""}
+          </div>
+        `;
+      }
+
+      function renderConfigureStep() {
+        const { baseline, selection, capabilities, replay, files, kind } = inspectionParts();
+        const problems = configurationProblems();
+        const sourceLabel = kind === "git" ? "Git repository" : kind === "non_git" ? "Non-Git directory" : titleCase(kind);
+        const workingState = text(
+          selection.working_tree_state ||
+          baseline.current_working_tree_state ||
+          baseline.working_tree_state,
+          "Not recorded"
+        );
+        return `
+          ${pageHeading(
+            "Configuration",
+            "Review the baseline and replay settings",
+            "File decisions apply symmetrically to the historical result and the isolated Codex replay."
+          )}
+          <div class="grid-2">
+            <section class="summary-card" aria-labelledby="baseline-heading">
+              <h2 id="baseline-heading">Historical baseline</h2>
+              <dl class="metrics">
+                <div class="metric"><dt>Thread</dt><dd>${escapeHtml(threadTitle(replay))}</dd></div>
+                <div class="metric"><dt>Source</dt><dd>${escapeHtml(sourceLabel || "Unknown")}</dd></div>
+                <div class="metric"><dt>Project</dt><dd><code>${escapeHtml(baseline.attribution_root || baseline.repository || replay.project_dir || "Unavailable")}</code></dd></div>
+                <div class="metric"><dt>Commit</dt><dd><code>${escapeHtml(baseline.commit || baseline.proposed_kind || baseline.kind || "Not applicable")}</code></dd></div>
+                <div class="metric"><dt>Working tree</dt><dd><span class="pill ${workingState === "clean" ? "pill--good" : workingState === "dirty" ? "pill--warning" : ""}">${escapeHtml(titleCase(workingState))}</span></dd></div>
+                <div class="metric"><dt>Confidence</dt><dd>${escapeHtml(titleCase(baseline.confidence || "unknown"))}</dd></div>
+              </dl>
+            </section>
+            <section class="summary-card" aria-labelledby="capability-heading">
+              <h2 id="capability-heading">Capability parity</h2>
+              <ul class="capability-list">
+                ${capabilityRows(capabilities)}
+              </ul>
+              ${asArray(capabilities.resolution_actions).length
+                ? `<details>
+                    <summary>Guidance</summary>
+                    <ul class="plain-list">
+                      ${asArray(capabilities.resolution_actions).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+                    </ul>
+                  </details>`
+                : ""}
+            </section>
+          </div>
+
+          <section class="panel" aria-labelledby="runtime-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="runtime-heading">Codex replay</h2>
+                <p>One implementation will run with this model and timeout.</p>
+              </div>
+            </div>
+            <div class="panel__body">
+              <div class="field-grid">
+                <div class="field">
+                  <label for="model">Codex model</label>
+                  ${state.models.length
+                    ? `<select id="model">
+                        <option value="">Choose a model</option>
+                        ${state.models.map((model) => `
+                          <option value="${escapeHtml(model.id)}" ${model.id === state.model ? "selected" : ""}>
+                            ${escapeHtml(model.label)}${model.recommended ? " — recommended" : ""}
+                          </option>
+                        `).join("")}
+                      </select>`
+                    : `<input id="model" type="text" value="${escapeHtml(state.model)}" placeholder="No local model catalog available">`
+                  }
+                  <small>${escapeHtml(state.models.find((model) => model.id === state.model)?.description || "Only locally available API-supported models are shown.")}</small>
+                </div>
+                <div class="field">
+                  <label for="timeout">Timeout in seconds</label>
+                  <input id="timeout" type="number" min="1" max="14400" step="1" value="${escapeHtml(state.timeoutSeconds)}">
+                  <small>Maximum 4 hours.</small>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="files-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="files-heading">${kind === "git" ? "Current Git change attribution" : "Current file classification"}</h2>
+                <p>${kind === "git"
+                  ? "Select only current changes that belong to the recorded Claude output."
+                  : "Classify every surfaced file. Unsafe or generated entries are locked to Exclude."}</p>
+              </div>
+              <span class="pill">${files.length} ${files.length === 1 ? "item" : "items"}</span>
+            </div>
+            ${kind === "git"
+              ? renderGitFiles(files, selection)
+              : kind === "non_git"
+                ? renderNonGitFiles(files)
+                : `<div class="panel__body"><div class="banner banner--error" role="alert">
+                    <span class="banner__mark" aria-hidden="true">!</span>
+                    <div class="banner__body"><strong>Unsupported source</strong><p>The controller could not determine whether this project is Git or non-Git.</p></div>
+                  </div></div>`
+            }
+          </section>
+
+          ${problems.length
+            ? `<div class="banner banner--warning" role="status" style="margin-top:14px">
+                <span class="banner__mark" aria-hidden="true">i</span>
+                <div class="banner__body">
+                  <strong>Before review</strong>
+                  <ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul>
+                </div>
+              </div>`
+            : ""}
+
+          <div class="footer-actions">
+            <span class="footer-actions__note">The original Claude output and checkout will not be modified.</span>
+            <button type="button" class="button button--quiet" data-action="go-step" data-step="thread">Back</button>
+            <button
+              type="button"
+              class="button button--primary"
+              data-action="prepare"
+              ${problems.length || state.busy ? "disabled" : ""}
+            >
+              ${state.busy === "prepare" ? '<span class="spinner" aria-hidden="true"></span>Preparing…' : "Review exact configuration"}
+            </button>
+          </div>
+        `;
+      }
+
+      function reviewItem(label, value, code = false) {
+        return `
+          <div class="review-item">
+            <span>${escapeHtml(label)}</span>
+            <${code ? "code" : "strong"}>${escapeHtml(value || "None")}</${code ? "code" : "strong"}>
+          </div>
+        `;
+      }
+
+      function reviewSummary(configuration) {
+        const task = isObject(configuration.task) ? configuration.task : {};
+        const baseline = isObject(configuration.baseline) ? configuration.baseline : {};
+        const runtime = isObject(configuration.runtime) ? configuration.runtime : {};
+        const direct = isObject(state.preparation?.run_config)
+          ? state.preparation.run_config
+          : selectionPayload();
+        const selection = isObject(configuration.file_selection)
+          ? configuration.file_selection
+          : {};
+        const included = asArray(
+          direct.claude_output_files?.length
+            ? direct.claude_output_files
+            : direct.created_by_claude?.length
+              ? direct.created_by_claude
+              : selection.claude_output_changes?.length
+                ? selection.claude_output_changes
+                : selection.claude_output_files
+        ).map((item) => text(isObject(item) ? item.path : item)).filter(Boolean);
+        const excluded = asArray(
+          direct.excluded_files?.length
+            ? direct.excluded_files
+            : selection.unselected_changes?.length
+              ? selection.unselected_changes
+              : selection.classifications?.exclude
+        ).map((item) => text(isObject(item) ? item.path : item)).filter(Boolean);
+        return {
+          thread: text(task.imported_thread_id || direct.thread_id || state.selectedThreadId),
+          project: text(task.project || baseline.attribution_root || baseline.repository || direct.repo),
+          baseline: text(baseline.commit || baseline.kind || baseline.proposed_kind),
+          model: text(configuration.model || direct.model || state.model),
+          timeout: Number(runtime.timeout_seconds ?? direct.timeout_seconds ?? state.timeoutSeconds),
+          sandbox: text(runtime.sandbox_policy?.type || runtime.sandbox_policy || "workspaceWrite"),
+          network: runtime.sandbox_policy?.networkAccess === false ? "Disabled" : "Enabled",
+          included,
+          excluded,
+        };
+      }
+
+      function renderReviewStep() {
+        const configuration = exactConfiguration();
+        const summary = reviewSummary(configuration);
+        const blockers = preparationBlockers();
+        const ready = preparationReady();
+        return `
+          ${pageHeading(
+            "Approval",
+            "Review the exact run configuration",
+            "This snapshot came from the local bakeoff engine. Any change requires preparing it again."
+          )}
+          ${blockers.length
+            ? `<div class="banner banner--error" role="alert">
+                <span class="banner__mark" aria-hidden="true">!</span>
+                <div class="banner__body">
+                  <strong>This configuration cannot run</strong>
+                  <ul>${blockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+                </div>
+              </div>`
+            : ""}
+          <section class="panel" aria-labelledby="review-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="review-heading">Prepared configuration</h2>
+                <p>${ready ? "Ready for explicit approval." : `Preparation status: ${titleCase(state.preparation?.status)}`}</p>
+              </div>
+              <span class="pill ${ready ? "pill--good" : "pill--warning"}">${ready ? "Ready" : "Needs attention"}</span>
+            </div>
+            <div class="panel__body">
+              <div class="review-grid">
+                ${reviewItem("Imported thread", summary.thread, true)}
+                ${reviewItem("Project", summary.project, true)}
+                ${reviewItem("Historical baseline", summary.baseline, true)}
+                ${reviewItem("Codex model", summary.model, true)}
+                ${reviewItem("Timeout", formatDuration(summary.timeout))}
+                ${reviewItem("Sandbox / network", `${titleCase(summary.sandbox)} · ${summary.network}`)}
+                ${reviewItem("Included Claude files", `${summary.included.length}`)}
+                ${reviewItem("Excluded files", `${summary.excluded.length}`)}
+              </div>
+              ${summary.included.length
+                ? `<details><summary>Included paths (${summary.included.length})</summary><pre>${escapeHtml(summary.included.join("\n"))}</pre></details>`
+                : ""}
+              ${summary.excluded.length
+                ? `<details><summary>Excluded paths (${summary.excluded.length})</summary><pre>${escapeHtml(summary.excluded.join("\n"))}</pre></details>`
+                : ""}
+              <details>
+                <summary>Exact server configuration</summary>
+                <pre>${escapeHtml(safeJson(configuration))}</pre>
+              </details>
+            </div>
+          </section>
+          <div class="footer-actions">
+            <span class="footer-actions__note">Starting creates exactly one isolated Codex implementation.</span>
+            <button type="button" class="button button--quiet" data-action="go-step" data-step="configure">Back</button>
+            <button
+              type="button"
+              class="button button--primary"
+              data-action="open-approval"
+              ${!ready || state.busy ? "disabled" : ""}
+            >Approve and start…</button>
+          </div>
+          ${renderApprovalDialog(configuration, summary)}
+        `;
+      }
+
+      function renderApprovalDialog(configuration, summary) {
+        return `
+          <dialog id="approval-dialog" aria-labelledby="approval-title">
+            <div class="dialog__header">
+              <h2 id="approval-title">Start one isolated Codex replay?</h2>
+              <p>Review the final guarantees, then explicitly approve this prepared configuration.</p>
+            </div>
+            <div class="dialog__body">
+              <div class="review-grid">
+                ${reviewItem("Thread", summary.thread, true)}
+                ${reviewItem("Model", summary.model, true)}
+                ${reviewItem("Baseline", summary.baseline, true)}
+                ${reviewItem("Timeout", formatDuration(summary.timeout))}
+              </div>
+              <ul class="approval-promises">
+                <li>Historical Claude is not rerun.</li>
+                <li>The original checkout is not modified.</li>
+                <li>Exactly one Codex implementation is started.</li>
+                <li>Shared verification and blind review use frozen captured results.</li>
+              </ul>
+              <details>
+                <summary>Exact configuration sent on approval</summary>
+                <pre>${escapeHtml(safeJson(configuration))}</pre>
+              </details>
+              <label class="choice" style="margin-top:16px">
+                <input id="approval-check" type="checkbox" ${state.approvalChecked ? "checked" : ""}>
+                <span>I approve this exact configuration and one isolated implementation.</span>
+              </label>
+            </div>
+            <div class="dialog__footer">
+              <button type="button" class="button button--quiet" data-action="close-approval">Cancel</button>
+              <button
+                id="start-run"
+                type="button"
+                class="button button--primary"
+                data-action="start"
+                ${state.approvalChecked || state.busy === "start" ? "" : "disabled"}
+              >
+                ${state.busy === "start" ? '<span class="spinner" aria-hidden="true"></span>Starting…' : "Start isolated replay"}
+              </button>
+            </div>
+          </dialog>
+        `;
+      }
+
+      function normalizedPhases(run) {
+        const provided = asArray(run?.phases);
+        if (provided.length) {
+          return provided.flatMap((item) => {
+            if (!isObject(item)) return [];
+            const id = text(item.id || item.phase);
+            if (!id) return [];
+            return [{
+              id,
+              label: text(item.label, DEFAULT_PHASES.find(([value]) => value === id)?.[1] || titleCase(id)),
+              status: text(item.status, "waiting").toLowerCase(),
+            }];
+          });
+        }
+        const current = text(run?.phase);
+        const index = DEFAULT_PHASES.findIndex(([id]) => id === current);
+        const failed = ["failed", "cancelled", "canceled"].includes(text(run?.status).toLowerCase());
+        return DEFAULT_PHASES.map(([id, label], itemIndex) => ({
+          id,
+          label,
+          status:
+            itemIndex < index ? "complete"
+              : itemIndex === index ? (failed ? "failed" : "running")
+                : "waiting",
+        }));
+      }
+
+      function renderRunStep() {
+        const run = isObject(state.run) ? state.run : {};
+        const status = text(run.status, "running").toLowerCase();
+        const failed = ["failed", "cancelled", "canceled"].includes(status);
+        const completed = successfulRunStatus(status);
+        const phases = normalizedPhases(run);
+        const events = asArray(run.events).filter(isObject).slice(-12).reverse();
+        return `
+          ${pageHeading(
+            "Run in progress",
+            completed ? "The comparison report is ready" : failed ? "The bakeoff stopped" : "Running the isolated replay",
+            completed
+              ? "Implementation, verification, and review completed."
+              : failed
+                ? "No replacement implementation or automatic retry was started."
+                : "You can leave and reopen this page; progress is stored in the local run directory."
+          )}
+          ${failed
+            ? `<div class="banner banner--error" role="alert">
+                <span class="banner__mark" aria-hidden="true">!</span>
+                <div class="banner__body">
+                  <strong>${escapeHtml(titleCase(status))}</strong>
+                  <p>${escapeHtml(run.error || "The bakeoff could not continue.")}</p>
+                </div>
+              </div>`
+            : ""}
+          <div class="grid-2">
+            <section class="panel" aria-labelledby="progress-heading">
+              <div class="panel__header">
+                <div>
+                  <h2 id="progress-heading">Run phases</h2>
+                  <p>Run <code>${escapeHtml(state.runId || run.id || run.run_id)}</code></p>
+                </div>
+                <span class="pill ${completed ? "pill--good" : failed ? "pill--bad" : ""}">
+                  ${escapeHtml(titleCase(status))}
+                </span>
+              </div>
+              <div class="panel__body">
+                <ol class="phase-list">
+                  ${phases.map((phase) => {
+                    const statusClass = ["complete", "completed", "succeeded"].includes(phase.status)
+                      ? "complete"
+                      : ["failed", "cancelled", "canceled"].includes(phase.status)
+                        ? "failed"
+                        : phase.status === "running"
+                          ? "running"
+                          : "waiting";
+                    return `
+                      <li class="phase phase--${statusClass}">
+                        <span class="phase__mark" aria-hidden="true">${statusClass === "complete" ? "✓" : statusClass === "failed" ? "!" : ""}</span>
+                        <span class="phase__name">${escapeHtml(phase.label)}</span>
+                        <span class="phase__state">${escapeHtml(titleCase(statusClass))}</span>
+                      </li>
+                    `;
+                  }).join("")}
+                </ol>
+              </div>
+            </section>
+            <section class="panel" aria-labelledby="activity-heading">
+              <div class="panel__header">
+                <div>
+                  <h2 id="activity-heading">Activity</h2>
+                  <p>${run.started_at ? `Started ${escapeHtml(formatDate(run.started_at))}` : "Waiting for the first event"}</p>
+                </div>
+              </div>
+              <div class="panel__body">
+                ${events.length
+                  ? `<ol class="activity">
+                      ${events.map((event) => `
+                        <li>
+                          <time datetime="${escapeHtml(event.at || event.timestamp || "")}">${escapeHtml(formatTime(event.at || event.timestamp))}</time>
+                          <span>${escapeHtml(event.summary || event.message || titleCase(event.phase || event.status))}</span>
+                        </li>
+                      `).join("")}
+                    </ol>`
+                  : `<p class="empty">No activity has been recorded yet.</p>`
+                }
+              </div>
+            </section>
+          </div>
+          <div class="footer-actions">
+            <span class="footer-actions__note">
+              ${completed ? "Loading the report…" : failed ? "Inspect the recorded error before starting a new bakeoff." : "Status refreshes automatically."}
+            </span>
+            ${failed
+              ? `<button type="button" class="button" data-action="refresh-run" ${state.busy ? "disabled" : ""}>Refresh status</button>
+                 <button type="button" class="button button--primary" data-action="reset-controller">Choose another thread</button>`
+              : completed
+                ? `<button type="button" class="button button--primary" data-action="load-report" ${state.busy ? "disabled" : ""}>
+                    ${state.busy === "report" ? '<span class="spinner" aria-hidden="true"></span>Loading…' : "Open results"}
+                  </button>`
+                : `<button type="button" class="button" data-action="refresh-run" ${state.busy ? "disabled" : ""}>Refresh now</button>`
+            }
+          </div>
+        `;
+      }
+
+      function reportParts() {
+        const report = isObject(state.report) ? state.report : {};
+        const candidates = isObject(report.candidates) ? report.candidates : {};
+        const claude = isObject(candidates.claude) ? candidates.claude : {};
+        const codex = isObject(candidates.codex) ? candidates.codex : {};
+        const baseline = isObject(report.baseline) ? report.baseline : {};
+        const execution = isObject(report.codex_execution) ? report.codex_execution : {};
+        const verification = isObject(report.verification) ? report.verification : {};
+        const evaluation = isObject(report.evaluation) ? report.evaluation : {};
+        const costs = isObject(report.estimated_cost) ? report.estimated_cost : {};
+        const usage = isObject(report.normalized_usage) ? report.normalized_usage : {};
+        return {
+          report, baseline, candidates, claude, codex, execution, verification, evaluation, costs, usage,
+        };
+      }
+
+      function outcomeSummary(evaluation) {
+        const totals = isObject(evaluation.totals) ? evaluation.totals : {};
+        const mapping = isObject(evaluation.candidate_mapping)
+          ? evaluation.candidate_mapping
+          : { A: "claude", B: "codex" };
+        const a = Number(totals.A);
+        const b = Number(totals.B);
+        if (!Number.isFinite(a) || !Number.isFinite(b)) {
+          return { headline: "Comparison complete", score: "No validated score", detail: "Review results are recorded below." };
+        }
+        const name = (label) =>
+          mapping[label] === "codex" ? "Codex replay"
+            : mapping[label] === "claude" ? "Historical Claude"
+              : `Candidate ${label}`;
+        if (a === b) {
+          return { headline: "The comparison is a tie", score: `${a}–${b}`, detail: "Each category win awards one point." };
+        }
+        const winner = a > b ? "A" : "B";
+        return {
+          headline: `${name(winner)} leads`,
+          score: `${Math.max(a, b)}–${Math.min(a, b)}`,
+          detail: "Each category win awards one point; ties and N/A award zero.",
+        };
+      }
+
+      function comparisonClass(value, otherValue) {
+        const own = Number(value);
+        const other = Number(otherValue);
+        if (
+          !Number.isFinite(own) ||
+          !Number.isFinite(other) ||
+          own < 0 ||
+          other < 0 ||
+          own === other
+        ) return "";
+        return own < other ? " metric--better" : " metric--worse";
+      }
+
+      function usageMetricRows(usage) {
+        const metrics = [
+          [
+            "Total input processed",
+            "total_input_tokens",
+            "All input tokens processed: ordinary input, cache reads, and cache writes.",
+          ],
+          [
+            "Ordinary input tokens",
+            "ordinary_input_tokens",
+            "Input tokens processed without being read from or written to a provider cache.",
+          ],
+          [
+            "Cache-read tokens",
+            "cached_input_tokens",
+            "Previously cached input tokens reused by the model.",
+          ],
+          [
+            "Cache-write tokens",
+            "cache_write_tokens",
+            "Input tokens written to the provider cache for possible reuse.",
+          ],
+          [
+            "Output tokens",
+            "output_tokens",
+            "Tokens generated by the model in its responses.",
+          ],
+        ];
+        return metrics.map(([label, key, description]) => `
+          <div class="metric">
+            <dt class="token-label" tabindex="0">
+              ${escapeHtml(label)}
+              <span class="token-tooltip" role="tooltip">${escapeHtml(description)}</span>
+            </dt>
+            <dd>${escapeHtml(formatTokens(usage?.[key]))}</dd>
+          </div>
+        `).join("");
+      }
+
+      function providerCard(
+        name,
+        candidate,
+        execution,
+        cost,
+        usage,
+        isCodex,
+        otherElapsed,
+        otherCost,
+      ) {
+        const model = text(candidate.model || (isCodex ? execution.model : ""), "Unavailable");
+        const elapsed = isCodex
+          ? execution.elapsed_seconds
+          : state.report?.historical_model_request_seconds;
+        return `
+          <article class="provider">
+            <h2>${escapeHtml(name)}</h2>
+            <dl class="metrics">
+              <div class="metric"><dt>Model</dt><dd><code>${escapeHtml(model)}</code></dd></div>
+              <div class="metric${comparisonClass(elapsed, otherElapsed)}"><dt>Execution time</dt><dd>${escapeHtml(formatDuration(elapsed))}</dd></div>
+              <div class="metric${comparisonClass(cost?.usd, otherCost?.usd)}"><dt>Estimated cost</dt><dd>${escapeHtml(formatCost(cost?.usd))}</dd></div>
+              ${usageMetricRows(usage)}
+            </dl>
+          </article>
+        `;
+      }
+
+      function checksById(container) {
+        if (!isObject(container)) return new Map();
+        const values = asArray(container.checks?.length ? container.checks : container.results);
+        return new Map(values.flatMap((item, index) => {
+          if (!isObject(item)) return [];
+          const id = text(item.id || item.name || item.command, `check-${index + 1}`);
+          return [[id, item]];
+        }));
+      }
+
+      function checkStatus(check, baselineFailed = false) {
+        if (!isObject(check)) return "Unavailable";
+        const raw = text(check.status, check.returncode === 0 ? "passed" : "failed");
+        if (baselineFailed && ["failed", "timed_out"].includes(raw)) {
+          return `${titleCase(raw)} · baseline also failed`;
+        }
+        return titleCase(raw);
+      }
+
+      function verificationTable(verification) {
+        const baseline = isObject(verification.baseline) ? verification.baseline : {};
+        const candidates = isObject(verification.candidates) ? verification.candidates : {};
+        const claude = isObject(candidates.claude) ? candidates.claude : {};
+        const codex = isObject(candidates.codex) ? candidates.codex : {};
+        const maps = [checksById(baseline), checksById(claude), checksById(codex)];
+        const ids = [...new Set(maps.flatMap((map) => [...map.keys()]))];
+        if (!ids.length) return `<p class="empty">No shared verification checks were available.</p>`;
+        return `
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Shared check</th><th>Baseline</th><th>Historical Claude</th><th>Codex replay</th></tr></thead>
+              <tbody>
+                ${ids.map((id) => {
+                  const base = maps[0].get(id);
+                  const baselineFailed = ["failed", "timed_out"].includes(text(base?.status));
+                  const command = text(base?.command || maps[1].get(id)?.command || maps[2].get(id)?.command || id);
+                  return `
+                    <tr>
+                      <th><code>${escapeHtml(command)}</code></th>
+                      <td>${escapeHtml(checkStatus(base))}</td>
+                      <td>${escapeHtml(checkStatus(maps[1].get(id), baselineFailed))}</td>
+                      <td>${escapeHtml(checkStatus(maps[2].get(id), baselineFailed))}</td>
+                    </tr>
+                  `;
+                }).join("")}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      function evaluationTable(evaluation) {
+        const mapping = isObject(evaluation.candidate_mapping)
+          ? evaluation.candidate_mapping
+          : { A: "claude", B: "codex" };
+        const name = (outcome) =>
+          mapping[outcome] === "codex" ? "Codex replay"
+            : mapping[outcome] === "claude" ? "Historical Claude"
+              : outcome === "tie" ? "Tie"
+                : outcome === "not_applicable" ? "N/A"
+                  : titleCase(outcome);
+        const rows = [];
+        for (const review of asArray(evaluation.reviews)) {
+          if (!isObject(review)) continue;
+          const categories = isObject(review.ballot?.categories) ? review.ballot.categories : {};
+          for (const [category, raw] of Object.entries(categories)) {
+            const decision = isObject(raw) ? raw : {};
+            rows.push({
+              evaluator: text(review.evaluator, "Unknown"),
+              model: text(review.model, "Unknown"),
+              category: titleCase(category),
+              outcome: name(text(decision.outcome, "not_applicable")),
+              explanation: text(decision.explanation, "No explanation recorded."),
+            });
+          }
+        }
+        if (!rows.length) return `<p class="empty">No validated blind review ballot is available.</p>`;
+        return `
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Evaluator</th><th>Category</th><th>Outcome</th><th>Explanation</th></tr></thead>
+              <tbody>
+                ${rows.map((row) => `
+                  <tr>
+                    <td>${escapeHtml(row.evaluator)}<br><code>${escapeHtml(row.model)}</code></td>
+                    <td>${escapeHtml(row.category)}</td>
+                    <td><strong>${escapeHtml(row.outcome)}</strong></td>
+                    <td>${escapeHtml(row.explanation)}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      function renderResultsStep() {
+        const {
+          report, baseline, claude, codex, execution, verification, evaluation, costs, usage,
+        } = reportParts();
+        const outcome = outcomeSummary(evaluation);
+        const limitations = asArray(report.limitations).map((item) => text(item)).filter(Boolean);
+        const claudeElapsed = report.historical_model_request_seconds;
+        const codexElapsed = execution.elapsed_seconds;
+        return `
+          <section class="result-hero" aria-labelledby="page-title">
+            <div>
+              <p class="eyebrow">Comparison complete</p>
+              <h1 id="page-title" tabindex="-1">${escapeHtml(outcome.headline)}</h1>
+              <p>${escapeHtml(outcome.detail)}</p>
+            </div>
+            <div class="score">${escapeHtml(outcome.score)}</div>
+          </section>
+
+          <div class="provider-grid">
+            ${providerCard(
+              "Historical Claude",
+              claude,
+              execution,
+              costs.claude,
+              usage.claude,
+              false,
+              codexElapsed,
+              costs.codex,
+            )}
+            ${providerCard(
+              "Codex replay",
+              codex,
+              execution,
+              costs.codex,
+              usage.codex,
+              true,
+              claudeElapsed,
+              costs.claude,
+            )}
+          </div>
+
+          <section class="panel" aria-labelledby="verification-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="verification-heading">Objective verification</h2>
+                <p>The same baseline-owned checks ran against the historical baseline, Claude result, and Codex replay.</p>
+              </div>
+              <span class="pill">${escapeHtml(titleCase(verification.status || "not verifiable"))}</span>
+            </div>
+            <div class="panel__body panel__body--flush">
+              ${verificationTable(verification)}
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="evaluation-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="evaluation-heading">Blind head-to-head review</h2>
+                <p>Candidate identities were revealed only after each ballot was recorded.</p>
+              </div>
+            </div>
+            <div class="panel__body panel__body--flush">
+              ${evaluationTable(evaluation)}
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="evidence-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="evidence-heading">Evidence and artifacts</h2>
+                <p>Detailed prompts, patches, responses, and limitations remain available for inspection.</p>
+              </div>
+            </div>
+            <div class="panel__body">
+              <dl class="metrics">
+                <div class="metric"><dt>Claude worktree</dt><dd><code>${escapeHtml(baseline.repository || "Unavailable")}</code></dd></div>
+                <div class="metric"><dt>Codex worktree</dt><dd><code>${escapeHtml(execution.worktree || "Unavailable")}</code></dd></div>
+              </dl>
+              <details><summary>Original request</summary><pre>${escapeHtml(report.original_request || "")}</pre></details>
+              <details><summary>Claude patch</summary><pre>${escapeHtml(claude.diff || "No attributable Claude patch was recovered.")}</pre></details>
+              <details><summary>Codex patch</summary><pre>${escapeHtml(codex.diff || "No Codex patch was recorded.")}</pre></details>
+              <details><summary>Claude final response</summary><pre>${escapeHtml(report.historical_final_response || claude.final_response || "Unavailable.")}</pre></details>
+              <details><summary>Codex final response</summary><pre>${escapeHtml(codex.final_response || execution.final_output || "Unavailable.")}</pre></details>
+              <details>
+                <summary>Confidence and limitations (${limitations.length})</summary>
+                ${limitations.length
+                  ? `<ul>${limitations.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+                  : `<p class="empty">No limitations were recorded.</p>`}
+              </details>
+              <details><summary>Raw report JSON</summary><pre>${escapeHtml(safeJson(report))}</pre></details>
+            </div>
+          </section>
+
+          <div class="footer-actions">
+            <span class="footer-actions__note">
+              ${state.reportPaths?.report_json
+                ? `Saved to ${escapeHtml(state.reportPaths.report_json)}`
+                : "The durable report remains in the local run directory."}
+            </span>
+            ${state.reportPaths?.report_json
+              ? `<button type="button" class="button" data-action="copy-report-path">Copy report path</button>`
+              : ""}
+            ${state.reportPaths?.report_json
+              ? `<button type="button" class="button" data-action="download-report" data-format="json">Download JSON</button>`
+              : ""}
+            ${state.reportPaths?.report_html
+              ? `<button type="button" class="button" data-action="download-report" data-format="html">Download HTML report</button>`
+              : ""}
+            <button type="button" class="button button--primary" data-action="reset-controller">Start another bakeoff</button>
+          </div>
+        `;
+      }
+
+      function renderContent() {
+        if (!state.hostReady && state.error) {
+          return `
+            ${pageHeading(
+              "Connection",
+              "The controller could not connect",
+              "This page must be opened from the installed Codex Bakeoff plugin."
+            )}
+            ${renderGlobalMessages()}
+            <button type="button" class="button button--primary" data-action="retry-init">Try again</button>
+          `;
+        }
+        const body =
+          state.step === "configure" ? renderConfigureStep()
+            : state.step === "review" ? renderReviewStep()
+              : state.step === "run" ? renderRunStep()
+                : state.step === "results" ? renderResultsStep()
+                  : renderThreadStep();
+        return `${renderGlobalMessages()}${body}`;
+      }
+
+      function render({ focus = false } = {}) {
+        saveDraft();
+        app.innerHTML = `
+          <div class="layout">
+            ${renderRail()}
+            <main class="workspace" aria-labelledby="page-title">
+              <div class="sr-only" aria-live="polite">
+                ${escapeHtml(state.busy ? `${titleCase(state.busy)} in progress` : state.notice || "")}
+              </div>
+              ${renderContent()}
+            </main>
+          </div>
+        `;
+        if (focus) {
+          requestAnimationFrame(() => document.getElementById("page-title")?.focus());
+        }
+      }
+
+      async function loadThreads(query = "") {
+        state.loading = true;
+        state.error = "";
+        render();
+        try {
+          const payload = await callTool("list_threads", {
+            offset: 0,
+            limit: 100,
+            ...(query.trim() ? { query: query.trim() } : {}),
+          });
+          state.threads = asArray(payload.threads?.length ? payload.threads : payload.sessions);
+          state.totalThreads = Number(payload.total) || state.threads.length;
+          state.hostReady = true;
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+        } finally {
+          state.loading = false;
+          render();
+        }
+      }
+
+      async function initialize() {
+        draftPersistenceReady = false;
+        restoredDraft = loadDraft();
+        state.loading = true;
+        state.hostReady = false;
+        state.error = "";
+        state.notice = "";
+        render();
+        try {
+          const [statePayload, threadPayload] = await Promise.all([
+            callTool("get_state", {}),
+            callTool("list_threads", { offset: 0, limit: 100 }),
+          ]);
+          const serverState = isObject(statePayload.state) ? statePayload.state : statePayload;
+          state.models = normalizeModels(serverState.models);
+          state.model = state.models.some((model) => model.id === restoredDraft?.model)
+            ? restoredDraft.model
+            : selectedModelDefault();
+          state.threads = asArray(
+            threadPayload.threads?.length ? threadPayload.threads : threadPayload.sessions
+          );
+          state.totalThreads = Number(threadPayload.total) || state.threads.length;
+          state.hostReady = true;
+
+          const recent = asArray(serverState.recent_runs);
+          const active = recent.find((run) =>
+            isObject(run) && !terminalRunStatus(run.status)
+          );
+          if (active) {
+            clearDraft();
+            restoredDraft = null;
+            state.run = active;
+            state.runId = text(active.run_id || active.id);
+            state.step = "run";
+            beginPolling();
+          } else if (restoredDraft?.selectedThreadId) {
+            const selected = state.threads.find(
+              (thread) => threadId(thread) === restoredDraft.selectedThreadId
+            );
+            state.selectedThreadId = restoredDraft.selectedThreadId;
+            state.selectedThread = selected || null;
+            try {
+              const payload = await callTool("inspect_thread", {
+                thread_id: restoredDraft.selectedThreadId,
+              });
+              state.inspection = payload;
+              const models = normalizeModels(payload.models);
+              if (models.length) state.models = models;
+              state.model = state.models.some((model) => model.id === restoredDraft.model)
+                ? restoredDraft.model
+                : selectedModelDefault();
+              initializeClassifications();
+              applyDraftToInspection(restoredDraft);
+              state.step = restoredDraft.step === "thread" ? "thread" : "configure";
+              if (restoredDraft.step === "review") {
+                state.notice = "Draft restored. Prepare it again to review and approve.";
+              }
+            } catch (error) {
+              state.hostReady = false;
+              state.selectedThreadId = "";
+              state.selectedThread = null;
+              state.inspection = null;
+              state.step = "thread";
+              state.error = `The saved draft could not be restored. ${
+                error instanceof Error ? error.message : String(error)
+              }`;
+            }
+          }
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+          state.hostReady = false;
+        } finally {
+          draftPersistenceReady = state.hostReady;
+          state.loading = false;
+          render({ focus: true });
+        }
+      }
+
+      async function selectThread(id) {
+        const selected = state.threads.find((thread) => threadId(thread) === id);
+        if (!selected) return;
+        state.busy = "inspection";
+        state.error = "";
+        state.notice = "";
+        state.selectedThreadId = id;
+        state.selectedThread = selected;
+        state.inspection = null;
+        state.classifications = Object.create(null);
+        state.gitSelectionConfirmed = false;
+        state.nonGitBaseline = "";
+        state.preparation = null;
+        state.approvalChecked = false;
+        state.runId = "";
+        state.run = null;
+        state.report = null;
+        state.reportPaths = null;
+        render();
+        try {
+          const payload = await callTool("inspect_thread", { thread_id: id });
+          state.inspection = payload;
+          const models = normalizeModels(payload.models);
+          if (models.length) state.models = models;
+          if (!state.models.some((model) => model.id === state.model)) {
+            state.model = selectedModelDefault();
+          }
+          initializeClassifications();
+          state.step = "configure";
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+          state.selectedThreadId = "";
+          state.selectedThread = null;
+          state.inspection = null;
+          clearDraft();
+          state.step = "thread";
+        } finally {
+          state.busy = "";
+          render({ focus: true });
+        }
+      }
+
+      async function prepareRun() {
+        const problems = configurationProblems();
+        if (problems.length) {
+          state.error = problems.join(" ");
+          render();
+          return;
+        }
+        state.busy = "prepare";
+        state.error = "";
+        state.notice = "";
+        render();
+        try {
+          state.preparation = await callTool("prepare_run", selectionPayload());
+          state.step = "review";
+          state.notice = preparationReady()
+            ? "The bakeoff engine validated this configuration."
+            : "";
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+        } finally {
+          state.busy = "";
+          render({ focus: true });
+        }
+      }
+
+      async function startRun() {
+        if (!state.approvalChecked || !preparationReady()) return;
+        const dialog = document.getElementById("approval-dialog");
+        state.busy = "start";
+        state.error = "";
+        state.notice = "";
+        startPending = true;
+        clearDraft();
+        const startButton = document.getElementById("start-run");
+        if (startButton) {
+          startButton.disabled = true;
+          startButton.innerHTML = '<span class="spinner" aria-hidden="true"></span>Starting…';
+        }
+        try {
+          const payload = await callTool("start_run", {
+            ...selectionPayload(),
+            approved: true,
+            prepare_token: text(
+              state.preparation?.prepare_token ||
+              state.preparation?.approval?.prepare_token
+            ),
+          });
+          const run = runRecord(payload);
+          const id = currentRunId(payload);
+          if (!run || !id) {
+            throw new Error("The controller started no durable run.");
+          }
+          if (dialog?.open) dialog.close();
+          state.run = run;
+          state.runId = id;
+          state.step = "run";
+          state.approvalChecked = false;
+          clearDraft();
+          restoredDraft = null;
+          startPending = false;
+          state.busy = "";
+          render({ focus: true });
+          beginPolling();
+        } catch (error) {
+          startPending = false;
+          state.error = error instanceof Error ? error.message : String(error);
+          state.busy = "";
+          render();
+          requestAnimationFrame(() => {
+            const updated = document.getElementById("approval-dialog");
+            if (updated && !updated.open) updated.showModal();
+          });
+        }
+      }
+
+      async function refreshRun({ continuePolling = false } = {}) {
+        if (!state.runId || state.busy === "run") return;
+        state.busy = "run";
+        try {
+          const payload = await callTool("get_run", { run_id: state.runId });
+          const run = runRecord(payload);
+          if (run) state.run = run;
+          state.error = "";
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+        } finally {
+          state.busy = "";
+          render();
+        }
+        if (successfulRunStatus(state.run?.status)) {
+          await loadReport();
+          return;
+        }
+        if (continuePolling && !terminalRunStatus(state.run?.status)) {
+          schedulePoll();
+        }
+      }
+
+      function schedulePoll() {
+        const generation = state.pollGeneration;
+        window.setTimeout(() => {
+          if (generation !== state.pollGeneration) return;
+          refreshRun({ continuePolling: true });
+        }, 1800);
+      }
+
+      function beginPolling() {
+        state.pollGeneration += 1;
+        schedulePoll();
+      }
+
+      async function loadReport() {
+        if (!state.runId || state.busy === "report") return;
+        state.busy = "report";
+        state.error = "";
+        render();
+        try {
+          const payload = await callTool("get_report", { run_id: state.runId });
+          const report = isObject(payload.report) ? payload.report : payload;
+          if (!isObject(report)) throw new Error("The report response was empty.");
+          state.report = report;
+          state.reportPaths = {
+            report_json: text(payload.report_json),
+            report_html: text(payload.report_html),
+          };
+          state.step = "results";
+          state.pollGeneration += 1;
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+          state.step = "run";
+        } finally {
+          state.busy = "";
+          render({ focus: true });
+        }
+      }
+
+      async function copyReportPath() {
+        const value = text(state.reportPaths?.report_json);
+        if (!value) return;
+        try {
+          await navigator.clipboard.writeText(value);
+          state.notice = "Report path copied.";
+        } catch {
+          state.error = "Clipboard access is unavailable. Select the report path shown on the page.";
+        }
+        render();
+      }
+
+      async function downloadReport(format) {
+        if (!state.runId || !["json", "html"].includes(format)) return;
+        const sessionToken = controllerSessionToken();
+        if (!sessionToken) {
+          state.error =
+            "This browser session has expired. Invoke the plugin again to reopen the controller.";
+          render();
+          return;
+        }
+        try {
+          const response = await fetch("/api/download", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Claude-Bakeoff-Session": sessionToken,
+            },
+            body: JSON.stringify({ run_id: state.runId, format }),
+          });
+          if (!response.ok) {
+            let detail = "";
+            try {
+              const payload = await response.json();
+              detail = text(payload.error || payload.content?.[0]?.text);
+            } catch {
+              // Fall back to the status-based message below.
+            }
+            throw new Error(detail || `The report download failed (${response.status}).`);
+          }
+          const url = URL.createObjectURL(await response.blob());
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = `claude-bakeoff-${state.runId}-report.${format}`;
+          document.body.append(link);
+          try {
+            link.click();
+          } finally {
+            link.remove();
+            URL.revokeObjectURL(url);
+          }
+          state.error = "";
+          state.notice = `${format.toUpperCase()} report download started.`;
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+        }
+        render();
+      }
+
+      app.addEventListener("click", (event) => {
+        const target = event.target.closest("[data-action]");
+        if (!target || target.disabled) return;
+        const action = target.dataset.action;
+        if (action === "retry-init") initialize();
+        if (action === "refresh-threads") loadThreads(state.query);
+        if (action === "select-thread") selectThread(target.dataset.threadId || "");
+        if (action === "prepare") prepareRun();
+        if (action === "start") startRun();
+        if (action === "refresh-run") refreshRun();
+        if (action === "load-report") loadReport();
+        if (action === "copy-report-path") copyReportPath();
+        if (action === "download-report") downloadReport(target.dataset.format || "");
+        if (action === "reset-controller") resetController();
+        if (action === "open-approval") {
+          state.approvalChecked = false;
+          const dialog = document.getElementById("approval-dialog");
+          if (dialog && !dialog.open) dialog.showModal();
+        }
+        if (action === "close-approval") {
+          document.getElementById("approval-dialog")?.close();
+        }
+        if (action === "go-step") {
+          const step = target.dataset.step;
+          if (!step || (!canNavigateTo(step) && step !== "thread" && step !== "configure")) return;
+          if (step === "thread" && state.step !== "thread") {
+            state.pollGeneration += 1;
+            state.error = "";
+            state.notice = "";
+          }
+          state.step = step;
+          render({ focus: true });
+        }
+      });
+
+      app.addEventListener("input", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLInputElement)) return;
+        if (target.id === "thread-search") {
+          state.query = target.value;
+          render();
+          requestAnimationFrame(() => {
+            const input = document.getElementById("thread-search");
+            if (input) {
+              input.focus();
+              input.setSelectionRange(state.query.length, state.query.length);
+            }
+          });
+        }
+        if (target.id === "timeout") {
+          state.timeoutSeconds = Number(target.value);
+          state.preparation = null;
+          saveDraft();
+        }
+        if (target.id === "approval-check") {
+          state.approvalChecked = target.checked;
+          const start = document.getElementById("start-run");
+          if (start) start.disabled = !target.checked;
+        }
+      });
+
+      app.addEventListener("change", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement)) return;
+        state.error = "";
+        state.notice = "";
+        if (target.id === "model") {
+          state.model = target.value;
+          state.preparation = null;
+          render();
+          return;
+        }
+        if (target.id === "timeout") {
+          state.timeoutSeconds = Number(target.value);
+          state.preparation = null;
+          render();
+          return;
+        }
+        if (target.id === "git-confirmation") {
+          state.gitSelectionConfirmed = target.checked;
+          state.preparation = null;
+          render();
+          return;
+        }
+        if (target.name === "non-git-baseline") {
+          state.nonGitBaseline = target.value;
+          state.preparation = null;
+          render();
+          return;
+        }
+        if (target.dataset.fileKind === "git") {
+          state.classifications[target.dataset.path] = target.checked ? "claude" : "exclude";
+          state.preparation = null;
+          render();
+          return;
+        }
+        if (target.dataset.fileKind === "non_git") {
+          state.classifications[target.dataset.path] = target.value;
+          state.preparation = null;
+          render();
+        }
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape") return;
+        const dialog = document.getElementById("approval-dialog");
+        if (dialog?.open && state.busy !== "start") dialog.close();
+      });
+
+      window.addEventListener("pagehide", saveDraft);
+
+      initialize();
+    })();
+  </script>
+</body>
+</html>
