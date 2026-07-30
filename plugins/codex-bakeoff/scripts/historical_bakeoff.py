@@ -368,6 +368,7 @@ def _prompt(replay: Mapping[str, Any]) -> str:
         "Do not inspect or modify the original Claude output directory. "
         "Ignore the contents of memory_summary.md. "
         "Do not read memory files or invoke the codex-bakeoff skill. "
+        "Do not run browser-control or browser-based end-to-end tests. Use non-browser validation only. "
         "Implement only from the original request and current workspace. "
         f"Original user requests:\n{request}"
     )
