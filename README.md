@@ -18,13 +18,14 @@ selection, approval, execution, verification, blinded review, and reporting.
 The installed plugin is prebuilt. Node.js is needed to run the bundled Codex
 worker; npm is only needed when rebuilding the worker from source.
 
-## Install in a workspace
+## Install in Codex
 
-1. Open **Workspace settings → Plugins → Create → Import from GitHub**.
-2. Enter `https://github.com/jgrodman-arch/codex-bakeoff`.
-3. Select the `main` branch, leave sparse paths blank, and import the plugin.
-4. Configure the installation policy and role access for **Codex Bakeoff**.
-5. Start a new task and ask Codex to open the Codex Bakeoff controller.
+1. Open **Plugins → Add → Add a marketplace**.
+2. Set **Source** to `https://github.com/jgrodman-arch/codex-bakeoff` and
+   leave the other fields empty.
+3. Search Plugins for **Codex Bakeoff**, then install it.
+4. Open a new chat and invoke the **@Codex Bakeoff** plugin. The controller UI
+   should open in Chrome.
 
 The plugin never downloads or replaces its own source. After a release is
 published, a workspace admin can force a refresh with **Update plugin** from the
