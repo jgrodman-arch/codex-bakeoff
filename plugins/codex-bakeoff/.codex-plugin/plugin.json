@@ -3,7 +3,7 @@
   "version": "1.0.1",
   "description": "Run a Codex bakeoff from an external-browser controller.",
   "author": {
-    "name": "OpenAI FDE",
+    "name": "OpenAI",
     "url": "https://github.com/jgrodman-arch/codex-bakeoff"
   },
   "homepage": "https://github.com/jgrodman-arch/codex-bakeoff",
@@ -20,7 +20,7 @@
     "displayName": "Codex Bakeoff",
     "shortDescription": "Run a bakeoff entirely in your external browser.",
     "longDescription": "Open an external-browser controller to select one imported historical Claude thread, choose a Codex model, classify the baseline, approve one native Codex implementation, follow live progress, and review the blinded comparison. Selection, execution, verification, evaluation, and results stay in the controller instead of a guided chat workflow.",
-    "developerName": "OpenAI FDE",
+    "developerName": "OpenAI",
     "category": "Productivity",
     "websiteURL": "https://github.com/jgrodman-arch/codex-bakeoff",
     "brandColor": "#3867D6",
