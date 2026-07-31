@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -112,6 +113,31 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            _jsonable(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _canonical_json_sha256(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def _write_canonical_json(path: Path, payload: Mapping[str, Any]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = _canonical_json_bytes(payload)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+    temporary.write_bytes(serialized)
+    temporary.replace(path)
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def _write_report_html(run_directory: Path, report: Mapping[str, Any]) -> None:
@@ -279,6 +305,116 @@ def _git_root(repository: Path) -> Path | None:
         return Path(root.stdout.strip()).resolve()
     except OSError:
         return None
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _git_root_for_changed_file(path: Path) -> Path | None:
+    directory = path if path.is_dir() else path.parent
+    while not directory.is_dir() and directory.parent != directory:
+        directory = directory.parent
+    return _git_root(directory)
+
+
+def _resolved_replay_repository(
+    args: argparse.Namespace,
+    replay: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    resolved = dict(replay)
+    raw_original = replay.get("project_dir")
+    original = (
+        _canonical_parent_path(raw_original)
+        if isinstance(raw_original, (str, Path)) and str(raw_original).strip()
+        else None
+    )
+    if original is not None:
+        resolved["original_project_dir"] = str(original)
+
+    raw_changed_files = replay.get("historical_changed_files")
+    raw_changed_files = raw_changed_files if isinstance(raw_changed_files, list) else []
+    changed_files: list[Path] = []
+    blocking_reasons: list[str] = []
+    for raw_path in raw_changed_files:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        expanded = Path(raw_path).expanduser()
+        if not expanded.is_absolute():
+            blocking_reasons.append(
+                "A task-attributed Claude file path is not absolute, so one replay "
+                "repository cannot be resolved."
+            )
+            continue
+        changed_files.append(_canonical_parent_path(expanded))
+
+    changed_roots = [_git_root_for_changed_file(path) for path in changed_files]
+    known_roots = {root for root in changed_roots if root is not None}
+    suggested = original
+    if changed_files and not blocking_reasons:
+        contained_by_original = (
+            original is not None
+            and all(_path_is_within(path, original) for path in changed_files)
+        )
+        original_root = _git_root(original) if original is not None else None
+        if (
+            contained_by_original
+            and original_root is not None
+            and all(root == original_root for root in changed_roots)
+        ):
+            suggested = original
+        elif contained_by_original and all(root is None for root in changed_roots):
+            suggested = original
+        elif len(known_roots) == 1 and all(root is not None for root in changed_roots):
+            suggested = next(iter(known_roots))
+        elif len(known_roots) > 1:
+            blocking_reasons.append(
+                "Claude changed files in multiple Git repositories; one bakeoff "
+                "requires one repository."
+            )
+        else:
+            blocking_reasons.append(
+                "A task-attributed Claude file is outside an accessible Git repository, "
+                "so one replay repository cannot be resolved."
+            )
+
+    raw_explicit = getattr(args, "repo", None)
+    explicit = (
+        _canonical_parent_path(raw_explicit)
+        if isinstance(raw_explicit, (str, Path)) and str(raw_explicit).strip()
+        else None
+    )
+    if explicit is not None and changed_files and not all(
+        _path_is_within(path, explicit) for path in changed_files
+    ):
+        blocking_reasons.append(
+            "The selected repository excludes task-attributed Claude changes."
+        )
+    effective = explicit or suggested
+    if effective is not None:
+        resolved["project_dir"] = str(effective)
+        resolved["project_dirs"] = [str(effective)]
+
+    source = "explicit_repo" if explicit is not None else "original_project_dir"
+    if (
+        explicit is None
+        and changed_files
+        and suggested is not None
+        and original is not None
+        and suggested != original
+    ):
+        source = "historical_changed_files"
+    resolution = {
+        "source": source,
+        "original_project_dir": str(original) if original is not None else None,
+        "effective_project_dir": str(effective) if effective is not None else None,
+    }
+    resolved["repository_resolution"] = resolution
+    return resolved, resolution, list(dict.fromkeys(blocking_reasons))
 
 
 def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, Any]:
@@ -582,12 +718,14 @@ def _configuration(
             "user_message_count": replay.get("user_message_count", 1),
             "request": replay.get("request"),
             "project": replay.get("project_dir"),
+            "original_project": replay.get("original_project_dir"),
         },
         "baseline": {
             "kind": baseline.get("kind"),
             "proposed_kind": baseline.get("proposed_kind"),
             "repository": baseline.get("repository"),
             "attribution_root": baseline.get("attribution_root"),
+            "repository_resolution": baseline.get("repository_resolution"),
             "commit": baseline.get("commit"),
             "confidence": baseline.get("confidence"),
             "historical_working_tree_state": baseline.get("working_tree_state"),
@@ -616,10 +754,16 @@ def _configuration(
 def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
     if args.timeout_seconds > MAX_TIMEOUT_SECONDS:
         raise BakeoffError("The execution timeout cannot exceed 14,400 seconds.")
-    replay = _selected_replay(args)
+    replay, repository_resolution, repository_blockers = _resolved_replay_repository(
+        args,
+        _selected_replay(args),
+    )
     baseline, file_selection = _classified_baseline(
         args,
-        _baseline(args, replay),
+        {
+            **_baseline(args, replay),
+            "repository_resolution": repository_resolution,
+        },
     )
     model = _selected_model(args.model, args.model_cache)
     capabilities = _capabilities(replay)
@@ -634,9 +778,33 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
         "sandbox_policy": {"type": "workspaceWrite", "networkAccess": True},
     }
     questions = _selection_questions(file_selection)
-    blocking_reasons = _blocking_reasons(baseline, file_selection)
+    blocking_reasons = [
+        *repository_blockers,
+        *_blocking_reasons(baseline, file_selection),
+    ]
     runnable = baseline.get("kind") in {"git_commit", "empty_directory"}
-    if questions:
+    historical_candidate: dict[str, Any] | None = None
+    replay_has_transcript = all(
+        isinstance(replay.get(field), str) and bool(str(replay.get(field)).strip())
+        for field in ("source_path", "message_uuid")
+    )
+    if not questions and runnable and not blocking_reasons:
+        if not replay_has_transcript:
+            blocking_reasons.append(
+                "The selected historical transcript and original user-message UUID "
+                "are required before starting Codex."
+            )
+        else:
+            try:
+                historical_candidate = _serialize_historical_candidate(
+                    *_historical_candidate(context)
+                )
+            except BakeoffError as error:
+                blocking_reasons.append(str(error))
+    context["historical_candidate"] = historical_candidate
+    if repository_blockers:
+        status = "blocked"
+    elif questions:
         status = "needs_user_input"
     elif runnable and not blocking_reasons:
         status = "ready_for_approval"
@@ -659,7 +827,22 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _command_prepare(args: argparse.Namespace) -> dict[str, Any]:
-    return _prepare_context(args)
+    prepared = _prepare_context(args)
+    result = {
+        key: value
+        for key, value in prepared.items()
+        if key != "historical_candidate"
+    }
+    result["prepared_configuration_sha256"] = _canonical_json_sha256(
+        prepared["configuration"]
+    )
+    historical_candidate = prepared.get("historical_candidate")
+    result["historical_result_sha256"] = (
+        _canonical_json_sha256(historical_candidate)
+        if isinstance(historical_candidate, Mapping)
+        else None
+    )
+    return result
 
 
 def _command_run(args: argparse.Namespace) -> dict[str, Any]:
@@ -680,6 +863,55 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
             "The prepared configuration is not runnable; no Codex task was "
             f"requested. {detail}".strip()
         )
+    expected_prepared_configuration_sha256 = getattr(
+        args,
+        "expected_prepared_configuration_sha256",
+        None,
+    )
+    if expected_prepared_configuration_sha256 is not None:
+        prepared_configuration_sha256 = _canonical_json_sha256(
+            prepared["configuration"]
+        )
+        if (
+            not isinstance(expected_prepared_configuration_sha256, str)
+            or re.fullmatch(
+                r"[a-f0-9]{64}",
+                expected_prepared_configuration_sha256,
+            )
+            is None
+            or not secrets.compare_digest(
+                prepared_configuration_sha256,
+                expected_prepared_configuration_sha256,
+            )
+        ):
+            raise BakeoffError(
+                "The prepared configuration changed or its digest is invalid; run "
+                "`prepare` again, review the current configuration, and approve it "
+                "again. No Codex task was requested."
+            )
+    historical_candidate = prepared.get("historical_candidate")
+    if not isinstance(historical_candidate, Mapping):
+        raise BakeoffError(
+            "The historical Claude candidate was not frozen; no Codex task was requested."
+        )
+    historical_result_sha256 = _canonical_json_sha256(historical_candidate)
+    expected_historical_result_sha256 = getattr(
+        args,
+        "expected_historical_result_sha256",
+        None,
+    )
+    if expected_historical_result_sha256 is not None and (
+        not isinstance(expected_historical_result_sha256, str)
+        or re.fullmatch(r"[a-f0-9]{64}", expected_historical_result_sha256) is None
+        or not secrets.compare_digest(
+            historical_result_sha256,
+            expected_historical_result_sha256,
+        )
+    ):
+        raise BakeoffError(
+            "The historical Claude result changed after preparation; prepare and "
+            "approve it again. No Codex task was requested."
+        )
     run_directory = _new_run_directory(args.run_root)
     target = _target_for_baseline(
         prepared["baseline"],
@@ -698,6 +930,11 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
             "sandbox_policy",
         )
     }
+    historical_result_path = run_directory / "historical-result.json"
+    _write_canonical_json(
+        historical_result_path,
+        historical_candidate,
+    )
     record = {
         "schema_version": 1,
         "status": "awaiting_native_task",
@@ -710,6 +947,11 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
         **context,
         "target": target,
         "baseline_materialization": None,
+        "historical_result": {
+            "schema_version": 1,
+            "path": historical_result_path.name,
+            "sha256": historical_result_sha256,
+        },
     }
     _write_json(run_directory / "run.json", record)
     return {
@@ -789,8 +1031,13 @@ def _historical_candidate(
         }
     else:
         try:
+            recovery_replay = {
+                **replay,
+                "project_dir": str(repository),
+                "project_dirs": [str(repository)],
+            }
             recovery = _discovery().recover_historical_solution(
-                replay,
+                recovery_replay,
                 baseline.get("commit"),
                 baseline_kind=baseline.get("kind", "git_commit"),
             )
@@ -880,6 +1127,73 @@ def _historical_candidate(
     return candidate, recovery, final_response or ""
 
 
+def _serialize_historical_candidate(
+    candidate: Any | None,
+    recovery: Mapping[str, Any],
+    final_response: str,
+) -> dict[str, Any]:
+    if candidate is None:
+        raise BakeoffError("The historical Claude candidate could not be serialized.")
+    return {
+        "schema_version": 1,
+        "candidate": _jsonable(candidate),
+        "recovery": _jsonable(recovery),
+        "final_response": final_response,
+    }
+
+
+def _historical_candidate_for_completion(
+    run: Mapping[str, Any],
+    run_directory: Path,
+) -> tuple[Any | None, dict[str, Any], str]:
+    if "historical_result" not in run:
+        return _historical_candidate(run)
+    metadata = run.get("historical_result")
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("schema_version") != 1
+        or metadata.get("path") != "historical-result.json"
+        or not isinstance(metadata.get("sha256"), str)
+        or re.fullmatch(r"[a-f0-9]{64}", metadata["sha256"]) is None
+    ):
+        raise BakeoffError("The frozen historical Claude artifact metadata is invalid.")
+    artifact_path = run_directory / "historical-result.json"
+    try:
+        serialized = artifact_path.read_bytes()
+    except OSError as error:
+        raise BakeoffError(
+            f"Cannot read the frozen historical Claude artifact: {_redact(error)}"
+        ) from error
+    observed_digest = hashlib.sha256(serialized).hexdigest()
+    if not secrets.compare_digest(observed_digest, metadata["sha256"]):
+        raise BakeoffError("The frozen historical Claude artifact digest does not match.")
+    try:
+        frozen = json.loads(serialized.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise BakeoffError(
+            f"Cannot read the frozen historical Claude artifact: {_redact(error)}"
+        ) from error
+    if not isinstance(frozen, Mapping) or frozen.get("schema_version") != 1:
+        raise BakeoffError("The frozen historical Claude candidate is invalid.")
+    raw_candidate = frozen.get("candidate")
+    raw_recovery = frozen.get("recovery")
+    final_response = frozen.get("final_response")
+    if (
+        not isinstance(raw_candidate, Mapping)
+        or not isinstance(raw_candidate.get("diff"), str)
+        or not isinstance(raw_recovery, Mapping)
+        or not isinstance(final_response, str)
+    ):
+        raise BakeoffError("The frozen historical Claude candidate is invalid.")
+    candidate = _execution().CandidateSolution(
+        provider="claude",
+        diff=raw_candidate["diff"],
+        model=str(raw_candidate.get("model") or "unknown"),
+        final_response=final_response,
+    )
+    return candidate, dict(raw_recovery), final_response
+
+
 def _codex_candidate(
     run: Mapping[str, Any],
     native: Mapping[str, Any],
@@ -963,7 +1277,10 @@ def _command_complete_run(args: argparse.Namespace) -> dict[str, Any]:
     run = _load_json(run_directory / "run.json", label="the bakeoff run")
     native_path = args.native_result.expanduser().resolve()
     native = _load_json(native_path, label="the native result")
-    claude_candidate, recovery, historical_final = _historical_candidate(run)
+    claude_candidate, recovery, historical_final = _historical_candidate_for_completion(
+        run,
+        run_directory,
+    )
     codex_candidate, codex_diff, changed = _codex_candidate(run, native)
     claude_usage, codex_usage = _usage_records(run, native)
     limitations = list(recovery.get("limitations", []))
@@ -1434,6 +1751,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Record explicit user approval of the reviewed prepare output.",
     )
+    run.add_argument(
+        "--expected-historical-result-sha256",
+        help="Require the approved prepare-time historical result digest.",
+    )
+    run.add_argument(
+        "--expected-prepared-configuration-sha256",
+        help="Require the exact approved prepare-time configuration digest.",
+    )
     run.add_argument("--run-root", type=Path)
     _add_json(run)
 
@@ -1501,17 +1826,26 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         replay = _selected_replay(args)
         return {"status": "ok", **_capabilities(replay)}
     if args.command == "baseline":
-        replay = _selected_replay(args)
+        replay, repository_resolution, repository_blockers = _resolved_replay_repository(
+            args,
+            _selected_replay(args),
+        )
         baseline, selection = _classified_baseline(
             args,
-            _baseline(args, replay),
+            {
+                **_baseline(args, replay),
+                "repository_resolution": repository_resolution,
+            },
         )
         return {
             "status": "ok",
             "baseline": baseline,
             "file_selection": selection,
             "questions": _selection_questions(selection),
-            "blocking_reasons": _blocking_reasons(baseline, selection),
+            "blocking_reasons": [
+                *repository_blockers,
+                *_blocking_reasons(baseline, selection),
+            ],
         }
     if args.command == "models":
         return discover_codex_models(args.model_cache)

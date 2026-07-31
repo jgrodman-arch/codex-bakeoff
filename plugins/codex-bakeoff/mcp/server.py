@@ -37,6 +37,7 @@ WORKER = Path(__file__).resolve().parent / "codex-worker.mjs"
 DEFAULT_RUN_ROOT = Path.home() / ".cache" / "codex-bakeoff" / "runs"
 RUN_ROOT = Path(os.environ.get("CODEX_BAKEOFF_RUN_ROOT", DEFAULT_RUN_ROOT)).expanduser().resolve()
 STATE_NAME = "controller-state.json"
+RUN_LOG_NAME = "run.log"
 
 SERVER_NAME = "codex-bakeoff"
 APP_TITLE = "Codex Bakeoff"
@@ -88,6 +89,7 @@ _active_processes: set[subprocess.Popen[str]] = set()
 _active_processes_lock = threading.RLock()
 _pending_port_conflicts: dict[str, dict[str, Any]] = {}
 _pending_port_conflicts_lock = threading.Lock()
+_run_log_lock = threading.Lock()
 _shutdown = threading.Event()
 
 
@@ -1106,12 +1108,59 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
         pass
 
 
+def _run_log_path(run_directory: Path) -> Path:
+    return run_directory / RUN_LOG_NAME
+
+
+def _append_run_log(path: Path, source: str, message: str) -> None:
+    line = f"{_utc_now()} [{source}] {message.rstrip()}\n"
+    try:
+        with _run_log_lock:
+            descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                os.write(descriptor, line.encode("utf-8", errors="replace"))
+            finally:
+                os.close(descriptor)
+    except OSError as error:
+        print(f"Cannot write bakeoff run log: {error}", file=sys.stderr)
+
+
+def _record_completed_process(
+    path: Path,
+    label: str,
+    completed: subprocess.CompletedProcess[str],
+) -> None:
+    _append_run_log(path, label, f"finished with exit code {completed.returncode}")
+    if completed.stderr:
+        for line in completed.stderr.splitlines():
+            _append_run_log(path, f"{label}:stderr", line)
+    if completed.returncode != 0 and completed.stdout:
+        for line in completed.stdout.splitlines():
+            _append_run_log(path, f"{label}:stdout", line)
+
+
+def _stream_process_output(
+    stream: Any,
+    chunks: list[str],
+    path: Path,
+    source: str,
+) -> None:
+    try:
+        for line in stream:
+            chunks.append(line)
+            _append_run_log(path, source, line)
+    finally:
+        stream.close()
+
+
 def _run_process(
     command: Sequence[str],
     *,
     cwd: Path,
     timeout: int,
     input_text: str | None = None,
+    stream_log_path: Path | None = None,
+    stream_log_label: str = "process",
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         list(command),
@@ -1124,12 +1173,84 @@ def _run_process(
     )
     with _active_processes_lock:
         _active_processes.add(process)
+    if stream_log_path is not None:
+        _append_run_log(stream_log_path, stream_log_label, "started")
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        stdout_thread = threading.Thread(
+            target=_stream_process_output,
+            args=(
+                process.stdout,
+                stdout_chunks,
+                stream_log_path,
+                f"{stream_log_label}:stdout",
+            ),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_stream_process_output,
+            args=(
+                process.stderr,
+                stderr_chunks,
+                stream_log_path,
+                f"{stream_log_label}:stderr",
+            ),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        if input_text is not None and process.stdin is not None:
+            try:
+                process.stdin.write(input_text)
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            _append_run_log(
+                stream_log_path,
+                stream_log_label,
+                f"timed out after {timeout} seconds",
+            )
+            _terminate_process_group(process)
+            stdout_thread.join()
+            stderr_thread.join()
+            raise subprocess.TimeoutExpired(
+                error.cmd,
+                error.timeout,
+                output="".join(stdout_chunks),
+                stderr="".join(stderr_chunks),
+            ) from error
+        finally:
+            with _active_processes_lock:
+                _active_processes.discard(process)
+        stdout_thread.join()
+        stderr_thread.join()
+        _append_run_log(
+            stream_log_path,
+            stream_log_label,
+            f"finished with exit code {process.returncode}",
+        )
+        return subprocess.CompletedProcess(
+            args=list(command),
+            returncode=process.returncode,
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+        )
     try:
         stdout, stderr = process.communicate(input=input_text, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as error:
         _terminate_process_group(process)
-        process.communicate()
-        raise
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            error.cmd,
+            error.timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from error
     finally:
         with _active_processes_lock:
             _active_processes.discard(process)
@@ -1146,6 +1267,7 @@ def _engine(
     arguments: Sequence[str] = (),
     *,
     timeout: int = 180,
+    run_directory: Path | None = None,
 ) -> dict[str, Any]:
     bounded_timeout = _bounded_int(
         timeout,
@@ -1153,11 +1275,22 @@ def _engine(
         minimum=1,
         maximum=MAX_COMMAND_TIMEOUT,
     )
-    completed = _run_process(
-        [sys.executable, str(RUNNER), command, *arguments, "--json"],
-        cwd=PLUGIN_ROOT,
-        timeout=bounded_timeout,
-    )
+    log_path = _run_log_path(run_directory) if run_directory is not None else None
+    label = f"engine:{command}"
+    if log_path is not None:
+        _append_run_log(log_path, label, "started")
+    try:
+        completed = _run_process(
+            [sys.executable, str(RUNNER), command, *arguments, "--json"],
+            cwd=PLUGIN_ROOT,
+            timeout=bounded_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        if log_path is not None:
+            _append_run_log(log_path, label, f"timed out after {bounded_timeout} seconds")
+        raise
+    if log_path is not None:
+        _record_completed_process(log_path, label, completed)
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as error:
@@ -1235,6 +1368,22 @@ def _prepare_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
     configuration = _normalized_configuration(arguments)
     payload = _engine("prepare", _configuration_arguments(arguments))
     ready = payload.get("status") == "ready_for_approval"
+    historical_result_sha256 = payload.get("historical_result_sha256")
+    if ready and (
+        not isinstance(historical_result_sha256, str)
+        or re.fullmatch(r"[a-f0-9]{64}", historical_result_sha256) is None
+    ):
+        raise ControllerError(
+            "The prepared historical Claude result has no valid integrity digest."
+        )
+    prepared_configuration_sha256 = payload.get("prepared_configuration_sha256")
+    if ready and (
+        not isinstance(prepared_configuration_sha256, str)
+        or re.fullmatch(r"[a-f0-9]{64}", prepared_configuration_sha256) is None
+    ):
+        raise ControllerError(
+            "The prepared bakeoff configuration has no valid integrity digest."
+        )
     prepare_token: str | None = None
     if ready:
         prepare_token = secrets.token_urlsafe(32)
@@ -1243,6 +1392,8 @@ def _prepare_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
                 _prepared_runs.pop(next(iter(_prepared_runs)))
             _prepared_runs[prepare_token] = {
                 "fingerprint": _configuration_fingerprint(configuration),
+                "historical_result_sha256": historical_result_sha256,
+                "prepared_configuration_sha256": prepared_configuration_sha256,
                 "run_id": None,
                 "starting": False,
             }
@@ -1314,11 +1465,16 @@ def _initial_state(
         for phase_id, label in PHASES
     ]
     now = _utc_now()
+    log_path = _run_log_path(run_directory)
+    log_path.touch(mode=0o600, exist_ok=True)
+    log_path.chmod(0o600)
+    _append_run_log(log_path, "controller", "run approved")
     return {
         "schema_version": 2,
         "id": run_directory.name,
         "run_id": run_directory.name,
         "run_directory": str(run_directory),
+        "log_path": str(log_path),
         "controller_pid": os.getpid(),
         "prepare_token_hash": (
             hashlib.sha256(prepare_token.encode("utf-8")).hexdigest()
@@ -1398,6 +1554,15 @@ def _update_state(
                 del events[:-200]
         state["updated_at"] = _utc_now()
         _write_json(path, state)
+        if summary:
+            _append_run_log(
+                _run_log_path(run_directory),
+                "controller",
+                (
+                    f"{phase or state.get('phase')} "
+                    f"[{status or state.get('status', 'running')}]: {summary[:1_000]}"
+                ),
+            )
         return state
 
 
@@ -1406,12 +1571,24 @@ def _subprocess(
     *,
     cwd: Path,
     timeout: int = 180,
+    run_directory: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = _run_process(
-        command,
-        cwd=cwd,
-        timeout=timeout,
-    )
+    log_path = _run_log_path(run_directory) if run_directory is not None else None
+    label = f"process:{Path(command[0]).name}"
+    if log_path is not None:
+        _append_run_log(log_path, label, "started")
+    try:
+        completed = _run_process(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        if log_path is not None:
+            _append_run_log(log_path, label, f"timed out after {timeout} seconds")
+        raise
+    if log_path is not None:
+        _record_completed_process(log_path, label, completed)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "No output.").strip()
         raise ControllerError(f"{Path(command[0]).name} failed: {detail[:1_500]}")
@@ -1442,11 +1619,13 @@ def _materialize_workspace(run_directory: Path, target: Mapping[str, Any]) -> Pa
         ["git", "clone", "--shared", "--no-checkout", str(repository), str(workspace)],
         cwd=run_directory,
         timeout=300,
+        run_directory=run_directory,
     )
     _subprocess(
         ["git", "-C", str(workspace), "checkout", "--detach", commit],
         cwd=run_directory,
         timeout=180,
+        run_directory=run_directory,
     )
     return workspace.resolve()
 
@@ -1512,8 +1691,10 @@ def _long_command_timeout(
 def _run_worker(
     request: Mapping[str, Any],
     *,
+    run_directory: Path,
     working_directory: Path,
     read_only: bool,
+    log_label: str,
 ) -> dict[str, Any]:
     if not WORKER.is_file():
         raise ControllerError("The packaged Codex worker is unavailable.")
@@ -1528,6 +1709,8 @@ def _run_worker(
         input_text=json.dumps(payload, ensure_ascii=False) + "\n",
         cwd=PLUGIN_ROOT,
         timeout=timeout,
+        stream_log_path=_run_log_path(run_directory),
+        stream_log_label=log_label,
     )
     records: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
@@ -1593,7 +1776,12 @@ def _collect_result(
         arguments.extend(("--evaluator", evaluator))
     if normalization_for is not None:
         arguments.extend(("--normalization-for", normalization_for))
-    return _engine("collect-native-result", arguments, timeout=timeout)
+    return _engine(
+        "collect-native-result",
+        arguments,
+        timeout=timeout,
+        run_directory=run_directory,
+    )
 
 
 def _run_review_requests(
@@ -1646,8 +1834,10 @@ def _run_review_requests(
                 request["candidate_paths"] = isolated_paths
             worker = _run_worker(
                 request,
+                run_directory=run_directory,
                 working_directory=workspace,
                 read_only=True,
+                log_label=f"{'normalization' if normalization else 'review'}:{evaluator}",
             )
             collected = _collect_result(
                 run_directory,
@@ -1682,7 +1872,13 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             summary="The approved Codex implementation is running.",
             details={"workspace": str(workspace)},
         )
-        worker = _run_worker(task_request, working_directory=workspace, read_only=False)
+        worker = _run_worker(
+            task_request,
+            run_directory=run_directory,
+            working_directory=workspace,
+            read_only=False,
+            log_label="implementation",
+        )
         _update_state(
             run_directory,
             phase="collecting",
@@ -1703,6 +1899,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
         _engine(
             "complete-run",
             ["--run-dir", str(run_directory), "--native-result", native_result],
+            run_directory=run_directory,
         )
         _update_state(
             run_directory,
@@ -1713,6 +1910,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             "verify",
             ["--run-dir", str(run_directory)],
             timeout=long_timeout,
+            run_directory=run_directory,
         )
         _update_state(
             run_directory,
@@ -1724,6 +1922,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             "evaluate",
             ["--run-dir", str(run_directory), "--evaluator", "codex"],
             timeout=long_timeout,
+            run_directory=run_directory,
         )
         requests = evaluation.get("task_requests")
         if isinstance(requests, list) and requests:
@@ -1740,6 +1939,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
                     ],
                 ],
                 timeout=long_timeout,
+                run_directory=run_directory,
             )
             combined_path = combined.get("native_results_path")
             if not isinstance(combined_path, str):
@@ -1753,6 +1953,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
                     combined_path,
                 ],
                 timeout=long_timeout,
+                run_directory=run_directory,
             )
             normalization_requests = completed.get("task_requests")
             if (
@@ -1779,6 +1980,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
                         ],
                     ],
                     timeout=long_timeout,
+                    run_directory=run_directory,
                 )
         _update_state(
             run_directory,
@@ -1789,6 +1991,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             "report",
             ["--run-dir", str(run_directory)],
             timeout=long_timeout,
+            run_directory=run_directory,
         )
         report = _read_json(
             Path(str(report_paths["report_json"])),
@@ -1882,13 +2085,38 @@ def _start_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
             return {"run_id": run_id, "run": state, "idempotent": True}
         if receipt.get("starting") is True:
             raise ControllerError("This approved run is already being started. Retry shortly.")
+        historical_result_sha256 = receipt.get("historical_result_sha256")
+        if (
+            not isinstance(historical_result_sha256, str)
+            or re.fullmatch(r"[a-f0-9]{64}", historical_result_sha256) is None
+        ):
+            raise ControllerError(
+                "The approved historical Claude result has no valid integrity digest."
+            )
+        prepared_configuration_sha256 = receipt.get("prepared_configuration_sha256")
+        if (
+            not isinstance(prepared_configuration_sha256, str)
+            or re.fullmatch(r"[a-f0-9]{64}", prepared_configuration_sha256) is None
+        ):
+            raise ControllerError(
+                "The approved bakeoff configuration has no valid integrity digest."
+            )
         receipt["starting"] = True
 
     try:
         command_arguments = _configuration_arguments(configuration)
         payload = _engine(
             "run",
-            [*command_arguments, "--approve", "--run-root", str(RUN_ROOT)],
+            [
+                *command_arguments,
+                "--expected-historical-result-sha256",
+                historical_result_sha256,
+                "--expected-prepared-configuration-sha256",
+                prepared_configuration_sha256,
+                "--approve",
+                "--run-root",
+                str(RUN_ROOT),
+            ],
         )
     except Exception:
         with _jobs_lock:
@@ -2012,6 +2240,8 @@ def _call_tool(params: Any) -> dict[str, Any]:
             "plugin_version": SERVER_VERSION,
             "models": list(models.get("options") or []),
             "recent_runs": _recent_runs(),
+            "run_root": str(RUN_ROOT),
+            "controller_log_path": str(CONTROLLER_LOG_PATH),
         }
         return _text_result("Codex Bakeoff is ready.", {"state": state})
     if name == "list_threads":

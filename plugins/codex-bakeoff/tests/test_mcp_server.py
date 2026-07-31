@@ -531,6 +531,11 @@ class McpServerTests(unittest.TestCase):
         )[0]
         self.assertIn("URL.createObjectURL", download_report)
         self.assertIn("URL.revokeObjectURL", download_report)
+        self.assertIn("function renderDiagnostics()", controller)
+        self.assertIn("Current run log", controller)
+        self.assertIn("Controller log", controller)
+        self.assertIn("serverState.run_root", controller)
+        self.assertIn("serverState.controller_log_path", controller)
         for field in (
             "selectedThreadId",
             "model",
@@ -616,6 +621,8 @@ class McpServerTests(unittest.TestCase):
                 "blocking_reasons": [],
                 "approval_prompt": "Approve?",
                 "configuration": {"model": "gpt-5.6-terra"},
+                "historical_result_sha256": "a" * 64,
+                "prepared_configuration_sha256": "c" * 64,
             }
 
         with mock.patch.object(server, "_engine", side_effect=fake_engine):
@@ -666,9 +673,31 @@ class McpServerTests(unittest.TestCase):
                         "status": "ready_for_approval",
                         "blocking_reasons": [],
                         "approval_prompt": "Approve?",
+                        "historical_result_sha256": "b" * 64,
+                        "prepared_configuration_sha256": "d" * 64,
                     }
                 if command == "run":
                     run_calls += 1
+                    self.assertIn(
+                        [
+                            "--expected-historical-result-sha256",
+                            "b" * 64,
+                        ],
+                        [
+                            list(arguments[index : index + 2])
+                            for index in range(len(arguments) - 1)
+                        ],
+                    )
+                    self.assertIn(
+                        [
+                            "--expected-prepared-configuration-sha256",
+                            "d" * 64,
+                        ],
+                        [
+                            list(arguments[index : index + 2])
+                            for index in range(len(arguments) - 1)
+                        ],
+                    )
                     run_directory.mkdir()
                     return {
                         "status": "native_task_required",
@@ -705,6 +734,57 @@ class McpServerTests(unittest.TestCase):
             self.assertFalse(first["idempotent"])
             self.assertTrue(second["idempotent"])
             self.assertEqual(first["run_id"], second["run_id"])
+
+    def test_prepare_requires_a_historical_result_digest(self) -> None:
+        server = load_server()
+        with (
+            mock.patch.object(
+                server,
+                "_engine",
+                return_value={
+                    "status": "ready_for_approval",
+                    "blocking_reasons": [],
+                    "approval_prompt": "Approve?",
+                },
+            ),
+            self.assertRaisesRegex(
+                server.ControllerError,
+                "no valid integrity digest",
+            ),
+        ):
+            server._prepare_payload(
+                {
+                    "thread_id": "thread-1",
+                    "model": "gpt-5.6-terra",
+                    "timeout_seconds": 1200,
+                }
+            )
+
+    def test_prepare_requires_a_configuration_digest(self) -> None:
+        server = load_server()
+        with (
+            mock.patch.object(
+                server,
+                "_engine",
+                return_value={
+                    "status": "ready_for_approval",
+                    "blocking_reasons": [],
+                    "approval_prompt": "Approve?",
+                    "historical_result_sha256": "a" * 64,
+                },
+            ),
+            self.assertRaisesRegex(
+                server.ControllerError,
+                "configuration has no valid integrity digest",
+            ),
+        ):
+            server._prepare_payload(
+                {
+                    "thread_id": "thread-1",
+                    "model": "gpt-5.6-terra",
+                    "timeout_seconds": 1200,
+                }
+            )
 
     def test_long_command_timeout_tracks_bounded_run_timeout(self) -> None:
         server = load_server()
@@ -747,13 +827,100 @@ class McpServerTests(unittest.TestCase):
                         "prompt": "test",
                         "timeout_seconds": 30,
                     },
+                    run_directory=PLUGIN_ROOT,
                     working_directory=PLUGIN_ROOT,
                     read_only=True,
+                    log_label="review:test",
                 )
         self.assertEqual(
             run_process.call_args.args[0],
             ["/runtime/node", str(server.WORKER)],
         )
+
+    def test_run_log_records_state_and_streamed_worker_output(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary).resolve()
+            state = server._initial_state(run_directory)
+            server._write_json(server._state_path(run_directory), state)
+            server._update_state(
+                run_directory,
+                phase="implementing",
+                summary="The implementation started.",
+            )
+            log_path = server._run_log_path(run_directory)
+            completed_processes = []
+            process_errors = []
+
+            def run_worker() -> None:
+                try:
+                    completed_processes.append(
+                        server._run_process(
+                            [
+                                sys.executable,
+                                "-c",
+                                (
+                                    "import sys, time; "
+                                    "print('worker event', flush=True); "
+                                    "time.sleep(0.5); "
+                                    "print('worker warning', file=sys.stderr)"
+                                ),
+                            ],
+                            cwd=run_directory,
+                            timeout=10,
+                            stream_log_path=log_path,
+                            stream_log_label="implementation",
+                        )
+                    )
+                except Exception as error:  # noqa: BLE001 - surface thread failures.
+                    process_errors.append(error)
+
+            worker_thread = threading.Thread(target=run_worker)
+            worker_thread.start()
+            deadline = time.monotonic() + 3
+            observed_while_running = False
+            while time.monotonic() < deadline:
+                if "worker event" in log_path.read_text(encoding="utf-8"):
+                    observed_while_running = worker_thread.is_alive()
+                    break
+                time.sleep(0.01)
+            worker_thread.join(timeout=10)
+            content = log_path.read_text(encoding="utf-8")
+            log_mode = log_path.stat().st_mode & 0o777
+
+        self.assertEqual(process_errors, [])
+        self.assertFalse(worker_thread.is_alive())
+        self.assertTrue(observed_while_running)
+        self.assertEqual(completed_processes[0].returncode, 0)
+        self.assertEqual(state["log_path"], str(log_path))
+        self.assertEqual(log_mode, 0o600)
+        self.assertIn("[controller] run approved", content)
+        self.assertIn("[controller] implementing [running]: The implementation started.", content)
+        self.assertIn("[implementation] started", content)
+        self.assertIn("[implementation:stdout] worker event", content)
+        self.assertIn("[implementation:stderr] worker warning", content)
+        self.assertIn("[implementation] finished with exit code 0", content)
+
+    def test_get_state_exposes_local_log_paths(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            run_root = root / "runs"
+            controller_log = root / "controller-server.log"
+            with (
+                mock.patch.object(server, "RUN_ROOT", run_root),
+                mock.patch.object(server, "CONTROLLER_LOG_PATH", controller_log),
+                mock.patch.object(
+                    server,
+                    "_engine",
+                    return_value={"options": []},
+                ),
+            ):
+                result = server._call_tool({"name": "get_state", "arguments": {}})
+
+        state = result["structuredContent"]["state"]
+        self.assertEqual(state["run_root"], str(run_root))
+        self.assertEqual(state["controller_log_path"], str(controller_log))
 
     def test_get_report_accepts_report_larger_than_legacy_limit(self) -> None:
         server = load_server()
@@ -825,8 +992,17 @@ class McpServerTests(unittest.TestCase):
                 candidate_paths.append(str(path))
             prompt = f"Read {candidate_paths[0]} and {candidate_paths[1]}"
 
-            def fake_worker(request, *, working_directory, read_only):
+            def fake_worker(
+                request,
+                *,
+                run_directory,
+                working_directory,
+                read_only,
+                log_label,
+            ):
                 self.assertTrue(read_only)
+                self.assertEqual(run_directory, Path(temporary).resolve())
+                self.assertEqual(log_label, "review:codex")
                 self.assertEqual(
                     sorted(item.name for item in working_directory.iterdir()),
                     ["candidate-a.json", "candidate-b.json"],
@@ -868,7 +1044,16 @@ class McpServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run_directory = Path(temporary).resolve()
 
-            def fake_worker(request, *, working_directory, read_only):
+            def fake_worker(
+                request,
+                *,
+                run_directory,
+                working_directory,
+                read_only,
+                log_label,
+            ):
+                self.assertEqual(run_directory, Path(temporary).resolve())
+                self.assertEqual(log_label, "normalization:codex")
                 self.assertEqual(list(working_directory.iterdir()), [])
                 return {"thread_id": "normalize-thread", "worktree": str(working_directory)}
 

@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -1489,10 +1490,135 @@ def _is_mutating_tool(name: str, arguments: dict[str, Any]) -> bool:
     return re.search(r"(?<![0-9])>{1,2}(?!&)", command) is not None
 
 
-def _is_git_status(command: object) -> bool:
+def _simple_git_command(
+    command: object,
+    event: dict[str, Any],
+) -> tuple[Path, str] | None:
+    """Resolve one unambiguous Git command and its effective directory."""
+
     if not isinstance(command, str):
+        return None
+    if any(character in command for character in "\n\r;|<>`") or "$(" in command:
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    cwd = event.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        return None
+    directory = Path(cwd).expanduser()
+    index = 0
+    if len(tokens) >= 4 and tokens[0] == "cd" and tokens[2] == "&&":
+        if any("&" in token for offset, token in enumerate(tokens) if offset != 2):
+            return None
+        selected = Path(tokens[1]).expanduser()
+        directory = selected if selected.is_absolute() else directory / selected
+        index = 3
+    elif "&&" in tokens or any("&" in token for token in tokens):
+        return None
+    if index >= len(tokens):
+        return None
+    if tokens[index] != "git":
+        return None
+    index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-C":
+            if index + 1 >= len(tokens):
+                return None
+            selected = Path(tokens[index + 1]).expanduser()
+            directory = selected if selected.is_absolute() else directory / selected
+            index += 2
+            continue
+        if token.startswith("-C") and len(token) > 2:
+            selected = Path(token[2:]).expanduser()
+            directory = selected if selected.is_absolute() else directory / selected
+            index += 1
+            continue
+        break
+    if index >= len(tokens) or tokens[index].startswith("-"):
+        return None
+    subcommand = tokens[index]
+    if any(token in ("&&", "&") or "&" in token for token in tokens[index + 1 :]):
+        return None
+    try:
+        return directory.resolve(), subcommand
+    except OSError:
+        return None
+
+
+def _git_status_directory(command: object, event: dict[str, Any]) -> Path | None:
+    parsed = _simple_git_command(command, event)
+    if parsed is None or parsed[1] != "status":
+        return None
+    return parsed[0]
+
+
+def _git_repository_root(directory: Path) -> Path | None:
+    ok, output = _git_capture(directory, "rev-parse", "--show-toplevel")
+    if not ok or not output.strip():
+        return None
+    try:
+        return Path(output.strip()).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _same_repository_or_path(left: Path, right: Path) -> bool:
+    try:
+        resolved_left = left.expanduser().resolve()
+        resolved_right = right.expanduser().resolve()
+    except OSError:
         return False
-    return re.search(r"\bgit\b[^\n;&|]*?\bstatus\b", command) is not None
+    if resolved_left == resolved_right:
+        return True
+    left_root = _git_repository_root(resolved_left)
+    right_root = _git_repository_root(resolved_right)
+    return left_root is not None and right_root is not None and left_root == right_root
+
+
+def _mutation_targets_repository(
+    name: str,
+    arguments: dict[str, Any],
+    event: dict[str, Any],
+    repository: Path | None,
+) -> bool:
+    if repository is None:
+        return True
+    expected = repository.expanduser().resolve()
+    if name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write_file"):
+        path = arguments.get(
+            "file_path",
+            arguments.get("path", arguments.get("notebook_path")),
+        )
+        if not isinstance(path, str) or not path.strip():
+            return True
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            cwd = event.get("cwd")
+            if not isinstance(cwd, str) or not cwd.strip():
+                return True
+            candidate = Path(cwd).expanduser() / candidate
+        try:
+            candidate = candidate.resolve()
+            candidate.relative_to(expected)
+            return True
+        except OSError:
+            return True
+        except ValueError:
+            return _same_repository_or_path(candidate.parent, expected)
+    if name in ("Bash", "shell", "exec_command"):
+        command = arguments.get("command", arguments.get("cmd"))
+        parsed = _simple_git_command(command, event)
+        if parsed is None or parsed[1] == "worktree":
+            return True
+        try:
+            parsed[0].relative_to(expected)
+            return True
+        except ValueError:
+            return _same_repository_or_path(parsed[0], expected)
+    return True
 
 
 def _classify_status(command: str, output: str, *, is_error: bool) -> tuple[str, list[str]]:
@@ -1540,23 +1666,28 @@ def _status_evidence(
     *,
     source_path: Path,
     mutation_cutoff: datetime | None = None,
+    repository: Path | None = None,
 ) -> dict[str, Any]:
     pending: dict[str, str] = {}
     latest: dict[str, Any] | None = None
     for event in events:
         event_timestamp = _parse_timestamp(event.get("timestamp"))
-        if (
-            mutation_cutoff is not None
-            and event_timestamp is not None
-            and event_timestamp >= mutation_cutoff
-        ):
-            break
+        if mutation_cutoff is not None:
+            if event_timestamp is None:
+                continue
+            if event_timestamp >= mutation_cutoff:
+                break
         for block in _tool_blocks(event):
             name = block["name"]
             arguments = block.get("input")
             if not isinstance(arguments, dict):
                 arguments = {}
-            if _is_mutating_tool(name, arguments):
+            if _is_mutating_tool(name, arguments) and _mutation_targets_repository(
+                name,
+                arguments,
+                event,
+                repository,
+            ):
                 if latest is not None:
                     return latest
                 return {
@@ -1567,7 +1698,18 @@ def _status_evidence(
                 }
             command = arguments.get("command", arguments.get("cmd"))
             block_id = block.get("id")
-            if _is_git_status(command) and isinstance(block_id, str):
+            status_directory = _git_status_directory(command, event)
+            repository_matches = status_directory is not None and (
+                repository is None
+                or _same_repository_or_path(
+                    status_directory,
+                    repository,
+                )
+            )
+            if (
+                repository_matches
+                and isinstance(block_id, str)
+            ):
                 pending[block_id] = command
         for block in _content_blocks(event):
             if block.get("type") != "tool_result":
@@ -1624,13 +1766,25 @@ def _subagent_paths(source_path: Path) -> list[Path]:
     return sorted(paths)
 
 
-def _first_mutation_timestamp(events: Iterable[dict[str, Any]]) -> datetime | None:
+def _first_mutation_timestamp(
+    events: Iterable[dict[str, Any]],
+    *,
+    repository: Path | None = None,
+) -> datetime | None:
     for event in events:
         for block in _tool_blocks(event):
             arguments = block.get("input")
             if not isinstance(arguments, dict):
                 arguments = {}
-            if _is_mutating_tool(block["name"], arguments):
+            if _is_mutating_tool(
+                block["name"],
+                arguments,
+            ) and _mutation_targets_repository(
+                block["name"],
+                arguments,
+                event,
+                repository,
+            ):
                 return _parse_timestamp(event.get("timestamp")) or datetime.min.replace(
                     tzinfo=timezone.utc
                 )
@@ -1643,6 +1797,7 @@ def _historical_working_tree(
     *,
     whole_thread: bool = False,
     linked_paths: list[Path] | None = None,
+    repository: Path | None = None,
 ) -> dict[str, Any]:
     try:
         if linked_paths is None:
@@ -1655,9 +1810,16 @@ def _historical_working_tree(
             value
             for value in (
                 _first_mutation_timestamp(
-                    _task_events(source_path, message_uuid, whole_thread=whole_thread)
+                    _task_events(source_path, message_uuid, whole_thread=whole_thread),
+                    repository=repository,
                 ),
-                *(_first_mutation_timestamp(_iter_events(path)) for path in linked_paths),
+                *(
+                    _first_mutation_timestamp(
+                        _iter_events(path),
+                        repository=repository,
+                    )
+                    for path in linked_paths
+                ),
             )
             if value is not None
         ]
@@ -1666,6 +1828,7 @@ def _historical_working_tree(
             _task_events(source_path, message_uuid, whole_thread=whole_thread),
             source_path=source_path,
             mutation_cutoff=cutoff,
+            repository=repository,
         )
     except TranscriptError as error:
         return {
@@ -1683,6 +1846,7 @@ def _historical_working_tree(
                 _iter_events(subagent_path),
                 source_path=subagent_path,
                 mutation_cutoff=cutoff,
+                repository=repository,
             )
         except TranscriptError:
             continue
@@ -1739,6 +1903,12 @@ def inspect_baseline(replay_spec: dict[str, Any]) -> dict[str, Any]:
     raw_source = replay_spec.get("source_path")
     message_uuid = replay_spec.get("message_uuid")
     linked_sources = replay_spec.get("linked_sources")
+    working_tree_repository: Path | None = None
+    if isinstance(raw_repo, str) and raw_repo.strip():
+        selected_repository = Path(raw_repo).expanduser()
+        working_tree_repository = (
+            _git_repository_root(selected_repository) or selected_repository
+        )
     working_tree = {
         "state": "unknown",
         "evidence": None,
@@ -1751,6 +1921,7 @@ def inspect_baseline(replay_spec: dict[str, Any]) -> dict[str, Any]:
                 Path(raw_source).expanduser(),
                 message_uuid,
                 whole_thread=replay_spec.get("task_scope") == "whole_thread",
+                repository=working_tree_repository,
                 linked_paths=(
                     [
                         Path(source["source_path"])

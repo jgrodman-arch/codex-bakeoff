@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -77,6 +78,46 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         self.write_ledger([self.record(source, thread="thread-1", imported_at=100)])
         session = discovery.list_imported_sessions(self.ledger)[0]
         return session, discovery.build_thread_task(session)
+
+    def status_events(
+        self,
+        command: str,
+        *,
+        cwd: Path,
+        timestamp: str | None = "2026-01-01T10:01:00Z",
+    ) -> list[dict]:
+        tool_event = {
+            "type": "assistant",
+            "cwd": str(cwd),
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "status-1",
+                        "name": "Bash",
+                        "input": {"command": command},
+                    }
+                ],
+            },
+        }
+        result_event = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "status-1",
+                        "content": "nothing to commit, working tree clean",
+                    }
+                ],
+            },
+        }
+        if timestamp is not None:
+            tool_event["timestamp"] = timestamp
+            result_event["timestamp"] = "2026-01-01T10:01:01Z"
+        return [tool_event, result_event]
 
     def test_sessions_sort_by_original_creation_time(self) -> None:
         older = self.write_transcript(
@@ -157,6 +198,283 @@ class HistoricalDiscoveryTests(unittest.TestCase):
             ),
             "later observation",
         )
+
+    def test_git_status_evidence_matches_selected_repository(self) -> None:
+        other = self.root / "other"
+        other.mkdir()
+        command = f"cd {other} && git status"
+        events = [
+            {
+                "type": "assistant",
+                "cwd": str(self.project),
+                "timestamp": "2026-01-01T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "write-1",
+                            "name": "Write",
+                            "input": {
+                                "file_path": str(self.project / "changed.txt"),
+                                "content": "changed\n",
+                            },
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "assistant",
+                "cwd": str(self.project),
+                "timestamp": "2026-01-01T10:01:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "status-1",
+                            "name": "Bash",
+                            "input": {"command": command},
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-01-01T10:01:01Z",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "status-1",
+                            "content": "nothing to commit, working tree clean",
+                        }
+                    ],
+                },
+            },
+        ]
+
+        matched = discovery._status_evidence(
+            events,
+            source_path=self.root / "selected.jsonl",
+            repository=other,
+        )
+        mismatched = discovery._status_evidence(
+            events,
+            source_path=self.root / "selected.jsonl",
+            repository=self.project,
+        )
+
+        self.assertEqual(matched["state"], "verified_clean")
+        self.assertEqual(matched["evidence"]["command"], command)
+        self.assertEqual(mismatched["state"], "unknown")
+
+    def test_git_status_evidence_rejects_ambiguous_shell_forms(self) -> None:
+        other = self.root / "other"
+        other.mkdir()
+
+        matched = discovery._status_evidence(
+            self.status_events(
+                f"git -C {other} status --short",
+                cwd=self.project,
+            ),
+            source_path=self.root / "selected.jsonl",
+            repository=other,
+        )
+        self.assertEqual(matched["state"], "verified_clean")
+        for command in (
+            f"cd {other}; git status",
+            f"git --no-pager -C {other} status",
+            f"git status && git -C {other} status",
+        ):
+            with self.subTest(command=command):
+                evidence = discovery._status_evidence(
+                    self.status_events(command, cwd=self.project),
+                    source_path=self.root / "selected.jsonl",
+                    repository=self.project,
+                )
+                self.assertEqual(evidence["state"], "unknown")
+
+    def test_child_directory_git_mutation_stops_clean_status_evidence(self) -> None:
+        subprocess.run(
+            ["git", "init", "-q", str(self.project)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        child = self.project / "child"
+        child.mkdir()
+        mutation = {
+            "type": "assistant",
+            "cwd": str(child),
+            "timestamp": "2026-01-01T10:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "reset-1",
+                        "name": "Bash",
+                        "input": {"command": "git reset --hard"},
+                    }
+                ],
+            },
+        }
+
+        evidence = discovery._status_evidence(
+            [mutation, *self.status_events("git status", cwd=self.project)],
+            source_path=self.root / "selected.jsonl",
+            repository=self.project,
+        )
+
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertIsNone(evidence["evidence"])
+
+    def test_nonexistent_child_git_mutation_fails_closed(self) -> None:
+        subprocess.run(
+            ["git", "init", "-q", str(self.project)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        mutation = {
+            "type": "assistant",
+            "cwd": str(self.project / "removed-child"),
+            "timestamp": "2026-01-01T10:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "reset-1",
+                        "name": "Bash",
+                        "input": {"command": "git reset --hard"},
+                    }
+                ],
+            },
+        }
+
+        evidence = discovery._status_evidence(
+            [mutation, *self.status_events("git status", cwd=self.project)],
+            source_path=self.root / "selected.jsonl",
+            repository=self.project,
+        )
+
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertIsNone(evidence["evidence"])
+
+    def test_unresolved_mutation_targets_fail_closed(self) -> None:
+        other = self.root / "other"
+        other.mkdir()
+        mutations = (
+            (
+                "missing structured path",
+                "Edit",
+                {"old_string": "before", "new_string": "after"},
+                self.project,
+            ),
+            (
+                "apply patch",
+                "apply_patch",
+                {"patch": "*** Begin Patch\n*** End Patch"},
+                other,
+            ),
+            (
+                "absolute shell target",
+                "Bash",
+                {"command": f"touch {self.project / 'changed.txt'}"},
+                other,
+            ),
+        )
+
+        for label, name, arguments, cwd in mutations:
+            with self.subTest(label=label):
+                mutation = {
+                    "type": "assistant",
+                    "cwd": str(cwd),
+                    "timestamp": "2026-01-01T10:00:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "mutation-1",
+                                "name": name,
+                                "input": arguments,
+                            }
+                        ],
+                    },
+                }
+                evidence = discovery._status_evidence(
+                    [mutation, *self.status_events("git status", cwd=self.project)],
+                    source_path=self.root / "selected.jsonl",
+                    repository=self.project,
+                )
+
+                self.assertEqual(evidence["state"], "unknown")
+                self.assertIsNone(evidence["evidence"])
+
+    def test_git_project_subdirectory_uses_top_level_mutation_scope(self) -> None:
+        subprocess.run(
+            ["git", "init", "-q", str(self.project)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        selected = self.project / "selected"
+        selected.mkdir()
+        events = [
+            {
+                **self.user("u1", "change it", "2026-01-01T09:59:00Z"),
+                "cwd": str(selected),
+            },
+            {
+                "type": "assistant",
+                "cwd": str(selected),
+                "timestamp": "2026-01-01T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "write-1",
+                            "name": "Write",
+                            "input": {
+                                "file_path": str(self.project / "sibling.txt"),
+                                "content": "changed\n",
+                            },
+                        }
+                    ],
+                },
+            },
+            *self.status_events("git status", cwd=selected),
+        ]
+        source = self.write_transcript("nested-project", events)
+
+        baseline = discovery.inspect_baseline(
+            {
+                "project_dir": str(selected),
+                "source_path": str(source),
+                "message_uuid": "u1",
+                "task_timestamp": "2026-01-01T09:59:00Z",
+            }
+        )
+
+        self.assertEqual(baseline["repository"], str(self.project.resolve()))
+        self.assertEqual(baseline["working_tree_state"], "unknown")
+        self.assertIsNone(baseline["working_tree"]["evidence"])
+
+    def test_undated_status_cannot_cross_mutation_cutoff(self) -> None:
+        evidence = discovery._status_evidence(
+            self.status_events("git status", cwd=self.project, timestamp=None),
+            source_path=self.root / "selected.jsonl",
+            repository=self.project,
+            mutation_cutoff=discovery._parse_timestamp("2026-01-01T10:00:00Z"),
+        )
+
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertIsNone(evidence["evidence"])
 
 
 if __name__ == "__main__":

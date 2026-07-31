@@ -85,6 +85,36 @@ class LeanBakeoffTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _git_repository(self, name: str) -> Path:
+        repository = self.root / name
+        repository.mkdir()
+        subprocess.run(
+            ["git", "-C", str(repository), "init", "--quiet"],
+            check=True,
+        )
+        (repository / "README.md").write_text(f"{name}\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "README.md"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+            check=True,
+        )
+        return repository
+
     def _patch_context(self, kind: str):
         repository = self.root / "source"
         repository.mkdir(exist_ok=True)
@@ -98,6 +128,8 @@ class LeanBakeoffTests(unittest.TestCase):
             "project_dir": str(repository),
             "imported_thread_id": "thread-1",
             "session_id": "claude-1",
+            "source_path": str(self.root / "rollout.jsonl"),
+            "message_uuid": "message-1",
         }
         baseline = {
             "kind": kind,
@@ -108,12 +140,31 @@ class LeanBakeoffTests(unittest.TestCase):
             "source_kind": "git" if kind == "git_commit" else "non_git",
         }
         parity = {"items": []}
+        historical_candidate = bakeoff._execution().CandidateSolution(
+            provider="claude",
+            diff="diff --git a/app.py b/app.py\n",
+            model="claude-test",
+            final_response="done",
+        )
+        historical_recovery = {
+            "provenance": "test_fixture",
+            "diff": historical_candidate.diff,
+            "changed_files": ["app.py"],
+            "limitations": [],
+        }
         return (
             mock.patch.multiple(
                 bakeoff,
                 _selected_replay=mock.DEFAULT,
                 _baseline=mock.DEFAULT,
                 _capabilities=mock.DEFAULT,
+                _historical_candidate=mock.Mock(
+                    return_value=(
+                        historical_candidate,
+                        historical_recovery,
+                        historical_candidate.final_response,
+                    )
+                ),
             ),
             replay,
             baseline,
@@ -382,6 +433,151 @@ class LeanBakeoffTests(unittest.TestCase):
             ),
         ):
             bakeoff._historical_candidate(run)
+
+    def test_cross_repository_changes_resolve_one_effective_repository(self) -> None:
+        original = self._git_repository("original")
+        effective = self._git_repository("effective")
+        changed = effective / "src" / "app.py"
+        changed.parent.mkdir()
+        changed.write_text("print('result')\n", encoding="utf-8")
+        replay = {
+            "project_dir": str(original),
+            "historical_changed_files": [str(changed)],
+        }
+
+        resolved, resolution, blockers = bakeoff._resolved_replay_repository(
+            argparse.Namespace(repo=None),
+            replay,
+        )
+
+        self.assertEqual(blockers, [])
+        self.assertEqual(resolved["project_dir"], str(effective.resolve()))
+        self.assertEqual(resolved["original_project_dir"], str(original.resolve()))
+        self.assertEqual(resolution["source"], "historical_changed_files")
+        self.assertEqual(
+            resolution["effective_project_dir"],
+            str(effective.resolve()),
+        )
+        _, explicit_resolution, explicit_blockers = bakeoff._resolved_replay_repository(
+            argparse.Namespace(repo=effective),
+            replay,
+        )
+        self.assertEqual(explicit_blockers, [])
+        self.assertEqual(explicit_resolution["source"], "explicit_repo")
+
+    def test_repository_resolution_preserves_original_nested_scope(self) -> None:
+        repository = self._git_repository("monorepo")
+        project = repository / "packages" / "selected"
+        project.mkdir(parents=True)
+        changed = project / "app.py"
+        changed.write_text("print('result')\n", encoding="utf-8")
+
+        resolved, resolution, blockers = bakeoff._resolved_replay_repository(
+            argparse.Namespace(repo=None),
+            {
+                "project_dir": str(project),
+                "historical_changed_files": [str(changed)],
+            },
+        )
+
+        self.assertEqual(blockers, [])
+        self.assertEqual(resolved["project_dir"], str(project.resolve()))
+        self.assertEqual(resolution["source"], "original_project_dir")
+
+    def test_repository_resolution_blocks_mixed_and_excluded_changes(self) -> None:
+        first = self._git_repository("first")
+        second = self._git_repository("second")
+        first_changed = first / "first.py"
+        second_changed = second / "second.py"
+        first_changed.write_text("first\n", encoding="utf-8")
+        second_changed.write_text("second\n", encoding="utf-8")
+
+        _, _, mixed_blockers = bakeoff._resolved_replay_repository(
+            argparse.Namespace(repo=None),
+            {
+                "project_dir": str(first),
+                "historical_changed_files": [
+                    str(first_changed),
+                    str(second_changed),
+                ],
+            },
+        )
+        _, _, explicit_blockers = bakeoff._resolved_replay_repository(
+            argparse.Namespace(repo=first),
+            {
+                "project_dir": str(first),
+                "historical_changed_files": [str(second_changed)],
+            },
+        )
+
+        self.assertIn("multiple Git repositories", mixed_blockers[0])
+        self.assertIn(
+            "The selected repository excludes task-attributed Claude changes.",
+            explicit_blockers,
+        )
+
+        args = _args(self.root, kind="git_commit")
+        replay = {
+            "request": "build the thing",
+            "project_dir": str(first),
+            "historical_changed_files": [str(first_changed), str(second_changed)],
+        }
+        baseline = {
+            "kind": "git_commit",
+            "repository": str(first),
+            "attribution_root": str(first),
+            "commit": "a" * 40,
+            "source_kind": "git",
+        }
+        with (
+            mock.patch.object(bakeoff, "_selected_replay", return_value=replay),
+            mock.patch.object(bakeoff, "_baseline", return_value=baseline),
+            mock.patch.object(bakeoff, "_capabilities", return_value={"items": []}),
+        ):
+            prepared = bakeoff._command_prepare(args)
+        self.assertEqual(prepared["status"], "blocked")
+        self.assertIn("multiple Git repositories", prepared["blocking_reasons"][0])
+
+    def test_historical_recovery_uses_the_baseline_repository(self) -> None:
+        original = self._git_repository("thread-cwd")
+        effective = self._git_repository("result-repository")
+        run = {
+            "replay": {
+                "project_dir": str(original),
+                "source_path": str(self.root / "rollout.jsonl"),
+                "message_uuid": "message-1",
+            },
+            "baseline": {
+                "kind": "git_commit",
+                "repository": str(effective),
+                "commit": "a" * 40,
+            },
+            "file_selection": {"source_kind": "git"},
+            "model": "gpt-test",
+        }
+        recovery = {
+            "provenance": "attributed_git_commit",
+            "diff": "diff --git a/app.py b/app.py\n",
+            "limitations": [],
+        }
+
+        with (
+            mock.patch.object(
+                bakeoff._discovery(),
+                "recover_historical_solution",
+                return_value=recovery,
+            ) as recover,
+            mock.patch.object(
+                bakeoff._discovery(),
+                "recover_historical_final_response",
+                return_value="done",
+            ),
+        ):
+            bakeoff._historical_candidate(run)
+
+        recovery_replay = recover.call_args.args[0]
+        self.assertEqual(recovery_replay["project_dir"], str(effective))
+        self.assertEqual(recovery_replay["project_dirs"], [str(effective)])
 
     def test_git_run_targets_a_managed_worktree(self) -> None:
         patches, replay, baseline, parity = self._patch_context("git_commit")
@@ -658,11 +854,326 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertEqual(prepared["status"], "ready_for_approval")
         self.assertTrue(prepared["requires_approval"])
         self.assertNotIn("task_request", prepared)
+        self.assertEqual(
+            prepared["prepared_configuration_sha256"],
+            bakeoff._canonical_json_sha256(prepared["configuration"]),
+        )
         self.assertFalse((self.root / "runs").exists())
 
         with self.assertRaisesRegex(bakeoff.BakeoffError, "explicit user approval"):
             bakeoff._command_run(args)
         self.assertFalse((self.root / "runs").exists())
+
+    def test_prepare_blocks_when_the_historical_patch_is_unavailable(self) -> None:
+        patches, replay, baseline, parity = self._patch_context("git_commit")
+        replay.update(
+            {
+                "source_path": str(self.root / "rollout.jsonl"),
+                "message_uuid": "message-1",
+            }
+        )
+        args = _args(self.root, kind="git_commit")
+        with (
+            patches as values,
+            mock.patch.object(
+                bakeoff,
+                "_historical_candidate",
+                side_effect=bakeoff.BakeoffError(
+                    "No attributable historical Claude patch could be captured; "
+                    "the comparison cannot be completed."
+                ),
+            ),
+        ):
+            values["_selected_replay"].return_value = replay
+            values["_baseline"].return_value = baseline
+            values["_capabilities"].return_value = parity
+            prepared = bakeoff._command_prepare(args)
+
+        self.assertEqual(prepared["status"], "blocked")
+        self.assertIn(
+            "No attributable historical Claude patch could be captured",
+            prepared["blocking_reasons"][0],
+        )
+        self.assertFalse((self.root / "runs").exists())
+
+    def test_prepare_blocks_when_transcript_identity_is_missing(self) -> None:
+        patches, replay, baseline, parity = self._patch_context("git_commit")
+        replay.pop("source_path")
+        replay.pop("message_uuid")
+        args = _args(self.root, kind="git_commit")
+        with patches as values:
+            values["_selected_replay"].return_value = replay
+            values["_baseline"].return_value = baseline
+            values["_capabilities"].return_value = parity
+            prepared = bakeoff._command_prepare(args)
+        self.assertEqual(prepared["status"], "blocked")
+        self.assertIn(
+            "historical transcript and original user-message UUID",
+            prepared["blocking_reasons"][0],
+        )
+        with patches as values:
+            values["_selected_replay"].return_value = replay
+            values["_baseline"].return_value = baseline
+            values["_capabilities"].return_value = parity
+            with self.assertRaisesRegex(
+                bakeoff.BakeoffError,
+                "not runnable",
+            ):
+                bakeoff._command_run(args)
+        self.assertFalse((self.root / "runs").exists())
+
+    def test_run_requires_a_frozen_candidate_before_allocating(self) -> None:
+        with (
+            mock.patch.object(
+                bakeoff,
+                "_prepare_context",
+                return_value={
+                    "status": "ready_for_approval",
+                    "questions": [],
+                    "historical_candidate": None,
+                },
+            ),
+            mock.patch.object(bakeoff, "_new_run_directory") as allocate,
+            self.assertRaisesRegex(
+                bakeoff.BakeoffError,
+                "was not frozen",
+            ),
+        ):
+            bakeoff._command_run(_args(self.root, kind="git_commit"))
+        allocate.assert_not_called()
+
+    def test_run_rejects_a_changed_prepared_candidate_before_allocating(self) -> None:
+        candidate = bakeoff._execution().CandidateSolution(
+            provider="claude",
+            diff="prepared diff",
+            model="claude-test",
+        )
+        frozen = bakeoff._serialize_historical_candidate(
+            candidate,
+            {"provenance": "test", "limitations": []},
+            "",
+        )
+        args = _args(self.root, kind="git_commit")
+        args.expected_historical_result_sha256 = "0" * 64
+        with (
+            mock.patch.object(
+                bakeoff,
+                "_prepare_context",
+                return_value={
+                    "status": "ready_for_approval",
+                    "questions": [],
+                    "historical_candidate": frozen,
+                },
+            ),
+            mock.patch.object(bakeoff, "_new_run_directory") as allocate,
+            self.assertRaisesRegex(
+                bakeoff.BakeoffError,
+                "changed after preparation",
+            ),
+        ):
+            bakeoff._command_run(args)
+        allocate.assert_not_called()
+
+    def test_run_rejects_an_invalid_or_changed_configuration_before_allocating(self) -> None:
+        candidate = bakeoff._execution().CandidateSolution(
+            provider="claude",
+            diff="prepared diff",
+            model="claude-test",
+        )
+        frozen = bakeoff._serialize_historical_candidate(
+            candidate,
+            {"provenance": "test", "limitations": []},
+            "",
+        )
+        prepared = {
+            "status": "ready_for_approval",
+            "questions": [],
+            "configuration": {"model": "gpt-test"},
+            "historical_candidate": frozen,
+        }
+        for expected_digest in ("not-a-digest", "0" * 64):
+            with self.subTest(expected_digest=expected_digest):
+                args = _args(self.root, kind="git_commit")
+                args.expected_prepared_configuration_sha256 = expected_digest
+                with (
+                    mock.patch.object(
+                        bakeoff,
+                        "_prepare_context",
+                        return_value=prepared,
+                    ),
+                    mock.patch.object(bakeoff, "_new_run_directory") as allocate,
+                    self.assertRaisesRegex(
+                        bakeoff.BakeoffError,
+                        "run `prepare` again",
+                    ),
+                ):
+                    bakeoff._command_run(args)
+                allocate.assert_not_called()
+
+    def test_run_freezes_the_historical_candidate_for_completion(self) -> None:
+        patches, replay, baseline, parity = self._patch_context("git_commit")
+        replay.update(
+            {
+                "source_path": str(self.root / "rollout.jsonl"),
+                "message_uuid": "message-1",
+            }
+        )
+        candidate = bakeoff._execution().CandidateSolution(
+            provider="claude",
+            diff="diff --git a/app.py b/app.py\n",
+            model="claude-test",
+            final_response="historical response",
+        )
+        recovery = {
+            "provenance": "attributed_git_commit",
+            "diff": candidate.diff,
+            "changed_files": ["app.py"],
+            "limitations": [],
+        }
+        args = _args(self.root, kind="git_commit")
+        with (
+            patches as values,
+            mock.patch.object(
+                bakeoff,
+                "_historical_candidate",
+                return_value=(candidate, recovery, candidate.final_response),
+            ),
+        ):
+            values["_selected_replay"].return_value = replay
+            values["_baseline"].return_value = baseline
+            values["_capabilities"].return_value = parity
+            prepared = bakeoff._command_prepare(args)
+        self.assertRegex(prepared["historical_result_sha256"], r"\A[a-f0-9]{64}\Z")
+        args.expected_prepared_configuration_sha256 = prepared[
+            "prepared_configuration_sha256"
+        ]
+        args.expected_historical_result_sha256 = prepared["historical_result_sha256"]
+        with (
+            patches as values,
+            mock.patch.object(
+                bakeoff,
+                "_historical_candidate",
+                return_value=(candidate, recovery, candidate.final_response),
+            ),
+        ):
+            values["_selected_replay"].return_value = replay
+            values["_baseline"].return_value = baseline
+            values["_capabilities"].return_value = parity
+            started = bakeoff._command_run(args)
+
+        recorded = json.loads(
+            (Path(started["run_directory"]) / "run.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("historical_candidate", recorded)
+        metadata = recorded["historical_result"]
+        self.assertEqual(metadata["sha256"], prepared["historical_result_sha256"])
+        self.assertEqual(
+            metadata,
+            {
+                "schema_version": 1,
+                "path": "historical-result.json",
+                "sha256": metadata["sha256"],
+            },
+        )
+        artifact_path = Path(started["run_directory"]) / metadata["path"]
+        serialized = artifact_path.read_bytes()
+        self.assertEqual(
+            metadata["sha256"],
+            bakeoff.hashlib.sha256(serialized).hexdigest(),
+        )
+        frozen = json.loads(serialized)
+        self.assertEqual(frozen["candidate"]["diff"], candidate.diff)
+        self.assertEqual(frozen["recovery"]["changed_files"], ["app.py"])
+        Path(replay["source_path"]).write_text("source changed\n", encoding="utf-8")
+        native_path = self.root / "native-result.json"
+        bakeoff._write_json(native_path, {"model": "gpt-test"})
+        codex_candidate = bakeoff._execution().CandidateSolution(
+            provider="codex",
+            diff="diff --git a/app.py b/app.py\n",
+            model="gpt-test",
+            final_response="done",
+        )
+        with (
+            mock.patch.object(
+                bakeoff,
+                "_historical_candidate",
+                side_effect=AssertionError("live source must not be reread"),
+            ),
+            mock.patch.object(
+                bakeoff,
+                "_codex_candidate",
+                return_value=(codex_candidate, codex_candidate.diff, ("app.py",)),
+            ),
+            mock.patch.object(bakeoff, "_usage_records", return_value=((), ())),
+            mock.patch.object(
+                bakeoff._execution(),
+                "generate_report",
+                return_value={},
+            ) as generate_report,
+            mock.patch.object(bakeoff, "_write_report"),
+        ):
+            completed = bakeoff._command_complete_run(
+                argparse.Namespace(
+                    run_dir=Path(started["run_directory"]),
+                    native_result=native_path,
+                )
+            )
+        self.assertEqual(completed["status"], "completed")
+        restored = generate_report.call_args.kwargs["claude_candidate"]
+        self.assertEqual(restored.diff, candidate.diff)
+        self.assertEqual(restored.final_response, "historical response")
+
+    def test_completion_rejects_a_tampered_historical_artifact(self) -> None:
+        run_directory = self.root / "tampered-run"
+        run_directory.mkdir()
+        frozen = {
+            "schema_version": 1,
+            "candidate": {
+                "provider": "claude",
+                "diff": "diff --git a/app.py b/app.py\n",
+                "model": "claude-test",
+                "final_response": "done",
+            },
+            "recovery": {"limitations": []},
+            "final_response": "done",
+        }
+        artifact = run_directory / "historical-result.json"
+        digest = bakeoff._write_canonical_json(artifact, frozen)
+        artifact.write_bytes(artifact.read_bytes() + b" ")
+        run = {
+            "historical_result": {
+                "schema_version": 1,
+                "path": artifact.name,
+                "sha256": digest,
+            }
+        }
+
+        with self.assertRaisesRegex(
+            bakeoff.BakeoffError,
+            "artifact digest does not match",
+        ):
+            bakeoff._historical_candidate_for_completion(run, run_directory)
+
+    def test_legacy_completion_falls_back_to_live_recovery(self) -> None:
+        candidate = bakeoff._execution().CandidateSolution(
+            provider="claude",
+            diff="legacy diff",
+            model="claude-test",
+            final_response="legacy",
+        )
+        recovery = {"provenance": "legacy", "limitations": []}
+        legacy_run = {"replay": {}, "baseline": {}}
+        with mock.patch.object(
+            bakeoff,
+            "_historical_candidate",
+            return_value=(candidate, recovery, "legacy"),
+        ) as live_recovery:
+            restored = bakeoff._historical_candidate_for_completion(
+                legacy_run,
+                self.root,
+            )
+        live_recovery.assert_called_once_with(legacy_run)
+        self.assertEqual(restored, (candidate, recovery, "legacy"))
 
     def test_dirty_git_requires_current_change_selection(self) -> None:
         patches, replay, baseline, parity = self._patch_context("git_commit")
@@ -799,6 +1310,11 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertNotIn("--registered-baseline-project-id", baseline_options)
         self.assertNotIn("--modified-by-claude", baseline_options)
         self.assertNotIn("--before-file", baseline_options)
+        run_options = {
+            option for action in choices["run"]._actions for option in action.option_strings
+        }
+        self.assertIn("--expected-historical-result-sha256", run_options)
+        self.assertIn("--expected-prepared-configuration-sha256", run_options)
         collect_options = {
             option
             for action in choices["collect-native-result"]._actions

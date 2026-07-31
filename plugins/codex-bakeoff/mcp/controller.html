@@ -119,6 +119,31 @@
       list-style: none;
     }
 
+    .diagnostics {
+      display: grid;
+      gap: 10px;
+      margin: 20px 10px 0;
+      padding-top: 16px;
+      border-top: 1px solid var(--line);
+    }
+
+    .diagnostics p {
+      margin-bottom: 3px;
+      color: var(--faint);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    .diagnostics code {
+      display: block;
+      overflow-wrap: anywhere;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.45;
+    }
+
     .step-button {
       display: grid;
       width: 100%;
@@ -991,6 +1016,10 @@
       .step-button { width: auto; grid-template-columns: 22px auto; padding: 8px; }
       .step-state { display: none; }
       .step-number { width: 22px; height: 22px; }
+      .diagnostics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin: 12px 8px 0;
+      }
       .grid-2, .provider-grid, .review-grid, .field-grid { grid-template-columns: 1fr; }
       .file-row { grid-template-columns: 1fr; gap: 7px; }
       .segmented { width: 100%; }
@@ -1061,6 +1090,8 @@
         run: null,
         report: null,
         reportPaths: null,
+        runRoot: "",
+        controllerLogPath: "",
         pollGeneration: 0,
       };
 
@@ -1621,7 +1652,30 @@
                 `;
               }).join("")}
             </ol>
+            ${renderDiagnostics()}
           </nav>
+        `;
+      }
+
+      function renderDiagnostics() {
+        const exactLogPath = text(state.run?.log_path);
+        const runPath = exactLogPath || state.runRoot;
+        if (!runPath && !state.controllerLogPath) return "";
+        return `
+          <div class="diagnostics" aria-label="Local diagnostics">
+            ${runPath
+              ? `<div>
+                  <p>${exactLogPath ? "Current run log" : "Run log root"}</p>
+                  <code title="${escapeHtml(runPath)}">${escapeHtml(runPath)}</code>
+                </div>`
+              : ""}
+            ${state.controllerLogPath
+              ? `<div>
+                  <p>Controller log</p>
+                  <code title="${escapeHtml(state.controllerLogPath)}">${escapeHtml(state.controllerLogPath)}</code>
+                </div>`
+              : ""}
+          </div>
         `;
       }
 
@@ -2067,6 +2121,9 @@
       function reviewSummary(configuration) {
         const task = isObject(configuration.task) ? configuration.task : {};
         const baseline = isObject(configuration.baseline) ? configuration.baseline : {};
+        const repositoryResolution = isObject(baseline.repository_resolution)
+          ? baseline.repository_resolution
+          : {};
         const runtime = isObject(configuration.runtime) ? configuration.runtime : {};
         const direct = isObject(state.preparation?.run_config)
           ? state.preparation.run_config
@@ -2090,9 +2147,24 @@
               ? selection.unselected_changes
               : selection.classifications?.exclude
         ).map((item) => text(isObject(item) ? item.path : item)).filter(Boolean);
+        const replayRepository = text(
+          task.project ||
+          repositoryResolution.effective_project_dir ||
+          baseline.attribution_root ||
+          baseline.repository ||
+          direct.repo
+        );
+        const originalThreadCwd = text(
+          task.original_project || repositoryResolution.original_project_dir
+        );
         return {
           thread: text(task.imported_thread_id || direct.thread_id || state.selectedThreadId),
-          project: text(task.project || baseline.attribution_root || baseline.repository || direct.repo),
+          replayRepository,
+          originalThreadCwd:
+            originalThreadCwd && originalThreadCwd !== replayRepository
+              ? originalThreadCwd
+              : "",
+          repositoryResolutionSource: text(repositoryResolution.source),
           baseline: text(baseline.commit || baseline.kind || baseline.proposed_kind),
           model: text(configuration.model || direct.model || state.model),
           timeout: Number(runtime.timeout_seconds ?? direct.timeout_seconds ?? state.timeoutSeconds),
@@ -2134,7 +2206,10 @@
             <div class="panel__body">
               <div class="review-grid">
                 ${reviewItem("Imported thread", summary.thread, true)}
-                ${reviewItem("Project", summary.project, true)}
+                ${reviewItem("Replay repository", summary.replayRepository, true)}
+                ${summary.originalThreadCwd
+                  ? reviewItem("Original thread cwd", summary.originalThreadCwd, true)
+                  : ""}
                 ${reviewItem("Historical baseline", summary.baseline, true)}
                 ${reviewItem("Codex model", summary.model, true)}
                 ${reviewItem("Timeout", formatDuration(summary.timeout))}
@@ -2142,6 +2217,17 @@
                 ${reviewItem("Included Claude files", `${summary.included.length}`)}
                 ${reviewItem("Excluded files", `${summary.excluded.length}`)}
               </div>
+              ${summary.originalThreadCwd
+                ? `<div class="banner" role="status" style="margin-top:14px">
+                    <span class="banner__mark" aria-hidden="true">i</span>
+                    <div class="banner__body">
+                      <strong>Replay repository resolved from the historical run</strong>
+                      <p>${summary.repositoryResolutionSource === "explicit_repo"
+                        ? "The explicitly selected repository differs from the thread’s original cwd and will be used for the historical baseline and isolated Codex replay."
+                        : "Claude’s recorded changes resolved to this repository, so it will be used for the historical baseline and isolated Codex replay."}</p>
+                    </div>
+                  </div>`
+                : ""}
               ${summary.included.length
                 ? `<details><summary>Included paths (${summary.included.length})</summary><pre>${escapeHtml(summary.included.join("\n"))}</pre></details>`
                 : ""}
@@ -2179,6 +2265,10 @@
               <div class="review-grid">
                 ${reviewItem("Thread", summary.thread, true)}
                 ${reviewItem("Model", summary.model, true)}
+                ${reviewItem("Replay repository", summary.replayRepository, true)}
+                ${summary.originalThreadCwd
+                  ? reviewItem("Original thread cwd", summary.originalThreadCwd, true)
+                  : ""}
                 ${reviewItem("Baseline", summary.baseline, true)}
                 ${reviewItem("Timeout", formatDuration(summary.timeout))}
               </div>
@@ -2740,6 +2830,8 @@
             callTool("list_threads", { offset: 0, limit: 100 }),
           ]);
           const serverState = isObject(statePayload.state) ? statePayload.state : statePayload;
+          state.runRoot = text(serverState.run_root);
+          state.controllerLogPath = text(serverState.controller_log_path);
           state.models = normalizeModels(serverState.models);
           state.model = state.models.some((model) => model.id === restoredDraft?.model)
             ? restoredDraft.model
