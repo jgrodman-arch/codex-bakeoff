@@ -1010,7 +1010,8 @@ class McpServerTests(unittest.TestCase):
             stdout=(
                 '{"type":"ready","protocolVersion":1}\n'
                 '{"type":"failed","id":"run-1","code":"stream_error",'
-                '"message":"Codex reported an unrecoverable stream error."}\n'
+                '"message":"Codex reported an unrecoverable stream error.",'
+                '"retryable":true}\n'
             ),
             stderr="unrelated runtime warning",
         )
@@ -1023,9 +1024,9 @@ class McpServerTests(unittest.TestCase):
             ) as run_process,
         ):
             with self.assertRaisesRegex(
-                server.ControllerError,
+                server.WorkerError,
                 "stream_error: Codex reported an unrecoverable stream error",
-            ):
+            ) as raised:
                 server._run_worker(
                     {
                         "model": "gpt-5.6-luna",
@@ -1037,6 +1038,8 @@ class McpServerTests(unittest.TestCase):
                     read_only=True,
                     log_label="review:test",
                 )
+        self.assertEqual(raised.exception.code, "stream_error")
+        self.assertTrue(raised.exception.retryable)
         self.assertEqual(
             run_process.call_args.args[0],
             ["/runtime/node", str(server.WORKER)],
@@ -1335,6 +1338,188 @@ class McpServerTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
             self.assertEqual(observed, commit)
+
+    def test_implementation_retries_three_times_in_fresh_workspaces(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary).resolve()
+            server._write_json(
+                server._state_path(run_directory),
+                server._initial_state(run_directory),
+            )
+            calls = []
+
+            def run_worker(*args, **kwargs):
+                calls.append(kwargs)
+                workspace = kwargs["working_directory"]
+                self.assertEqual(list(workspace.iterdir()), [])
+                if len(calls) <= server.IMPLEMENTATION_RETRY_LIMIT:
+                    (workspace / f"partial-{len(calls)}.txt").write_text(
+                        "partial",
+                        encoding="utf-8",
+                    )
+                    raise server.WorkerError(
+                        "stream_error",
+                        "stream_error: Codex reported an unrecoverable stream error.",
+                        retryable=True,
+                    )
+                self.assertFalse((workspace / "partial.txt").exists())
+                return {"thread_id": "retry-thread", "events": []}
+
+            with mock.patch.object(server, "_run_worker", side_effect=run_worker):
+                workspace, worker = server._run_implementation(
+                    run_directory,
+                    {"model": "gpt-5.6-sol", "prompt": "test"},
+                    {"type": "projectless"},
+                )
+
+            log = server._run_log_path(run_directory).read_text(encoding="utf-8")
+            self.assertEqual(worker["thread_id"], "retry-thread")
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(calls[0]["log_label"], "implementation")
+            self.assertEqual(calls[1]["log_label"], "implementation:retry-1")
+            self.assertEqual(calls[2]["log_label"], "implementation:retry-2")
+            self.assertEqual(calls[3]["log_label"], "implementation:retry-3")
+            for attempt in range(1, 4):
+                archived = (
+                    run_directory / "workspaces" / f"codex-attempt-{attempt}-failed"
+                )
+                self.assertTrue((archived / f"partial-{attempt}.txt").is_file())
+            self.assertEqual(workspace.name, "codex")
+            self.assertIn("starting retry 1 of 3", log)
+            self.assertIn("starting retry 2 of 3", log)
+            self.assertIn("starting retry 3 of 3", log)
+
+    def test_packaged_worker_retries_transient_failures_three_times(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            run_directory = root / "run"
+            run_directory.mkdir()
+            server._write_json(
+                server._state_path(run_directory),
+                server._initial_state(run_directory),
+            )
+            counter = root / "attempt-count"
+            fake_codex = root / "fake-codex.py"
+            fake_codex.write_text(
+                "\n".join(
+                    [
+                        f"#!{sys.executable}",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "sys.stdin.read()",
+                        "args = sys.argv[1:]",
+                        "workspace = Path(args[args.index('--cd') + 1])",
+                        "counter = Path(os.environ['FAKE_RETRY_COUNTER'])",
+                        "attempt = int(counter.read_text() or '0') + 1 if counter.exists() else 1",
+                        "counter.write_text(str(attempt))",
+                        "print(json.dumps({'type': 'thread.started', 'thread_id': f'fixture-thread-{attempt}'}))",
+                        "print(json.dumps({'type': 'turn.started'}))",
+                        "if attempt <= 3:",
+                        "    assert not list(workspace.iterdir())",
+                        "    (workspace / f'partial-{attempt}.txt').write_text('partial')",
+                        "    print(json.dumps({'type': 'error', 'message': 'connection reset by peer'}))",
+                        "else:",
+                        "    assert not list(workspace.iterdir())",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'completed after retries'}}))",
+                        "    print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 1, 'cached_input_tokens': 0, 'output_tokens': 1, 'reasoning_output_tokens': 0}}))",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_CLI_PATH": str(fake_codex),
+                    "FAKE_RETRY_COUNTER": str(counter),
+                },
+            ):
+                workspace, worker = server._run_implementation(
+                    run_directory,
+                    {
+                        "model": "gpt-5.6-sol",
+                        "prompt": "test process-level retry",
+                        "timeout_seconds": 30,
+                    },
+                    {"type": "projectless"},
+                )
+
+            log = server._run_log_path(run_directory).read_text(encoding="utf-8")
+            self.assertEqual(counter.read_text(encoding="utf-8"), "4")
+            self.assertEqual(worker["thread_id"], "fixture-thread-4")
+            self.assertEqual(workspace.name, "codex")
+            for attempt in range(1, 4):
+                archived = (
+                    run_directory / "workspaces" / f"codex-attempt-{attempt}-failed"
+                )
+                self.assertTrue((archived / f"partial-{attempt}.txt").is_file())
+            self.assertEqual(log.count("starting retry"), 3)
+            self.assertIn("[implementation:retry-3:stdout]", log)
+            self.assertEqual(log.count("connection reset by peer"), 3)
+
+    def test_implementation_stops_after_three_retries(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary).resolve()
+            server._write_json(
+                server._state_path(run_directory),
+                server._initial_state(run_directory),
+            )
+            failure = server.WorkerError(
+                "stream_error",
+                "stream_error: Codex reported an unrecoverable stream error.",
+                retryable=True,
+            )
+            with (
+                mock.patch.object(server, "_run_worker", side_effect=failure) as run_worker,
+                self.assertRaises(server.WorkerError),
+            ):
+                server._run_implementation(
+                    run_directory,
+                    {"model": "gpt-5.6-sol", "prompt": "test"},
+                    {"type": "projectless"},
+                )
+
+            self.assertEqual(run_worker.call_count, 4)
+            for attempt in range(1, 4):
+                self.assertTrue(
+                    (
+                        run_directory
+                        / "workspaces"
+                        / f"codex-attempt-{attempt}-failed"
+                    ).is_dir()
+                )
+            self.assertTrue((run_directory / "workspaces" / "codex").is_dir())
+
+    def test_implementation_does_not_retry_non_retryable_failure(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary).resolve()
+            server._write_json(
+                server._state_path(run_directory),
+                server._initial_state(run_directory),
+            )
+            failure = server.WorkerError(
+                "stream_error",
+                "stream_error: Codex reported an unrecoverable stream error.",
+            )
+            with (
+                mock.patch.object(server, "_run_worker", side_effect=failure) as run_worker,
+                self.assertRaises(server.WorkerError),
+            ):
+                server._run_implementation(
+                    run_directory,
+                    {"model": "gpt-5.6-sol", "prompt": "test"},
+                    {"type": "projectless"},
+                )
+
+            archived = run_directory / "workspaces" / "codex-attempt-1-failed"
+            self.assertEqual(run_worker.call_count, 1)
+            self.assertFalse(archived.exists())
 
 
 if __name__ == "__main__":

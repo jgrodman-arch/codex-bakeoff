@@ -124,7 +124,10 @@ test("logs an SDK stream error without exposing its detail in the protocol error
               return {
                 events: (async function* () {
                   yield { type: "thread.started", thread_id: "fixture-thread" };
-                  yield { type: "error", message: "sensitive provider detail" };
+                  yield {
+                    type: "error",
+                    message: "connection reset: sensitive provider detail"
+                  };
                   yield {
                     type: "turn.completed",
                     usage: {
@@ -144,10 +147,13 @@ test("logs an SDK stream error without exposing its detail in the protocol error
     (error) =>
       error instanceof Error &&
       error.code === "stream_error" &&
+      error.retryable === true &&
       error.message === "Codex reported an unrecoverable stream error." &&
       !error.message.includes("sensitive provider detail")
   );
-  assert.deepEqual(diagnostics, ["Codex stream error: sensitive provider detail"]);
+  assert.deepEqual(diagnostics, [
+    "Codex stream error: connection reset: sensitive provider detail"
+  ]);
 });
 
 test("logs an SDK turn failure without exposing its detail in the protocol error", async () => {
@@ -188,6 +194,7 @@ test("logs an SDK turn failure without exposing its detail in the protocol error
     (error) =>
       error instanceof Error &&
       error.code === "turn_failed" &&
+      error.retryable === false &&
       error.message === "Codex turn failed." &&
       !error.message.includes("sensitive turn detail")
   );
@@ -224,9 +231,10 @@ test("writes SDK error detail only to worker stderr", async () => {
   const messages = await stdout;
   const failure = messages.at(-1);
   assert.equal(failure.type, "failed");
+  assert.equal(failure.retryable, true);
   assert.equal(failure.message, "Codex reported an unrecoverable stream error.");
   assert.doesNotMatch(JSON.stringify(messages), /fixture provider detail/);
-  assert.match(await stderr, /Codex stream error: fixture provider detail/);
+  assert.match(await stderr, /Codex stream error: connection reset: fixture provider detail/);
 });
 
 test("built JSONL worker executes one SDK run and returns the observed result", async () => {
@@ -397,7 +405,7 @@ async function fakeCodexFixture() {
       "console.log(JSON.stringify({ type: 'thread.started', thread_id: 'fixture-thread-id' }));",
       "console.log(JSON.stringify({ type: 'turn.started' }));",
       "if (prompt.includes('HANG')) { setInterval(() => {}, 1000); await new Promise(() => {}); }",
-      "if (prompt.includes('STREAM_ERROR')) { console.log(JSON.stringify({ type: 'error', message: 'fixture provider detail' })); process.exit(0); }",
+      "if (prompt.includes('STREAM_ERROR')) { console.log(JSON.stringify({ type: 'error', message: 'connection reset: fixture provider detail' })); process.exit(0); }",
       "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'fixture-secret-command', aggregated_output: 'fixture-secret-output', status: 'completed' } }));",
       "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'fixture final response' } }));",
       "console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 7, cached_input_tokens: 2, output_tokens: 3, reasoning_output_tokens: 1 } }));",

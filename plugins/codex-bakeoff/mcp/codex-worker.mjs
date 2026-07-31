@@ -566,9 +566,11 @@ var SAFE_ITEM_TYPES = /* @__PURE__ */ new Set([
 ]);
 var SafeWorkerError = class extends Error {
   constructor(code, message, options = {}) {
-    super(message, options);
+    const { retryable = false, ...errorOptions } = options;
+    super(message, errorOptions);
     this.name = "SafeWorkerError";
     this.code = code;
+    this.retryable = retryable;
   }
 };
 function normalizeRunRequest(input) {
@@ -724,7 +726,11 @@ async function executeRunRequest(request, {
         throw new SafeWorkerError("turn_failed", "Codex turn failed.");
       } else if (event.type === "error") {
         diagnostic(`Codex stream error: ${event.message ?? "No detail provided."}`);
-        throw new SafeWorkerError("stream_error", "Codex reported an unrecoverable stream error.");
+        throw new SafeWorkerError(
+          "stream_error",
+          "Codex reported an unrecoverable stream error.",
+          { retryable: isRetryableStreamError(event.message) }
+        );
       }
     }
     if (!turnCompleted) {
@@ -795,7 +801,7 @@ function startStdioWorker({
       id,
       code: safeError.code,
       message: safeError.message,
-      retryable: false
+      retryable: safeError.retryable
     });
     finish(2);
   };
@@ -848,7 +854,7 @@ function startStdioWorker({
         id: request.id,
         code: safeError.code,
         message: safeError.message,
-        retryable: false
+        retryable: safeError.retryable
       });
       finish(safeError.code === "timeout" ? 124 : 1);
     });
@@ -1068,6 +1074,17 @@ function safeRequestId(value) {
   if (!isRecord(value)) return null;
   const id = value.id ?? value.requestId;
   return typeof id === "string" && SAFE_ID.test(id) ? id : null;
+}
+function isRetryableStreamError(message) {
+  if (typeof message !== "string") return false;
+  if (/auth|unauthoriz|forbidden|api key|quota|billing|usage limit|model.*(?:access|not found)|invalid request/i.test(
+    message
+  )) {
+    return false;
+  }
+  return /connection|network|stream|transport|reset|closed|timed? out|temporar|unavailable|overload|internal server error|\b(?:429|502|503|504)\b/i.test(
+    message
+  );
 }
 function truncate(value, maxChars) {
   if (value.length <= maxChars) return { value, truncated: false };

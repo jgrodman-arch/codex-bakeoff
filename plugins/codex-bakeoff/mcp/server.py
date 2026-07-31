@@ -59,6 +59,7 @@ MAX_BROWSER_SESSIONS = 256
 MAX_SELECTION_ITEMS = 2_000
 MAX_PREPARE_TOKENS = 256
 MAX_COMMAND_TIMEOUT = 14_700
+IMPLEMENTATION_RETRY_LIMIT = 3
 RUN_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 COMMIT_PATTERN = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
 HTTP_TOOL_NAMES = frozenset(
@@ -96,6 +97,15 @@ _shutdown = threading.Event()
 
 class ControllerError(ValueError):
     """A safe user-facing controller error."""
+
+
+class WorkerError(ControllerError):
+    """A structured Codex worker failure."""
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+        self.code = code
+        self.retryable = retryable
+        super().__init__(message)
 
 
 class PortConflictError(ControllerError):
@@ -1732,6 +1742,26 @@ def _materialize_workspace(run_directory: Path, target: Mapping[str, Any]) -> Pa
     return workspace.resolve()
 
 
+def _archive_failed_implementation_workspace(
+    run_directory: Path,
+    workspace: Path,
+    attempt: int,
+) -> Path:
+    expected = (run_directory / "workspaces" / "codex").resolve()
+    if workspace.resolve() != expected or not workspace.is_dir():
+        raise ControllerError("The failed implementation workspace is unavailable.")
+    archived = workspace.with_name(f"codex-attempt-{attempt}-failed")
+    if archived.exists():
+        raise ControllerError("The failed implementation workspace was already archived.")
+    workspace.rename(archived)
+    _append_run_log(
+        _run_log_path(run_directory),
+        "controller",
+        f"archived failed implementation attempt {attempt} workspace at {archived}",
+    )
+    return archived
+
+
 def _worker_request(
     request: Mapping[str, Any],
     *,
@@ -1842,6 +1872,13 @@ def _run_worker(
         )
         detail = failure_message or (final or {}).get("error") or completed.stderr.strip()
         detail = detail or completed.stdout.strip() or "The Codex worker exited without a result."
+        if isinstance(failure, Mapping):
+            code = failure.get("code")
+            raise WorkerError(
+                code if isinstance(code, str) and code else "worker_failed",
+                str(detail)[:2_000],
+                retryable=failure.get("retryable") is True,
+            )
         raise ControllerError(str(detail)[:2_000])
     raw_result = final.get("result")
     result = dict(raw_result) if isinstance(raw_result, Mapping) else dict(final)
@@ -1884,6 +1921,53 @@ def _collect_result(
         timeout=timeout,
         run_directory=run_directory,
     )
+
+
+def _run_implementation(
+    run_directory: Path,
+    task_request: Mapping[str, Any],
+    target: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    workspace = _materialize_workspace(run_directory, target)
+    for attempt in range(1, IMPLEMENTATION_RETRY_LIMIT + 2):
+        _update_state(
+            run_directory,
+            phase="implementing",
+            summary=(
+                "The approved Codex implementation is running."
+                if attempt == 1
+                else (
+                    "Retrying the Codex implementation in a fresh isolated workspace "
+                    f"({attempt - 1} of {IMPLEMENTATION_RETRY_LIMIT})."
+                )
+            ),
+            details={"workspace": str(workspace), "implementation_attempt": attempt},
+        )
+        try:
+            worker = _run_worker(
+                task_request,
+                run_directory=run_directory,
+                working_directory=workspace,
+                read_only=False,
+                log_label=(
+                    "implementation" if attempt == 1 else f"implementation:retry-{attempt - 1}"
+                ),
+            )
+            return workspace, worker
+        except WorkerError as error:
+            if attempt > IMPLEMENTATION_RETRY_LIMIT or not error.retryable:
+                raise
+            _append_run_log(
+                _run_log_path(run_directory),
+                "controller",
+                (
+                    f"implementation attempt {attempt} failed with retryable {error.code}; "
+                    f"starting retry {attempt} of {IMPLEMENTATION_RETRY_LIMIT}"
+                ),
+            )
+            _archive_failed_implementation_workspace(run_directory, workspace, attempt)
+            workspace = _materialize_workspace(run_directory, target)
+    raise ControllerError("The Codex implementation did not produce a result.")
 
 
 def _run_review_requests(
@@ -1967,20 +2051,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
         target = task_request.get("target")
         if not isinstance(target, Mapping):
             raise ControllerError("The implementation task has no workspace target.")
-        workspace = _materialize_workspace(run_directory, target)
-        _update_state(
-            run_directory,
-            phase="implementing",
-            summary="The approved Codex implementation is running.",
-            details={"workspace": str(workspace)},
-        )
-        worker = _run_worker(
-            task_request,
-            run_directory=run_directory,
-            working_directory=workspace,
-            read_only=False,
-            log_label="implementation",
-        )
+        workspace, worker = _run_implementation(run_directory, task_request, target)
         _update_state(
             run_directory,
             phase="collecting",
