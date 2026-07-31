@@ -85,6 +85,14 @@ class LeanBakeoffTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_manual_model_is_accepted_when_catalog_discovery_is_unavailable(self) -> None:
+        self.assertEqual(
+            bakeoff._selected_model("gpt-manually-reviewed", self.root / "missing.json"),
+            "gpt-manually-reviewed",
+        )
+        with self.assertRaisesRegex(bakeoff.BakeoffError, "not locally available"):
+            bakeoff._selected_model("gpt-manually-reviewed", self.root / "models.json")
+
     def _git_repository(self, name: str) -> Path:
         repository = self.root / name
         repository.mkdir()
@@ -515,6 +523,19 @@ class LeanBakeoffTests(unittest.TestCase):
             "The selected repository excludes task-attributed Claude changes.",
             explicit_blockers,
         )
+        _, reviewed_resolution, reviewed_blockers = bakeoff._resolved_replay_repository(
+            argparse.Namespace(
+                repo=first,
+                confirm_repository_selection=True,
+            ),
+            {
+                "project_dir": str(first),
+                "historical_changed_files": [str(first_changed), str(second_changed)],
+            },
+        )
+        self.assertEqual(reviewed_blockers, [])
+        self.assertTrue(reviewed_resolution["user_confirmed"])
+        self.assertTrue(reviewed_resolution["overridden_blocking_reasons"])
 
         args = _args(self.root, kind="git_commit")
         replay = {
@@ -632,6 +653,126 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertTrue(file_selection["complete"])
         self.assertEqual(classified["kind"], "empty_directory")
         self.assertEqual(baseline["kind"], "unclassified_directory")
+
+    def test_reviewed_git_commit_recovers_from_failed_baseline_discovery(self) -> None:
+        repository = self._git_repository("reviewed-baseline")
+        commit = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        args = _args(self.root, kind="git_commit")
+        args.repo = repository
+        args.baseline_kind = "git_commit"
+        args.baseline_commit = commit
+
+        with mock.patch.object(
+            bakeoff._discovery(),
+            "inspect_baseline",
+            side_effect=RuntimeError("ambiguous baseline"),
+        ):
+            baseline = bakeoff._baseline(args, {"project_dir": str(repository)})
+
+        self.assertEqual(baseline["kind"], "git_commit")
+        self.assertEqual(baseline["commit"], commit)
+        self.assertEqual(baseline["confidence"], "user_confirmed")
+        self.assertTrue(baseline["reviewed_override"])
+
+        args.baseline_commit = "deadbee"
+        with (
+            mock.patch.object(
+                bakeoff._discovery(),
+                "inspect_baseline",
+                side_effect=RuntimeError("ambiguous baseline"),
+            ),
+            self.assertRaisesRegex(bakeoff.BakeoffError, "commit is unavailable"),
+        ):
+            bakeoff._baseline(args, {"project_dir": str(repository)})
+
+    def test_reviewed_request_recovers_from_failed_transcript_discovery(self) -> None:
+        repository = self.root / "manual-request"
+        repository.mkdir()
+        args = _args(self.root, kind="empty_directory")
+        args.repo = repository
+        args.request = "Build the manually reviewed task."
+        session = {
+            "imported_thread_id": "thread-1",
+            "session_id": "session-1",
+            "project_dir": str(repository),
+        }
+
+        with (
+            mock.patch.object(bakeoff, "_selected_session", return_value=session),
+            mock.patch.object(
+                bakeoff._discovery(),
+                "build_thread_task",
+                side_effect=RuntimeError("ambiguous transcript"),
+            ),
+        ):
+            replay = bakeoff._selected_replay(args)
+
+        self.assertEqual(replay["request"], args.request)
+        self.assertEqual(replay["project_dir"], str(repository))
+
+    def test_reviewed_transcript_identity_recovers_ambiguous_thread_discovery(self) -> None:
+        repository = self.root / "manual-transcript"
+        repository.mkdir()
+        transcript = self.root / "manual-transcript.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "message-1",
+                    "sessionId": "session-1",
+                    "cwd": str(repository),
+                    "timestamp": "2026-07-31T12:00:00Z",
+                    "message": {"role": "user", "content": "Original request"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        args = _args(self.root, kind="empty_directory")
+        args.repo = repository
+        args.source_path = transcript
+        args.message_uuid = "message-1"
+        args.request = "Build the manually reviewed task."
+        session = {
+            "imported_thread_id": "thread-1",
+            "session_id": "session-1",
+            "source_path": str(transcript),
+            "project_dir": str(repository),
+        }
+
+        with mock.patch.object(bakeoff, "_selected_session", return_value=session):
+            replay = bakeoff._selected_replay(args)
+
+        self.assertEqual(replay["source_path"], str(transcript))
+        self.assertEqual(replay["message_uuid"], "message-1")
+        self.assertEqual(replay["request"], args.request)
+        self.assertFalse(replay["review_decisions"]["transcript_overridden"])
+        self.assertTrue(replay["review_decisions"]["request_overridden"])
+
+        with mock.patch.object(
+            bakeoff,
+            "_selected_session",
+            side_effect=bakeoff.BakeoffError("ledger unavailable"),
+        ):
+            replay_without_ledger = bakeoff._selected_replay(args)
+        self.assertEqual(replay_without_ledger["source_path"], str(transcript))
+        self.assertEqual(replay_without_ledger["message_uuid"], "message-1")
+        self.assertEqual(replay_without_ledger["request"], args.request)
+        self.assertTrue(
+            replay_without_ledger["review_decisions"]["transcript_overridden"]
+        )
+
+        args.message_uuid = "missing-message"
+        with (
+            mock.patch.object(bakeoff, "_selected_session", return_value=session),
+            self.assertRaisesRegex(bakeoff.BakeoffError, "not in the imported transcript"),
+        ):
+            bakeoff._selected_replay(args)
 
     def test_git_repository_without_commits_uses_non_git_classification(self) -> None:
         repository = self.root / "unborn"
@@ -830,6 +971,16 @@ class LeanBakeoffTests(unittest.TestCase):
             "2026-01-02T00:00:00Z",
         )
 
+        reviewed_args = _args(self.root, kind="empty_directory")
+        reviewed_args.repo = repository
+        reviewed_args.baseline_kind = "empty_directory"
+        reviewed_args.baseline_commit = None
+        reviewed_baseline = bakeoff._baseline(reviewed_args, replay)
+        self.assertEqual(reviewed_baseline["kind"], "unclassified_directory")
+        self.assertEqual(reviewed_baseline["source_kind"], "non_git")
+        self.assertIn("post_task_git_history", reviewed_baseline)
+        self.assertFalse(reviewed_baseline["reviewed_override"])
+
         prepare_args = _args(self.root, kind="empty_directory")
         prepare_args.created_by_claude = ["created.html"]
         prepare_args.exclude_file = ["unrelated.txt"]
@@ -863,6 +1014,23 @@ class LeanBakeoffTests(unittest.TestCase):
         with self.assertRaisesRegex(bakeoff.BakeoffError, "explicit user approval"):
             bakeoff._command_run(args)
         self.assertFalse((self.root / "runs").exists())
+
+    def test_prepare_retains_capability_discovery_failure_as_a_limitation(self) -> None:
+        patches, replay, baseline, _ = self._patch_context("git_commit")
+        args = _args(self.root, kind="git_commit")
+        with patches as values:
+            values["_selected_replay"].return_value = replay
+            values["_baseline"].return_value = baseline
+            values["_capabilities"].side_effect = bakeoff.BakeoffError(
+                "capability discovery unavailable"
+            )
+            prepared = bakeoff._command_prepare(args)
+
+        self.assertEqual(prepared["status"], "ready_for_approval")
+        self.assertEqual(
+            prepared["capabilities"]["limitations"],
+            ["capability discovery unavailable"],
+        )
 
     def test_prepare_blocks_when_the_historical_patch_is_unavailable(self) -> None:
         patches, replay, baseline, parity = self._patch_context("git_commit")
@@ -901,25 +1069,24 @@ class LeanBakeoffTests(unittest.TestCase):
         replay.pop("source_path")
         replay.pop("message_uuid")
         args = _args(self.root, kind="git_commit")
-        with patches as values:
+        capture_historical = bakeoff._historical_candidate
+        with (
+            patches as values,
+            mock.patch.object(
+                bakeoff,
+                "_historical_candidate",
+                side_effect=capture_historical,
+            ),
+        ):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
             prepared = bakeoff._command_prepare(args)
         self.assertEqual(prepared["status"], "blocked")
         self.assertIn(
-            "historical transcript and original user-message UUID",
+            "source transcript path and original user-message UUID",
             prepared["blocking_reasons"][0],
         )
-        with patches as values:
-            values["_selected_replay"].return_value = replay
-            values["_baseline"].return_value = baseline
-            values["_capabilities"].return_value = parity
-            with self.assertRaisesRegex(
-                bakeoff.BakeoffError,
-                "not runnable",
-            ):
-                bakeoff._command_run(args)
         self.assertFalse((self.root / "runs").exists())
 
     def test_run_requires_a_frozen_candidate_before_allocating(self) -> None:
@@ -1310,11 +1477,18 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertNotIn("--registered-baseline-project-id", baseline_options)
         self.assertNotIn("--modified-by-claude", baseline_options)
         self.assertNotIn("--before-file", baseline_options)
+        self.assertIn("--baseline-kind", baseline_options)
+        self.assertIn("--baseline-commit", baseline_options)
+        self.assertIn("--confirm-repository-selection", baseline_options)
         run_options = {
             option for action in choices["run"]._actions for option in action.option_strings
         }
         self.assertIn("--expected-historical-result-sha256", run_options)
         self.assertIn("--expected-prepared-configuration-sha256", run_options)
+        self.assertIn("--request", run_options)
+        self.assertIn("--request-stdin", run_options)
+        self.assertIn("--source-path", run_options)
+        self.assertIn("--message-uuid", run_options)
         collect_options = {
             option
             for action in choices["collect-native-result"]._actions

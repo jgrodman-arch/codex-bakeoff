@@ -69,13 +69,14 @@
       line-height: 1.45;
     }
 
-    button, input, select { font: inherit; }
+    button, input, select, textarea { font: inherit; }
 
-    button, input, select, summary { outline: none; }
+    button, input, select, textarea, summary { outline: none; }
 
     button:focus-visible,
     input:focus-visible,
     select:focus-visible,
+    textarea:focus-visible,
     summary:focus-visible {
       box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 34%, transparent);
     }
@@ -549,7 +550,10 @@
       font-weight: 680;
     }
 
-    .field select, .field input[type="number"], .field input[type="text"] {
+    .field select,
+    .field textarea,
+    .field input[type="number"],
+    .field input[type="text"] {
       width: 100%;
       min-height: 40px;
       padding: 8px 10px;
@@ -557,6 +561,21 @@
       border-radius: var(--radius-sm);
       background: var(--panel-soft);
       color: var(--text);
+    }
+
+    .field textarea {
+      min-height: 92px;
+      resize: vertical;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .field--wide { grid-column: 1 / -1; }
+
+    .review-fields {
+      min-width: 0;
+      margin: 0;
+      padding: 0;
+      border: 0;
     }
 
     .field small {
@@ -1060,9 +1079,9 @@
         ["reporting", "Finalizing report"],
       ];
 
-      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v1";
+      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v2";
       const CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1";
-      const DRAFT_VERSION = 1;
+      const DRAFT_VERSION = 2;
       const DRAFT_STEPS = new Set(["thread", "configure", "review"]);
 
       const state = {
@@ -1084,6 +1103,8 @@
         classifications: Object.create(null),
         gitSelectionConfirmed: false,
         nonGitBaseline: "",
+        reviewDraft: null,
+        reviewRevision: 0,
         preparation: null,
         approvalChecked: false,
         runId: "",
@@ -1125,6 +1146,36 @@
         }
       };
 
+      const stringList = (value) => asArray(value)
+        .map((item) => text(item).trim())
+        .filter((item, index, values) => item && values.indexOf(item) === index);
+
+      const pathLines = (value) => text(value)
+        .split(/\r?\n/)
+        .map((item) => item.trim())
+        .filter((item, index, values) => item && values.indexOf(item) === index);
+
+      function normalizeReviewDraft(value) {
+        if (!isObject(value)) return null;
+        return {
+          thread_id: text(value.thread_id),
+          source_path: text(value.source_path),
+          message_uuid: text(value.message_uuid),
+          request: text(value.request),
+          repo: text(value.repo),
+          baseline_kind: ["git_commit", "empty_directory"].includes(value.baseline_kind)
+            ? value.baseline_kind
+            : "",
+          baseline_commit: text(value.baseline_commit),
+          model: text(value.model),
+          timeout_seconds: text(value.timeout_seconds),
+          claude_output_files: stringList(value.claude_output_files),
+          created_by_claude: stringList(value.created_by_claude),
+          excluded_files: stringList(value.excluded_files),
+          confirm_file_selection: value.confirm_file_selection === true,
+        };
+      }
+
       function normalizeDraft(value) {
         if (!isObject(value) || value.version !== DRAFT_VERSION) return null;
         const timeoutSeconds = Number(value.timeoutSeconds);
@@ -1150,6 +1201,7 @@
           nonGitBaseline: ["empty", "existing"].includes(value.nonGitBaseline)
             ? value.nonGitBaseline
             : "",
+          reviewDraft: normalizeReviewDraft(value.reviewDraft),
         };
       }
 
@@ -1174,6 +1226,7 @@
           ),
           gitSelectionConfirmed: state.gitSelectionConfirmed,
           nonGitBaseline: state.nonGitBaseline,
+          reviewDraft: normalizeReviewDraft(state.reviewDraft),
         };
       }
 
@@ -1424,9 +1477,7 @@
 
       function applyDraftToInspection(draft) {
         if (!isObject(draft)) return;
-        if (state.models.some((model) => model.id === draft.model)) {
-          state.model = draft.model;
-        }
+        if (draft.model) state.model = draft.model;
         state.timeoutSeconds = draft.timeoutSeconds;
         const { files, kind } = inspectionParts();
         const fileByPath = new Map(
@@ -1446,6 +1497,7 @@
         if (kind === "non_git") {
           state.nonGitBaseline = draft.nonGitBaseline;
         }
+        state.reviewDraft = normalizeReviewDraft(draft.reviewDraft);
       }
 
       function selectedModelDefault() {
@@ -1475,6 +1527,8 @@
         state.classifications = Object.create(null);
         state.gitSelectionConfirmed = false;
         state.nonGitBaseline = "";
+        state.reviewDraft = null;
+        state.reviewRevision += 1;
         state.preparation = null;
         state.approvalChecked = false;
         state.runId = "";
@@ -1510,6 +1564,167 @@
         return Object.fromEntries(
           Object.entries(common).filter(([, value]) => value !== undefined)
         );
+      }
+
+      function inspectionDiagnostics() {
+        const inspection = isObject(state.inspection) ? state.inspection : {};
+        const selection = isObject(inspection.file_selection) ? inspection.file_selection : {};
+        return [
+          ...asArray(inspection.diagnostics),
+          ...asArray(inspection.blockers),
+          ...asArray(selection.blocking_reasons),
+        ]
+          .map((item) => text(isObject(item) ? item.message : item))
+          .filter((item, index, values) => item && values.indexOf(item) === index);
+      }
+
+      function reviewDraftFromConfiguration() {
+        const { inspection, baseline, replay } = inspectionParts();
+        const selection = selectionPayload();
+        const failedSteps = new Set(
+          asArray(inspection.diagnostics)
+            .map((item) => text(isObject(item) ? item.step : ""))
+            .filter(Boolean)
+        );
+        const baselineKind = baseline.kind === "git_commit"
+          ? "git_commit"
+          : (baseline.kind === "empty_directory" || baseline.proposed_kind === "empty_directory")
+            ? "empty_directory"
+            : "";
+        const baselineUnresolved = (
+          failedSteps.has("baseline") ||
+          asArray(inspection.repository_blockers).length > 0 ||
+          !baselineKind
+        );
+        return normalizeReviewDraft({
+          thread_id: state.selectedThreadId,
+          source_path: replay.source_path || state.selectedThread?.source_path,
+          message_uuid: failedSteps.has("thread") ? "" : replay.message_uuid,
+          request: failedSteps.has("thread")
+            ? ""
+            : replay.request || state.selectedThread?.request,
+          repo: baselineUnresolved
+            ? ""
+            : baseline.attribution_root ||
+              baseline.repository ||
+              replay.project_dir ||
+              state.selectedThread?.project_dir,
+          baseline_kind: baselineKind,
+          baseline_commit: baselineUnresolved ? "" : baseline.commit,
+          model: state.model,
+          timeout_seconds: state.timeoutSeconds,
+          claude_output_files: selection.claude_output_files,
+          created_by_claude: selection.created_by_claude,
+          excluded_files: selection.excluded_files,
+          confirm_file_selection: baselineUnresolved
+            ? false
+            : selection.confirm_file_selection,
+        });
+      }
+
+      function reviewIncludedFiles() {
+        const draft = normalizeReviewDraft(state.reviewDraft) || {};
+        return draft.baseline_kind === "git_commit"
+          ? stringList(draft.claude_output_files)
+          : stringList(draft.created_by_claude);
+      }
+
+      function reviewPayload() {
+        const draft = normalizeReviewDraft(state.reviewDraft) || {};
+        const isGit = draft.baseline_kind === "git_commit";
+        return {
+          thread_id: text(draft.thread_id).trim(),
+          source_path: text(draft.source_path).trim(),
+          message_uuid: text(draft.message_uuid).trim(),
+          request: text(draft.request).trim(),
+          repo: text(draft.repo).trim(),
+          baseline_kind: text(draft.baseline_kind),
+          baseline_commit: isGit ? text(draft.baseline_commit).trim() : "",
+          confirm_repository_selection: Boolean(text(draft.repo).trim()),
+          model: text(draft.model).trim(),
+          timeout_seconds: Number(draft.timeout_seconds),
+          claude_output_files: isGit ? stringList(draft.claude_output_files) : [],
+          created_by_claude: isGit ? [] : stringList(draft.created_by_claude),
+          excluded_files: isGit ? [] : stringList(draft.excluded_files),
+          confirm_file_selection: draft.confirm_file_selection === true,
+        };
+      }
+
+      function reviewProblems() {
+        const draft = normalizeReviewDraft(state.reviewDraft);
+        if (!draft) return ["Open a configuration draft."];
+        const problems = [];
+        if (!draft.thread_id.trim()) problems.push("Enter the imported thread ID.");
+        if (!draft.source_path.trim()) problems.push("Enter the source transcript path.");
+        if (!draft.message_uuid.trim()) problems.push("Enter the original user-message UUID.");
+        if (!draft.request.trim()) problems.push("Enter the original request.");
+        if (!draft.repo.trim()) problems.push("Enter the replay repository.");
+        if (!draft.baseline_kind) problems.push("Choose the historical baseline type.");
+        if (draft.baseline_kind === "git_commit" && !draft.baseline_commit.trim()) {
+          problems.push("Enter the historical baseline commit.");
+        }
+        if (!draft.model.trim()) problems.push("Enter a Codex model.");
+        const timeout = Number(draft.timeout_seconds);
+        if (!Number.isInteger(timeout) || timeout < 1 || timeout > 14400) {
+          problems.push("Set a timeout from 1 through 14,400 seconds.");
+        }
+        if (draft.baseline_kind && !draft.confirm_file_selection) {
+          problems.push(
+            draft.baseline_kind === "empty_directory"
+              ? "Confirm the file classification and empty starting directory."
+              : "Confirm the Git working-tree attribution."
+          );
+        }
+        return problems;
+      }
+
+      function invalidateReviewPreparation() {
+        state.reviewRevision += 1;
+        state.preparation = null;
+        state.approvalChecked = false;
+        state.error = "";
+        state.notice = "";
+        const approval = document.querySelector('[data-action="open-approval"]');
+        if (approval instanceof HTMLButtonElement) {
+          approval.hidden = true;
+          approval.disabled = true;
+        }
+        const validate = document.querySelector('[data-action="validate-review"]');
+        if (validate instanceof HTMLButtonElement) {
+          validate.hidden = false;
+          validate.disabled = Boolean(state.busy);
+        }
+        const status = document.getElementById("review-status");
+        if (status) {
+          status.classList.remove("pill--good");
+          status.classList.add("pill--warning");
+          status.textContent = "Needs attention";
+        }
+        const statusCopy = document.getElementById("review-status-copy");
+        if (statusCopy) {
+          statusCopy.textContent = "Complete every required field, then validate this configuration.";
+        }
+        const evidence = document.getElementById("prepared-evidence");
+        if (evidence) evidence.hidden = true;
+        const dialog = document.getElementById("approval-dialog");
+        if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
+      }
+
+      function clearReviewAttestation(field, id) {
+        if (!state.reviewDraft) return;
+        state.reviewDraft[field] = false;
+        const checkbox = document.getElementById(id);
+        if (checkbox instanceof HTMLInputElement) checkbox.checked = false;
+      }
+
+      function invalidateConfigurationReview() {
+        state.reviewRevision += 1;
+        state.reviewDraft = null;
+        state.preparation = null;
+        state.approvalChecked = false;
+        state.error = "";
+        state.notice = "";
+        saveDraft();
       }
 
       function configurationProblems() {
@@ -1555,10 +1770,14 @@
 
       function preparationBlockers() {
         const preparation = isObject(state.preparation) ? state.preparation : {};
-        return asArray(preparation.blockers?.length
-          ? preparation.blockers
-          : preparation.blocking_reasons
-        ).map((item) => text(item)).filter(Boolean);
+        return [
+          ...asArray(preparation.blockers?.length
+            ? preparation.blockers
+            : preparation.blocking_reasons),
+          ...asArray(preparation.questions),
+        ]
+          .map((item) => text(isObject(item) ? item.question : item))
+          .filter((item, index, values) => item && values.indexOf(item) === index);
       }
 
       function preparationReady() {
@@ -1570,12 +1789,19 @@
         ) && preparationBlockers().length === 0;
       }
 
-      function exactConfiguration() {
+      function approvedConfiguration() {
+        const preparation = isObject(state.preparation) ? state.preparation : {};
+        return (
+          (isObject(preparation.run_config) && preparation.run_config) ||
+          reviewPayload()
+        );
+      }
+
+      function evidenceConfiguration() {
         const preparation = isObject(state.preparation) ? state.preparation : {};
         return (
           (isObject(preparation.configuration) && preparation.configuration) ||
-          (isObject(preparation.run_config) && preparation.run_config) ||
-          selectionPayload()
+          approvedConfiguration()
         );
       }
 
@@ -1604,11 +1830,12 @@
       }
 
       function canNavigateTo(id) {
+        if (state.busy) return false;
         if (state.run && !terminalRunStatus(state.run.status)) return id === "run";
         if (id === state.step) return false;
         if (id === "thread") return true;
         if (id === "configure") return Boolean(state.inspection);
-        if (id === "review") return Boolean(state.preparation);
+        if (id === "review") return Boolean(state.reviewDraft);
         if (id === "run") return Boolean(state.run);
         if (id === "results") return Boolean(state.report);
         return false;
@@ -2052,7 +2279,12 @@
                       </select>`
                     : `<input id="model" type="text" value="${escapeHtml(state.model)}" placeholder="No local model catalog available">`
                   }
-                  <small>${escapeHtml(state.models.find((model) => model.id === state.model)?.description || "Only locally available API-supported models are shown.")}</small>
+                  <small>${escapeHtml(
+                    state.models.find((model) => model.id === state.model)?.description ||
+                    (state.models.length
+                      ? "Only locally available API-supported models are shown."
+                      : "The local model catalog is unavailable; enter the exact model ID.")
+                  )}</small>
                 </div>
                 <div class="field">
                   <label for="timeout">Timeout in seconds</label>
@@ -2089,6 +2321,7 @@
                 <span class="banner__mark" aria-hidden="true">i</span>
                 <div class="banner__body">
                   <strong>Before review</strong>
+                  <p>Anything unresolved here can be completed manually in Review.</p>
                   <ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul>
                 </div>
               </div>`
@@ -2100,10 +2333,10 @@
             <button
               type="button"
               class="button button--primary"
-              data-action="prepare"
-              ${problems.length || state.busy ? "disabled" : ""}
+              data-action="review-configuration"
+              ${state.busy ? "disabled" : ""}
             >
-              ${state.busy === "prepare" ? '<span class="spinner" aria-hidden="true"></span>Preparing…' : "Review exact configuration"}
+              Review and complete configuration
             </button>
           </div>
         `;
@@ -2127,7 +2360,7 @@
         const runtime = isObject(configuration.runtime) ? configuration.runtime : {};
         const direct = isObject(state.preparation?.run_config)
           ? state.preparation.run_config
-          : selectionPayload();
+          : reviewPayload();
         const selection = isObject(configuration.file_selection)
           ? configuration.file_selection
           : {};
@@ -2176,21 +2409,36 @@
       }
 
       function renderReviewStep() {
-        const configuration = exactConfiguration();
-        const summary = reviewSummary(configuration);
+        const draft = normalizeReviewDraft(state.reviewDraft) || normalizeReviewDraft({});
+        const evidence = evidenceConfiguration();
+        const approved = approvedConfiguration();
+        const summary = reviewSummary(evidence);
         const blockers = preparationBlockers();
+        const diagnostics = inspectionDiagnostics();
+        const problems = reviewProblems();
         const ready = preparationReady();
+        const included = reviewIncludedFiles().join("\n");
         return `
           ${pageHeading(
-            "Approval",
-            "Review the exact run configuration",
-            "This snapshot came from the local bakeoff engine. Any change requires preparing it again."
+            "Review",
+            "Complete the run configuration",
+            "Every run field is editable. Discovered values are suggestions until the server validates this draft."
           )}
+          ${diagnostics.length
+            ? `<div class="banner banner--warning" role="status">
+                <span class="banner__mark" aria-hidden="true">i</span>
+                <div class="banner__body">
+                  <strong>Some values could not be discovered</strong>
+                  <p>Fill the blank fields below. Discovery details are retained for context.</p>
+                  <ul>${diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+                </div>
+              </div>`
+            : ""}
           ${blockers.length
-            ? `<div class="banner banner--error" role="alert">
+            ? `<div class="banner banner--warning" role="status">
                 <span class="banner__mark" aria-hidden="true">!</span>
                 <div class="banner__body">
-                  <strong>This configuration cannot run</strong>
+                  <strong>The server still needs information</strong>
                   <ul>${blockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
                 </div>
               </div>`
@@ -2198,59 +2446,134 @@
           <section class="panel" aria-labelledby="review-heading">
             <div class="panel__header">
               <div>
-                <h2 id="review-heading">Prepared configuration</h2>
-                <p>${ready ? "Ready for explicit approval." : `Preparation status: ${titleCase(state.preparation?.status)}`}</p>
+                <h2 id="review-heading">Editable configuration</h2>
+                <p id="review-status-copy">${ready ? "Validated and ready for explicit approval." : "Complete every required field, then validate this configuration."}</p>
               </div>
-              <span class="pill ${ready ? "pill--good" : "pill--warning"}">${ready ? "Ready" : "Needs attention"}</span>
+              <span id="review-status" class="pill ${ready ? "pill--good" : "pill--warning"}">${ready ? "Ready" : "Needs attention"}</span>
             </div>
             <div class="panel__body">
-              <div class="review-grid">
-                ${reviewItem("Imported thread", summary.thread, true)}
-                ${reviewItem("Replay repository", summary.replayRepository, true)}
-                ${summary.originalThreadCwd
-                  ? reviewItem("Original thread cwd", summary.originalThreadCwd, true)
+              <fieldset class="review-fields" ${state.busy === "prepare" ? "disabled" : ""}>
+                <div class="field-grid">
+                <div class="field">
+                  <label for="review-thread">Imported thread ID</label>
+                  <input id="review-thread" type="text" value="${escapeHtml(draft.thread_id)}">
+                </div>
+                <div class="field">
+                  <label for="review-model">Codex model</label>
+                  <input id="review-model" type="text" list="review-model-options" value="${escapeHtml(draft.model)}">
+                  <datalist id="review-model-options">
+                    ${state.models.map((model) => `<option value="${escapeHtml(model.id)}">${escapeHtml(model.label)}</option>`).join("")}
+                  </datalist>
+                </div>
+                <div class="field field--wide">
+                  <label for="review-source-path">Source transcript path</label>
+                  <input id="review-source-path" type="text" value="${escapeHtml(draft.source_path)}" placeholder="/absolute/path/to/transcript.jsonl">
+                </div>
+                <div class="field field--wide">
+                  <label for="review-message-uuid">Original user-message UUID</label>
+                  <input id="review-message-uuid" type="text" value="${escapeHtml(draft.message_uuid)}">
+                </div>
+                <div class="field field--wide">
+                  <label for="review-request">Original request</label>
+                  <textarea id="review-request">${escapeHtml(draft.request)}</textarea>
+                </div>
+                <div class="field field--wide">
+                  <label for="review-repo">Replay repository</label>
+                  <input id="review-repo" type="text" value="${escapeHtml(draft.repo)}" placeholder="/absolute/path/to/project">
+                </div>
+                <div class="field">
+                  <label for="review-baseline-kind">Historical baseline type</label>
+                  <select id="review-baseline-kind">
+                    <option value="" ${draft.baseline_kind ? "" : "selected"}>Choose a baseline</option>
+                    <option value="git_commit" ${draft.baseline_kind === "git_commit" ? "selected" : ""}>Git commit</option>
+                    <option value="empty_directory" ${draft.baseline_kind === "empty_directory" ? "selected" : ""}>Empty directory</option>
+                  </select>
+                </div>
+                ${draft.baseline_kind === "git_commit"
+                  ? `<div class="field">
+                      <label for="review-baseline-commit">Historical baseline commit</label>
+                      <input id="review-baseline-commit" type="text" value="${escapeHtml(draft.baseline_commit)}">
+                    </div>`
                   : ""}
-                ${reviewItem("Historical baseline", summary.baseline, true)}
-                ${reviewItem("Codex model", summary.model, true)}
-                ${reviewItem("Timeout", formatDuration(summary.timeout))}
-                ${reviewItem("Sandbox / network", `${titleCase(summary.sandbox)} · ${summary.network}`)}
-                ${reviewItem("Included Claude files", `${summary.included.length}`)}
-                ${reviewItem("Excluded files", `${summary.excluded.length}`)}
-              </div>
-              ${summary.originalThreadCwd
-                ? `<div class="banner" role="status" style="margin-top:14px">
+                <div class="field">
+                  <label for="review-timeout">Timeout in seconds</label>
+                  <input id="review-timeout" type="number" min="1" max="14400" step="1" value="${escapeHtml(draft.timeout_seconds)}">
+                </div>
+                ${draft.baseline_kind
+                  ? `<div class="field field--wide">
+                      <label for="review-included-files">Claude output paths</label>
+                      <textarea id="review-included-files" placeholder="One repository-relative path per line">${escapeHtml(included)}</textarea>
+                      <small>${draft.baseline_kind === "git_commit"
+                        ? "Current Git changes not listed here remain protected from the historical candidate."
+                        : "List every current path created by Claude."}</small>
+                    </div>`
+                  : `<div class="banner banner--warning field--wide" role="status">
+                      <span class="banner__mark" aria-hidden="true">i</span>
+                      <div class="banner__body"><strong>Choose a baseline type before classifying files.</strong></div>
+                    </div>`}
+                ${draft.baseline_kind === "empty_directory"
+                  ? `<div class="field field--wide">
+                      <label for="review-excluded-files">Excluded paths</label>
+                      <textarea id="review-excluded-files" placeholder="One repository-relative path per line">${escapeHtml(draft.excluded_files.join("\n"))}</textarea>
+                      <small>Every surfaced non-Git path must be classified as Claude output or excluded.</small>
+                    </div>`
+                  : ""}
+                ${draft.baseline_kind
+                  ? `<label class="choice field--wide">
+                      <input id="review-confirmation" type="checkbox" ${draft.confirm_file_selection ? "checked" : ""}>
+                      <span>${draft.baseline_kind === "empty_directory"
+                        ? "I confirm this complete file classification and that the directory was empty before Claude."
+                        : "I confirm this complete Git working-tree attribution."}</span>
+                    </label>`
+                  : ""}
+                </div>
+              </fieldset>
+              ${problems.length
+                ? `<div class="banner banner--warning" role="status" style="margin-top:14px">
                     <span class="banner__mark" aria-hidden="true">i</span>
                     <div class="banner__body">
-                      <strong>Replay repository resolved from the historical run</strong>
-                      <p>${summary.repositoryResolutionSource === "explicit_repo"
-                        ? "The explicitly selected repository differs from the thread’s original cwd and will be used for the historical baseline and isolated Codex replay."
-                        : "Claude’s recorded changes resolved to this repository, so it will be used for the historical baseline and isolated Codex replay."}</p>
+                      <strong>Required before approval</strong>
+                      <ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul>
                     </div>
                   </div>`
                 : ""}
-              ${summary.included.length
-                ? `<details><summary>Included paths (${summary.included.length})</summary><pre>${escapeHtml(summary.included.join("\n"))}</pre></details>`
-                : ""}
-              ${summary.excluded.length
-                ? `<details><summary>Excluded paths (${summary.excluded.length})</summary><pre>${escapeHtml(summary.excluded.join("\n"))}</pre></details>`
-                : ""}
-              <details>
-                <summary>Exact server configuration</summary>
-                <pre>${escapeHtml(safeJson(configuration))}</pre>
-              </details>
             </div>
           </section>
+          ${state.preparation
+            ? `<section id="prepared-evidence" class="panel" aria-labelledby="prepared-heading" style="margin-top:14px">
+                <div class="panel__header">
+                  <div>
+                    <h2 id="prepared-heading">Server-prepared evidence</h2>
+                    <p>Derived baseline, sandbox, and file-selection details for the current draft.</p>
+                  </div>
+                </div>
+                <div class="panel__body">
+                  <div class="review-grid">
+                    ${reviewItem("Imported thread", summary.thread, true)}
+                    ${reviewItem("Replay repository", summary.replayRepository, true)}
+                    ${reviewItem("Historical baseline", summary.baseline, true)}
+                    ${reviewItem("Codex model", summary.model, true)}
+                    ${reviewItem("Timeout", formatDuration(summary.timeout))}
+                    ${reviewItem("Sandbox / network", `${titleCase(summary.sandbox)} · ${summary.network}`)}
+                    ${reviewItem("Included Claude files", `${summary.included.length}`)}
+                    ${reviewItem("Excluded files", `${summary.excluded.length}`)}
+                  </div>
+                  <details>
+                    <summary>Exact server configuration</summary>
+                    <pre>${escapeHtml(safeJson(evidence))}</pre>
+                  </details>
+                </div>
+              </section>`
+            : ""}
           <div class="footer-actions">
             <span class="footer-actions__note">Starting creates exactly one isolated Codex implementation.</span>
-            <button type="button" class="button button--quiet" data-action="go-step" data-step="configure">Back</button>
-            <button
-              type="button"
-              class="button button--primary"
-              data-action="open-approval"
-              ${!ready || state.busy ? "disabled" : ""}
-            >Approve and start…</button>
+            <button type="button" class="button button--quiet" data-action="go-step" data-step="configure" ${state.busy ? "disabled" : ""}>Back</button>
+            <button type="button" class="button button--primary" data-action="open-approval" ${ready ? "" : "hidden disabled"} ${state.busy ? "disabled" : ""}>Approve and start…</button>
+            <button type="button" class="button button--primary" data-action="validate-review" ${ready ? "hidden" : ""} ${state.busy ? "disabled" : ""}>
+              ${state.busy === "prepare" ? '<span class="spinner" aria-hidden="true"></span>Validating…' : "Validate configuration"}
+            </button>
           </div>
-          ${renderApprovalDialog(configuration, summary)}
+          ${ready ? renderApprovalDialog(approved, summary) : ""}
         `;
       }
 
@@ -2879,19 +3202,23 @@
                 : selectedModelDefault();
               initializeClassifications();
               applyDraftToInspection(restoredDraft);
-              state.step = restoredDraft.step === "thread" ? "thread" : "configure";
-              if (restoredDraft.step === "review") {
-                state.notice = "Draft restored. Prepare it again to review and approve.";
+              state.step = restoredDraft.step === "review" && state.reviewDraft
+                ? "review"
+                : restoredDraft.step === "thread" ? "thread" : "configure";
+              if (state.step === "review") {
+                state.notice = "Review draft restored. Validate it again before approval.";
               }
             } catch (error) {
-              state.hostReady = false;
-              state.selectedThreadId = "";
-              state.selectedThread = null;
-              state.inspection = null;
-              state.step = "thread";
-              state.error = `The saved draft could not be restored. ${
-                error instanceof Error ? error.message : String(error)
-              }`;
+              state.inspection = {
+                replay: selected || { imported_thread_id: restoredDraft.selectedThreadId },
+                diagnostics: [{
+                  step: "inspection",
+                  message: error instanceof Error ? error.message : String(error),
+                }],
+              };
+              state.reviewDraft = normalizeReviewDraft(restoredDraft.reviewDraft) || reviewDraftFromConfiguration();
+              state.step = state.reviewDraft ? "review" : "configure";
+              state.error = "";
             }
           }
         } catch (error) {
@@ -2916,6 +3243,8 @@
         state.classifications = Object.create(null);
         state.gitSelectionConfirmed = false;
         state.nonGitBaseline = "";
+        state.reviewDraft = null;
+        state.reviewRevision += 1;
         state.preparation = null;
         state.approvalChecked = false;
         state.runId = "";
@@ -2934,37 +3263,63 @@
           initializeClassifications();
           state.step = "configure";
         } catch (error) {
-          state.error = error instanceof Error ? error.message : String(error);
-          state.selectedThreadId = "";
-          state.selectedThread = null;
-          state.inspection = null;
-          clearDraft();
-          state.step = "thread";
+          state.inspection = {
+            replay: selected,
+            diagnostics: [{
+              step: "inspection",
+              message: error instanceof Error ? error.message : String(error),
+            }],
+          };
+          initializeClassifications();
+          state.step = "configure";
         } finally {
           state.busy = "";
           render({ focus: true });
         }
       }
 
+      function openReview() {
+        if (!state.reviewDraft) {
+          state.reviewDraft = reviewDraftFromConfiguration();
+        }
+        state.preparation = null;
+        state.approvalChecked = false;
+        state.error = "";
+        state.notice = "";
+        state.step = "review";
+        render({ focus: true });
+      }
+
       async function prepareRun() {
-        const problems = configurationProblems();
+        const problems = reviewProblems();
         if (problems.length) {
           state.error = problems.join(" ");
           render();
           return;
         }
         state.busy = "prepare";
+        state.preparation = null;
+        state.approvalChecked = false;
         state.error = "";
         state.notice = "";
+        const reviewRevision = state.reviewRevision;
+        const configuration = reviewPayload();
         render();
         try {
-          state.preparation = await callTool("prepare_run", selectionPayload());
-          state.step = "review";
+          const preparation = await callTool("prepare_run", configuration);
+          if (
+            reviewRevision !== state.reviewRevision ||
+            state.step !== "review" ||
+            !state.reviewDraft
+          ) return;
+          state.preparation = preparation;
           state.notice = preparationReady()
             ? "The bakeoff engine validated this configuration."
             : "";
         } catch (error) {
-          state.error = error instanceof Error ? error.message : String(error);
+          if (reviewRevision === state.reviewRevision && state.step === "review") {
+            state.error = error instanceof Error ? error.message : String(error);
+          }
         } finally {
           state.busy = "";
           render({ focus: true });
@@ -2985,8 +3340,9 @@
           startButton.innerHTML = '<span class="spinner" aria-hidden="true"></span>Starting…';
         }
         try {
+          const approvedRunConfiguration = approvedConfiguration();
           const payload = await callTool("start_run", {
-            ...selectionPayload(),
+            ...approvedRunConfiguration,
             approved: true,
             prepare_token: text(
               state.preparation?.prepare_token ||
@@ -3149,7 +3505,8 @@
         if (action === "retry-init") initialize();
         if (action === "refresh-threads") loadThreads(state.query);
         if (action === "select-thread") selectThread(target.dataset.threadId || "");
-        if (action === "prepare") prepareRun();
+        if (action === "review-configuration") openReview();
+        if (action === "validate-review") prepareRun();
         if (action === "start") startRun();
         if (action === "refresh-run") refreshRun();
         if (action === "load-report") loadReport();
@@ -3179,7 +3536,7 @@
 
       app.addEventListener("input", (event) => {
         const target = event.target;
-        if (!(target instanceof HTMLInputElement)) return;
+        if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
         if (target.id === "thread-search") {
           state.query = target.value;
           render();
@@ -3193,54 +3550,119 @@
         }
         if (target.id === "timeout") {
           state.timeoutSeconds = Number(target.value);
-          state.preparation = null;
-          saveDraft();
+          invalidateConfigurationReview();
+        }
+        if (target.id === "model") {
+          state.model = target.value;
+          invalidateConfigurationReview();
         }
         if (target.id === "approval-check") {
           state.approvalChecked = target.checked;
           const start = document.getElementById("start-run");
           if (start) start.disabled = !target.checked;
         }
+        const reviewFields = {
+          "review-thread": "thread_id",
+          "review-source-path": "source_path",
+          "review-message-uuid": "message_uuid",
+          "review-model": "model",
+          "review-request": "request",
+          "review-repo": "repo",
+          "review-baseline-commit": "baseline_commit",
+          "review-timeout": "timeout_seconds",
+        };
+        const reviewKey = reviewFields[target.id];
+        if (reviewKey && state.reviewDraft) {
+          state.reviewDraft[reviewKey] = target.value;
+          if (["review-thread", "review-source-path", "review-message-uuid"].includes(target.id)) {
+            clearReviewAttestation("confirm_file_selection", "review-confirmation");
+          }
+          if (target.id === "review-repo") {
+            clearReviewAttestation("confirm_file_selection", "review-confirmation");
+          }
+          if (target.id === "review-baseline-commit") {
+            clearReviewAttestation("confirm_file_selection", "review-confirmation");
+          }
+          invalidateReviewPreparation();
+          saveDraft();
+          document.querySelector('[data-action="open-approval"]')?.setAttribute("disabled", "");
+        }
+        if (target.id === "review-included-files" && state.reviewDraft) {
+          const values = pathLines(target.value);
+          if (state.reviewDraft.baseline_kind === "git_commit") {
+            state.reviewDraft.claude_output_files = values;
+          } else {
+            state.reviewDraft.created_by_claude = values;
+          }
+          clearReviewAttestation("confirm_file_selection", "review-confirmation");
+          invalidateReviewPreparation();
+          saveDraft();
+          document.querySelector('[data-action="open-approval"]')?.setAttribute("disabled", "");
+        }
+        if (target.id === "review-excluded-files" && state.reviewDraft) {
+          state.reviewDraft.excluded_files = pathLines(target.value);
+          clearReviewAttestation("confirm_file_selection", "review-confirmation");
+          invalidateReviewPreparation();
+          saveDraft();
+          document.querySelector('[data-action="open-approval"]')?.setAttribute("disabled", "");
+        }
       });
 
       app.addEventListener("change", (event) => {
         const target = event.target;
-        if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement)) return;
+        if (!(
+          target instanceof HTMLInputElement ||
+          target instanceof HTMLSelectElement ||
+          target instanceof HTMLTextAreaElement
+        )) return;
         state.error = "";
         state.notice = "";
+        if (target.id === "review-baseline-kind" && state.reviewDraft) {
+          state.reviewDraft.baseline_kind = target.value;
+          state.reviewDraft.confirm_file_selection = false;
+          invalidateReviewPreparation();
+          render();
+          return;
+        }
+        if (target.id === "review-confirmation" && state.reviewDraft) {
+          state.reviewDraft.confirm_file_selection = target.checked;
+          invalidateReviewPreparation();
+          render();
+          return;
+        }
         if (target.id === "model") {
           state.model = target.value;
-          state.preparation = null;
+          invalidateConfigurationReview();
           render();
           return;
         }
         if (target.id === "timeout") {
           state.timeoutSeconds = Number(target.value);
-          state.preparation = null;
+          invalidateConfigurationReview();
           render();
           return;
         }
         if (target.id === "git-confirmation") {
           state.gitSelectionConfirmed = target.checked;
-          state.preparation = null;
+          invalidateConfigurationReview();
           render();
           return;
         }
         if (target.name === "non-git-baseline") {
           state.nonGitBaseline = target.value;
-          state.preparation = null;
+          invalidateConfigurationReview();
           render();
           return;
         }
         if (target.dataset.fileKind === "git") {
           state.classifications[target.dataset.path] = target.checked ? "claude" : "exclude";
-          state.preparation = null;
+          invalidateConfigurationReview();
           render();
           return;
         }
         if (target.dataset.fileKind === "non_git") {
           state.classifications[target.dataset.path] = target.value;
-          state.preparation = null;
+          invalidateConfigurationReview();
           render();
         }
       });

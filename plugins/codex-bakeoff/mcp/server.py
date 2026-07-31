@@ -1268,6 +1268,7 @@ def _engine(
     *,
     timeout: int = 180,
     run_directory: Path | None = None,
+    input_text: str | None = None,
 ) -> dict[str, Any]:
     bounded_timeout = _bounded_int(
         timeout,
@@ -1284,6 +1285,7 @@ def _engine(
             [sys.executable, str(RUNNER), command, *arguments, "--json"],
             cwd=PLUGIN_ROOT,
             timeout=bounded_timeout,
+            input_text=input_text,
         )
     except subprocess.TimeoutExpired:
         if log_path is not None:
@@ -1307,13 +1309,55 @@ def _engine(
 
 def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
     model = arguments.get("model")
-    if not isinstance(model, str) or not model.strip():
+    if not isinstance(model, str) or not model.strip() or "\x00" in model:
         raise ControllerError("Choose a Codex model.")
+    source_path = arguments.get("source_path")
+    if source_path is not None:
+        if not isinstance(source_path, str) or not source_path.strip() or "\x00" in source_path:
+            raise ControllerError("source_path must identify a source transcript.")
+        source_path = source_path.strip()
+    message_uuid = arguments.get("message_uuid")
+    if message_uuid is not None:
+        if not isinstance(message_uuid, str) or not message_uuid.strip() or "\x00" in message_uuid:
+            raise ControllerError("message_uuid must identify an original user message.")
+        message_uuid = message_uuid.strip()
+    if (source_path is None) != (message_uuid is None):
+        raise ControllerError("source_path and message_uuid must be provided together.")
     repo = arguments.get("repo")
     if repo is not None and (not isinstance(repo, str) or not repo.strip()):
         raise ControllerError("repo must be a non-empty path.")
+    request = arguments.get("request")
+    if request is not None:
+        if not isinstance(request, str) or not request.strip() or "\x00" in request:
+            raise ControllerError("request must be non-empty text.")
+        request = request.strip()
+    baseline_kind = arguments.get("baseline_kind")
+    if baseline_kind is not None and (
+        not isinstance(baseline_kind, str)
+        or baseline_kind not in {"git_commit", "empty_directory"}
+    ):
+        raise ControllerError("Choose a Git commit or empty-directory baseline.")
+    baseline_commit = arguments.get("baseline_commit")
+    if baseline_commit is not None:
+        if not isinstance(baseline_commit, str):
+            raise ControllerError("baseline_commit must be a Git commit.")
+        baseline_commit = baseline_commit.strip()
+        if not baseline_commit:
+            baseline_commit = None
+    if baseline_kind == "git_commit" and (
+        not isinstance(baseline_commit, str)
+        or COMMIT_PATTERN.fullmatch(baseline_commit) is None
+    ):
+        raise ControllerError("Enter a valid historical Git commit.")
+    if baseline_kind == "empty_directory" and baseline_commit is not None:
+        raise ControllerError("An empty-directory baseline cannot have a Git commit.")
+    if baseline_commit is not None and baseline_kind != "git_commit":
+        raise ControllerError("Choose a Git-commit baseline for baseline_commit.")
     return {
         "thread_id": _thread_id(arguments),
+        "source_path": source_path,
+        "message_uuid": message_uuid,
+        "request": request,
         "model": model.strip(),
         "timeout_seconds": _bounded_int(
             arguments.get("timeout_seconds"),
@@ -1322,6 +1366,11 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
             maximum=14_400,
         ),
         "repo": repo.strip() if isinstance(repo, str) else None,
+        "baseline_kind": baseline_kind,
+        "baseline_commit": baseline_commit,
+        "confirm_repository_selection": (
+            arguments.get("confirm_repository_selection") is True
+        ),
         "claude_output_files": _string_list(arguments, "claude_output_files"),
         "created_by_claude": _string_list(arguments, "created_by_claude"),
         "excluded_files": _string_list(arguments, "excluded_files"),
@@ -1352,6 +1401,21 @@ def _configuration_arguments(arguments: Mapping[str, Any]) -> list[str]:
     repo = configuration["repo"]
     if isinstance(repo, str):
         result.extend(("--repo", repo))
+    source_path = configuration["source_path"]
+    message_uuid = configuration["message_uuid"]
+    if isinstance(source_path, str) and isinstance(message_uuid, str):
+        result.extend(("--source-path", source_path, "--message-uuid", message_uuid))
+    request = configuration["request"]
+    if isinstance(request, str):
+        result.append("--request-stdin")
+    baseline_kind = configuration["baseline_kind"]
+    if isinstance(baseline_kind, str):
+        result.extend(("--baseline-kind", baseline_kind))
+    baseline_commit = configuration["baseline_commit"]
+    if isinstance(baseline_commit, str):
+        result.extend(("--baseline-commit", baseline_commit))
+    if configuration["confirm_repository_selection"] is True:
+        result.append("--confirm-repository-selection")
     for key, flag in (
         ("claude_output_files", "--claude-output-file"),
         ("created_by_claude", "--created-by-claude"),
@@ -1366,7 +1430,11 @@ def _configuration_arguments(arguments: Mapping[str, Any]) -> list[str]:
 
 def _prepare_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
     configuration = _normalized_configuration(arguments)
-    payload = _engine("prepare", _configuration_arguments(arguments))
+    payload = _engine(
+        "prepare",
+        _configuration_arguments(arguments),
+        input_text=configuration["request"],
+    )
     ready = payload.get("status") == "ready_for_approval"
     historical_result_sha256 = payload.get("historical_result_sha256")
     if ready and (
@@ -2117,6 +2185,7 @@ def _start_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
                 "--run-root",
                 str(RUN_ROOT),
             ],
+            input_text=configuration["request"],
         )
     except Exception:
         with _jobs_lock:
@@ -2185,16 +2254,33 @@ def _inspect_thread(arguments: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(repo, str) or not repo.strip():
             raise ControllerError("repo must be a non-empty path.")
         baseline_args.extend(("--repo", repo.strip()))
-    replay = _engine("replay", session_args)
-    capabilities = _engine("capabilities", session_args)
-    baseline = _engine("baseline", baseline_args)
-    models = _engine("models")
+    diagnostics: list[dict[str, str]] = []
+
+    def inspect_step(
+        step: str,
+        command: str,
+        command_arguments: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        try:
+            return _engine(command, command_arguments)
+        except Exception as error:  # noqa: BLE001 - review preserves partial discovery.
+            diagnostics.append({"step": step, "message": str(error)[:2_000]})
+            return {}
+
+    replay = inspect_step("thread", "replay", session_args)
+    capabilities = inspect_step("capabilities", "capabilities", session_args)
+    baseline = inspect_step("baseline", "baseline", baseline_args)
+    models = inspect_step("models", "models")
     file_selection = baseline.get("file_selection")
     selection = file_selection if isinstance(file_selection, Mapping) else {}
     baseline_value = baseline.get("baseline")
     baseline_record = baseline_value if isinstance(baseline_value, Mapping) else {}
     thread = replay.get("replay")
-    thread_record = thread if isinstance(thread, Mapping) else {}
+    thread_record = (
+        thread
+        if isinstance(thread, Mapping)
+        else {"imported_thread_id": thread_id}
+    )
     return {
         "thread": dict(thread_record),
         "replay": dict(thread_record),
@@ -2210,7 +2296,11 @@ def _inspect_thread(arguments: Mapping[str, Any]) -> dict[str, Any]:
         },
         "models": list(models.get("options") or []),
         "questions": list(baseline.get("questions") or []),
+        "repository_blockers": list(
+            baseline.get("repository_blocking_reasons") or []
+        ),
         "blockers": list(baseline.get("blocking_reasons") or []),
+        "diagnostics": diagnostics,
     }
 
 
@@ -2235,10 +2325,16 @@ def _call_tool(params: Any) -> dict[str, Any]:
             raise ControllerError("A valid port-process confirmation token is required.")
         return _open_external_controller(confirmation_token=token)
     if name == "get_state":
-        models = _engine("models")
+        diagnostics: list[dict[str, str]] = []
+        try:
+            models = _engine("models")
+        except Exception as error:  # noqa: BLE001 - model can be entered in Review.
+            models = {}
+            diagnostics.append({"step": "models", "message": str(error)[:2_000]})
         state = {
             "plugin_version": SERVER_VERSION,
             "models": list(models.get("options") or []),
+            "diagnostics": diagnostics,
             "recent_runs": _recent_runs(),
             "run_root": str(RUN_ROOT),
             "controller_log_path": str(CONTROLLER_LOG_PATH),

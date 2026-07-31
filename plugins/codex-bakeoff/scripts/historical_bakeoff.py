@@ -26,6 +26,7 @@ DEFAULT_RUN_ROOT = Path.home() / ".cache" / "codex-bakeoff" / "runs"
 PRICING_PATH = PLUGIN_ROOT / "assets" / "model-pricing.json"
 MAX_TIMEOUT_SECONDS = 14_400
 THREAD_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}\Z")
+COMMIT_PATTERN = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
 
 _SECRET_PATTERNS = (
     (re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}\b"), "[REDACTED_API_KEY]"),
@@ -218,13 +219,16 @@ def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, An
 
 
 def _selected_model(model: str | None, model_cache: Path | None) -> str:
-    if not isinstance(model, str) or not model:
+    if not isinstance(model, str) or not model.strip() or "\x00" in model:
         raise BakeoffError("Choose a Codex model before starting the comparison.")
+    selected = model.strip()
     catalog = discover_codex_models(model_cache)
     choices = {item["id"] for item in catalog["options"]}
-    if model not in choices:
+    if catalog.get("status") != "available" or not choices:
+        return selected
+    if selected not in choices:
         raise BakeoffError("The selected Codex model is not locally available.")
-    return model
+    return selected
 
 
 def _sessions(ledger: Path) -> list[dict[str, Any]]:
@@ -245,12 +249,92 @@ def _selected_session(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
-    session = _selected_session(args)
+    request_from_stdin = bool(getattr(args, "request_stdin", False))
+    raw_request = sys.stdin.read() if request_from_stdin else getattr(args, "request", "")
+    manual_request = str(raw_request or "").strip()
+    if request_from_stdin and not manual_request:
+        raise BakeoffError("The reviewed request is blank.")
+    if "\x00" in manual_request:
+        raise BakeoffError("The reviewed request is invalid.")
+    raw_source_path = getattr(args, "source_path", None)
+    raw_message_uuid = getattr(args, "message_uuid", None)
+    source_path = str(raw_source_path or "").strip()
+    message_uuid = str(raw_message_uuid or "").strip()
+    if bool(source_path) != bool(message_uuid):
+        raise BakeoffError(
+            "Enter both the source transcript path and original user-message UUID."
+        )
+    session_recovered = True
     try:
-        task = _discovery().build_thread_task(session)
-        replay = _discovery().build_replay_spec(session, task)
+        session = _selected_session(args)
+    except Exception:
+        if not (source_path and message_uuid and manual_request):
+            raise
+        session_recovered = False
+        session = {
+            "imported_thread_id": args.imported_thread_id,
+            "source_path": source_path,
+            "project_dir": str(getattr(args, "repo", None) or "") or None,
+        }
+    transcript_overridden = False
+    request_discovery_failed = False
+    try:
+        if source_path and message_uuid:
+            reviewed_source = Path(source_path).expanduser()
+            if not reviewed_source.is_absolute():
+                raise BakeoffError("The reviewed source transcript path must be absolute.")
+            discovered_task: Mapping[str, Any] | None = None
+            if session_recovered:
+                try:
+                    discovered_task = _discovery().build_thread_task(session)
+                except Exception:
+                    discovered_task = None
+            original_source = session.get("source_path")
+            transcript_overridden = (
+                not session_recovered
+                or not isinstance(original_source, str)
+                or reviewed_source.resolve()
+                != Path(original_source).expanduser().resolve()
+                or discovered_task is None
+                or discovered_task.get("message_uuid") != message_uuid
+            )
+            replay = _discovery().build_replay_spec(
+                {**session, "source_path": str(reviewed_source)},
+                {
+                    "message_uuid": message_uuid,
+                    "task_scope": "whole_thread",
+                    "project_dir": getattr(args, "repo", None) or session.get("project_dir"),
+                },
+            )
+        else:
+            task = _discovery().build_thread_task(session)
+            replay = _discovery().build_replay_spec(session, task)
     except Exception as error:
-        raise BakeoffError(_redact(error)) from error
+        if source_path or message_uuid:
+            raise BakeoffError(_redact(error)) from error
+        if not manual_request:
+            raise BakeoffError(_redact(error)) from error
+        request_discovery_failed = True
+        project_dir = getattr(args, "repo", None) or session.get("project_dir")
+        replay = {
+            **session,
+            "imported_thread_id": args.imported_thread_id,
+            "request": manual_request,
+            "project_dir": str(project_dir) if project_dir else None,
+            "project_dirs": [str(project_dir)] if project_dir else [],
+            "task_scope": "whole_thread",
+            "user_message_count": 1,
+        }
+    discovered_request = str(replay.get("request") or "").strip()
+    if manual_request:
+        replay["request"] = manual_request
+    replay["review_decisions"] = {
+        "transcript_overridden": transcript_overridden,
+        "request_overridden": bool(
+            manual_request
+            and (request_discovery_failed or manual_request != discovered_request)
+        ),
+    }
     return replay
 
 
@@ -394,6 +478,12 @@ def _resolved_replay_repository(
         blocking_reasons.append(
             "The selected repository excludes task-attributed Claude changes."
         )
+    overridden_blockers: list[str] = []
+    if explicit is not None and bool(
+        getattr(args, "confirm_repository_selection", False)
+    ):
+        overridden_blockers = list(dict.fromkeys(blocking_reasons))
+        blocking_reasons = []
     effective = explicit or suggested
     if effective is not None:
         resolved["project_dir"] = str(effective)
@@ -412,9 +502,49 @@ def _resolved_replay_repository(
         "source": source,
         "original_project_dir": str(original) if original is not None else None,
         "effective_project_dir": str(effective) if effective is not None else None,
+        "user_confirmed": bool(
+            explicit is not None
+            and getattr(args, "confirm_repository_selection", False)
+        ),
+        "overridden_blocking_reasons": overridden_blockers,
     }
     resolved["repository_resolution"] = resolution
     return resolved, resolution, list(dict.fromkeys(blocking_reasons))
+
+
+def _reviewed_git_baseline(
+    repository: Path,
+    attribution_root: Path,
+    commit: str,
+) -> dict[str, Any]:
+    if COMMIT_PATTERN.fullmatch(commit) is None:
+        raise BakeoffError("Enter a valid historical Git commit.")
+    git_root = _git_root(repository)
+    if git_root is None:
+        raise BakeoffError("The reviewed repository is not an accessible Git repository.")
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(git_root), "rev-parse", "--verify", f"{commit}^{{commit}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise BakeoffError("The reviewed historical Git commit could not be verified.") from error
+    resolved = completed.stdout.strip()
+    if completed.returncode != 0 or re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved) is None:
+        raise BakeoffError("The reviewed historical Git commit is unavailable.")
+    return {
+        "kind": "git_commit",
+        "proposed_kind": "git_commit",
+        "repository": str(git_root),
+        "attribution_root": str(attribution_root),
+        "source_kind": "git",
+        "commit": resolved.lower(),
+        "confidence": "user_confirmed",
+        "working_tree_state": "user_reviewed",
+    }
 
 
 def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, Any]:
@@ -431,10 +561,66 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
             raise BakeoffError("The selected project root changed or is not a real directory.")
         inspected_replay["project_dir"] = str(selected_project)
         inspected_replay["project_dirs"] = [inspected_replay["project_dir"]]
+    manual_kind = getattr(args, "baseline_kind", None)
+    manual_commit = str(getattr(args, "baseline_commit", "") or "").strip()
+    if manual_commit and manual_kind != "git_commit":
+        raise BakeoffError("Choose a Git-commit baseline for the reviewed commit.")
+    inspection_failed = False
     try:
         inspected = _discovery().inspect_baseline(inspected_replay)
     except Exception as error:
-        raise BakeoffError(_redact(error)) from error
+        if manual_kind is None:
+            raise BakeoffError(_redact(error)) from error
+        inspection_failed = True
+        inspected = {}
+
+    if manual_kind == "git_commit":
+        if selected_project is None:
+            raise BakeoffError("Enter a replay repository for the reviewed Git baseline.")
+        reviewed = _reviewed_git_baseline(
+            selected_project,
+            selected_project,
+            manual_commit,
+        )
+        if str(inspected.get("commit") or "").lower() == reviewed["commit"]:
+            reviewed["confidence"] = inspected.get("confidence", reviewed["confidence"])
+            reviewed["working_tree_state"] = inspected.get(
+                "working_tree_state",
+                reviewed["working_tree_state"],
+            )
+        return {
+            **inspected,
+            **reviewed,
+            "reviewed_override": inspection_failed or not (
+                inspected.get("kind") == "git_commit"
+                and str(inspected.get("commit") or "").lower() == reviewed["commit"]
+            ),
+        }
+
+    if manual_kind == "empty_directory":
+        if manual_commit:
+            raise BakeoffError("An empty-directory baseline cannot have a Git commit.")
+        if selected_project is None:
+            raise BakeoffError("Enter a replay repository for the empty-directory baseline.")
+        if (
+            _git_root(selected_project) is not None
+            and not inspected.get("post_task_git_history")
+        ):
+            raise BakeoffError(
+                "A Git repository with commits cannot use an empty-directory baseline."
+            )
+        return {
+            **inspected,
+            "kind": "unclassified_directory",
+            "proposed_kind": "empty_directory",
+            "repository": str(selected_project),
+            "attribution_root": str(selected_project),
+            "source_kind": "non_git",
+            "commit": None,
+            "confidence": "requires_user_classification",
+            "reviewed_override": inspection_failed,
+        }
+
     raw_repository = args.repo or inspected.get("repository") or replay.get("project_dir")
     if not isinstance(raw_repository, (str, Path)) or not str(raw_repository).strip():
         return inspected
@@ -710,6 +896,8 @@ def _configuration(
     replay = context["replay"]
     baseline = context["baseline"]
     capabilities = context["capabilities"]
+    review_decisions = replay.get("review_decisions")
+    review_decisions = review_decisions if isinstance(review_decisions, Mapping) else {}
     return {
         "task": {
             "imported_thread_id": replay.get("imported_thread_id"),
@@ -744,6 +932,14 @@ def _configuration(
         },
         "user_decisions": {
             "file_selection_confirmed": bool(context["file_selection"].get("confirmed")),
+            "repository_selection_confirmed": bool(
+                getattr(args, "confirm_repository_selection", False)
+            ),
+            "transcript_overridden": bool(
+                review_decisions.get("transcript_overridden")
+            ),
+            "baseline_overridden": bool(baseline.get("reviewed_override")),
+            "request_overridden": bool(review_decisions.get("request_overridden")),
             "empty_starting_directory_confirmed": bool(
                 context["file_selection"].get("empty_starting_directory_confirmed")
             ),
@@ -766,7 +962,14 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
         },
     )
     model = _selected_model(args.model, args.model_cache)
-    capabilities = _capabilities(replay)
+    try:
+        capabilities = _capabilities(replay)
+    except BakeoffError as error:
+        capabilities = {
+            "items": [],
+            "resolution_actions": [],
+            "limitations": [str(error)],
+        }
     context = {
         "replay": replay,
         "baseline": baseline,
@@ -784,23 +987,13 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
     ]
     runnable = baseline.get("kind") in {"git_commit", "empty_directory"}
     historical_candidate: dict[str, Any] | None = None
-    replay_has_transcript = all(
-        isinstance(replay.get(field), str) and bool(str(replay.get(field)).strip())
-        for field in ("source_path", "message_uuid")
-    )
     if not questions and runnable and not blocking_reasons:
-        if not replay_has_transcript:
-            blocking_reasons.append(
-                "The selected historical transcript and original user-message UUID "
-                "are required before starting Codex."
+        try:
+            historical_candidate = _serialize_historical_candidate(
+                *_historical_candidate(context)
             )
-        else:
-            try:
-                historical_candidate = _serialize_historical_candidate(
-                    *_historical_candidate(context)
-                )
-            except BakeoffError as error:
-                blocking_reasons.append(str(error))
+        except BakeoffError as error:
+            blocking_reasons.append(str(error))
     context["historical_candidate"] = historical_candidate
     if repository_blockers:
         status = "blocked"
@@ -1014,6 +1207,16 @@ def _historical_candidate(
     run: Mapping[str, Any],
 ) -> tuple[Any | None, dict[str, Any], str]:
     replay = run["replay"]
+    if (
+        not isinstance(replay.get("source_path"), str)
+        or not replay["source_path"].strip()
+        or not isinstance(replay.get("message_uuid"), str)
+        or not replay["message_uuid"].strip()
+    ):
+        raise BakeoffError(
+            "The source transcript path and original user-message UUID must be "
+            "reviewed before capturing the historical Claude result."
+        )
     baseline = run["baseline"]
     selection = run.get("file_selection")
     selection = selection if isinstance(selection, Mapping) else {}
@@ -1673,6 +1876,20 @@ def _add_session(parser: argparse.ArgumentParser) -> None:
 def _add_baseline(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", type=Path)
     parser.add_argument(
+        "--baseline-kind",
+        choices=("git_commit", "empty_directory"),
+        help="Use an explicitly reviewed historical baseline type.",
+    )
+    parser.add_argument(
+        "--baseline-commit",
+        help="Use an explicitly reviewed historical Git commit.",
+    )
+    parser.add_argument(
+        "--confirm-repository-selection",
+        action="store_true",
+        help="Confirm the reviewed repository when automatic resolution was ambiguous.",
+    )
+    parser.add_argument(
         "--claude-output-file",
         action="append",
         help=(
@@ -1704,6 +1921,22 @@ def _add_baseline(parser: argparse.ArgumentParser) -> None:
 def _add_preparation(parser: argparse.ArgumentParser) -> None:
     _add_session(parser)
     _add_baseline(parser)
+    parser.add_argument(
+        "--source-path",
+        type=Path,
+        help="Use an explicitly reviewed source transcript path.",
+    )
+    parser.add_argument(
+        "--message-uuid",
+        help="Use an explicitly reviewed original user-message UUID.",
+    )
+    request = parser.add_mutually_exclusive_group()
+    request.add_argument("--request", help="Override the replay request after manual review.")
+    request.add_argument(
+        "--request-stdin",
+        action="store_true",
+        help="Read the manually reviewed replay request from standard input.",
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
     parser.add_argument("--timeout-seconds", type=_positive_int, default=1800)
@@ -1842,6 +2075,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             "baseline": baseline,
             "file_selection": selection,
             "questions": _selection_questions(selection),
+            "repository_blocking_reasons": repository_blockers,
             "blocking_reasons": [
                 *repository_blockers,
                 *_blocking_reasons(baseline, selection),
