@@ -153,7 +153,8 @@ export async function executeRunRequest(
   {
     abortController = new AbortController(),
     codexFactory = defaultCodexFactory,
-    emit = () => {}
+    emit = () => {},
+    diagnostic = () => {}
   } = {}
 ) {
   const lifecycle = createLifecycleEmitter(request.id, emit);
@@ -228,8 +229,10 @@ export async function executeRunRequest(
         usage = normalizeUsage(event.usage);
         turnCompleted = true;
       } else if (event.type === "turn.failed") {
+        diagnostic(`Codex turn failed: ${event.error?.message ?? "No detail provided."}`);
         throw new SafeWorkerError("turn_failed", "Codex turn failed.");
       } else if (event.type === "error") {
+        diagnostic(`Codex stream error: ${event.message ?? "No detail provided."}`);
         throw new SafeWorkerError("stream_error", "Codex reported an unrecoverable stream error.");
       }
     }
@@ -276,6 +279,7 @@ export async function executeRunRequest(
 export function startStdioWorker({
   input = process.stdin,
   output = process.stdout,
+  errorOutput = process.stderr,
   setExitCode = (code) => {
     process.exitCode = code;
   },
@@ -324,7 +328,12 @@ export function startStdioWorker({
     active = { id: request.id, abortController };
     emit({ type: "accepted", id: request.id });
 
-    void executeRunRequest(request, { abortController, codexFactory, emit })
+    void executeRunRequest(request, {
+      abortController,
+      codexFactory,
+      emit,
+      diagnostic: (message) => errorOutput.write(`[codex-worker] ${message}\n`)
+    })
       .then((result) => {
         emit({
           type: "completed",

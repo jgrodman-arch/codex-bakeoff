@@ -100,7 +100,7 @@ test("normalizes server aliases and keeps SDK events sanitized", async () => {
   assert.match(serializedEvents, /thread_started|item_completed/);
 });
 
-test("fails immediately on an SDK stream error without exposing its message", async () => {
+test("logs an SDK stream error without exposing its detail in the protocol error", async () => {
   const request = normalizeRunRequest({
     type: "run",
     id: "stream-error",
@@ -112,8 +112,10 @@ test("fails immediately on an SDK stream error without exposing its message", as
     networkAccessEnabled: false
   });
 
+  const diagnostics = [];
   await assert.rejects(
     executeRunRequest(request, {
+      diagnostic: (message) => diagnostics.push(message),
       codexFactory: () => ({
         startThread() {
           return {
@@ -145,6 +147,86 @@ test("fails immediately on an SDK stream error without exposing its message", as
       error.message === "Codex reported an unrecoverable stream error." &&
       !error.message.includes("sensitive provider detail")
   );
+  assert.deepEqual(diagnostics, ["Codex stream error: sensitive provider detail"]);
+});
+
+test("logs an SDK turn failure without exposing its detail in the protocol error", async () => {
+  const request = normalizeRunRequest({
+    type: "run",
+    id: "turn-failure",
+    model: "gpt-5.6-sol",
+    prompt: "private prompt",
+    workingDirectory: "/private/fixture",
+    timeoutMs: 30_000,
+    sandboxMode: "read-only",
+    networkAccessEnabled: false
+  });
+  const diagnostics = [];
+
+  await assert.rejects(
+    executeRunRequest(request, {
+      diagnostic: (message) => diagnostics.push(message),
+      codexFactory: () => ({
+        startThread() {
+          return {
+            id: "fixture-thread",
+            async runStreamed() {
+              return {
+                events: (async function* () {
+                  yield { type: "thread.started", thread_id: "fixture-thread" };
+                  yield {
+                    type: "turn.failed",
+                    error: { message: "sensitive turn detail" }
+                  };
+                })()
+              };
+            }
+          };
+        }
+      })
+    }),
+    (error) =>
+      error instanceof Error &&
+      error.code === "turn_failed" &&
+      error.message === "Codex turn failed." &&
+      !error.message.includes("sensitive turn detail")
+  );
+  assert.deepEqual(diagnostics, ["Codex turn failed: sensitive turn detail"]);
+});
+
+test("writes SDK error detail only to worker stderr", async () => {
+  const fixture = await fakeCodexFixture();
+  const child = spawn(process.execPath, [builtWorkerPath], {
+    env: {
+      ...process.env,
+      CODEX_CLI_PATH: fixture.executablePath
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const stdout = collectLines(child.stdout);
+  const stderr = collectText(child.stderr);
+  child.stdin.end(
+    `${JSON.stringify({
+      type: "run",
+      id: "stdio-stream-error",
+      model: "gpt-5.6-sol",
+      prompt: "STREAM_ERROR",
+      workingDirectory: fixture.root,
+      timeoutMs: 10_000,
+      sandboxMode: "workspace-write",
+      networkAccessEnabled: false
+    })}\n`
+  );
+
+  const [code, signal] = await once(child, "exit");
+  assert.equal(code, 1);
+  assert.equal(signal, null);
+  const messages = await stdout;
+  const failure = messages.at(-1);
+  assert.equal(failure.type, "failed");
+  assert.equal(failure.message, "Codex reported an unrecoverable stream error.");
+  assert.doesNotMatch(JSON.stringify(messages), /fixture provider detail/);
+  assert.match(await stderr, /Codex stream error: fixture provider detail/);
 });
 
 test("built JSONL worker executes one SDK run and returns the observed result", async () => {
@@ -315,6 +397,7 @@ async function fakeCodexFixture() {
       "console.log(JSON.stringify({ type: 'thread.started', thread_id: 'fixture-thread-id' }));",
       "console.log(JSON.stringify({ type: 'turn.started' }));",
       "if (prompt.includes('HANG')) { setInterval(() => {}, 1000); await new Promise(() => {}); }",
+      "if (prompt.includes('STREAM_ERROR')) { console.log(JSON.stringify({ type: 'error', message: 'fixture provider detail' })); process.exit(0); }",
       "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'fixture-secret-command', aggregated_output: 'fixture-secret-output', status: 'completed' } }));",
       "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'fixture final response' } }));",
       "console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 7, cached_input_tokens: 2, output_tokens: 3, reasoning_output_tokens: 1 } }));",
