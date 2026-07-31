@@ -16,6 +16,7 @@ try:
 except ModuleNotFoundError:  # Python 3.9 and 3.10.
     tomllib = None  # type: ignore[assignment]
 
+
 NATIVE_TOOLS = {
     "Bash": "Codex sandboxed shell",
     "Read": "Codex workspace file reading",
@@ -27,6 +28,7 @@ NATIVE_TOOLS = {
     "AskUserQuestion": "Codex user-input request",
     "ToolSearch": "Codex tool discovery",
 }
+CODEX_BROWSER_SKILL = "control-in-app-browser"
 OFFICIAL_MARKETPLACES = {
     "openai-bundled",
     "openai-curated",
@@ -84,6 +86,15 @@ def _read_codex_config() -> dict[str, Any]:
 
 def _identity(value: object) -> str:
     return str(value or "").strip().casefold()
+
+
+def _is_claude_browser_connector(value: object) -> bool:
+    return _identity(value).replace(" ", "_").replace("-", "_") == "claude_browser"
+
+
+def _is_claude_browser_tool(value: object) -> bool:
+    parts = str(value or "").split("__", 2)
+    return len(parts) == 3 and parts[0] == "mcp" and _is_claude_browser_connector(parts[1])
 
 
 def _plugin_identity(value: object) -> tuple[str, str | None]:
@@ -261,6 +272,7 @@ def inspect_capabilities(
     }
     plugins = _installed_plugins()
     skills = _local_skills(plugins)
+    browser_skill = skills.get(CODEX_BROWSER_SKILL)
     config = _read_codex_config()
     connectors = _configured_connectors(config)
     items: list[dict[str, Any]] = []
@@ -324,6 +336,17 @@ def inspect_capabilities(
                 resolution="local_equivalent",
                 description="Codex has a native equivalent.",
                 equivalent=equivalent,
+            )
+        elif browser_skill and _is_claude_browser_tool(name):
+            add(
+                capability_id=capability_id,
+                kind="tool",
+                name=name,
+                status="available_and_ready",
+                resolution="local_equivalent",
+                description="The installed Codex Browser provides this browser capability.",
+                equivalent="Codex Browser",
+                details={"local_match": browser_skill},
             )
         else:
             add(
@@ -421,6 +444,18 @@ def inspect_capabilities(
     for name in sorted(observed_connectors):
         capability_id = f"connector:{name}"
         readiness_id = f"verify:connector:{_identity(name)}"
+        if browser_skill and _is_claude_browser_connector(name):
+            add(
+                capability_id=capability_id,
+                kind="connector",
+                name=name,
+                status="available_and_ready",
+                resolution="local_equivalent",
+                description="The installed Codex Browser provides an equivalent capability.",
+                equivalent="Codex Browser",
+                details={"local_match": browser_skill},
+            )
+            continue
         if _identity(name) in connectors and readiness_id in verified:
             add(
                 capability_id=capability_id,

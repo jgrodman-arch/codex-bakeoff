@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -35,6 +36,70 @@ class LeanCapabilityTests(unittest.TestCase):
         self.assertEqual(by_id["tool:Bash"]["status"], "codex_native_equivalent")
         self.assertEqual(by_id["tool:ImaginaryTool"]["status"], "best_effort")
         self.assertEqual(result["unavailable_capabilities"], [])
+
+    def test_claude_browser_uses_installed_codex_browser(self) -> None:
+        plugin = (
+            self.codex_home
+            / "plugins"
+            / "cache"
+            / "openai-bundled"
+            / "browser"
+            / "1.0.0"
+        )
+        skill = plugin / "skills" / "control-in-app-browser"
+        skill.mkdir(parents=True)
+        (plugin / ".codex-plugin").mkdir()
+        (plugin / ".codex-plugin" / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "name": "browser",
+                    "version": "1.0.0",
+                    "skills": "./skills/",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (skill / "SKILL.md").write_text(
+            "---\nname: control-in-app-browser\n---\n",
+            encoding="utf-8",
+        )
+
+        result = capabilities.inspect_capabilities(
+            {
+                "observed_tools": [
+                    "mcp__Claude_Browser__computer",
+                    "mcp__Claude_Browser__javascript_tool",
+                ],
+                "connector_names": ["Claude_Browser"],
+            }
+        )
+        by_name = {item["name"]: item for item in result["items"]}
+
+        for name in (
+            "mcp__Claude_Browser__computer",
+            "mcp__Claude_Browser__javascript_tool",
+            "Claude_Browser",
+        ):
+            self.assertEqual(by_name[name]["status"], "available_and_ready")
+            self.assertEqual(by_name[name]["equivalent"], "Codex Browser")
+        self.assertEqual(result["unavailable_capabilities"], [])
+        self.assertEqual(result["resolution_actions"], [])
+
+    def test_claude_browser_requires_installed_codex_browser(self) -> None:
+        result = capabilities.inspect_capabilities(
+            {
+                "observed_tools": ["mcp__Claude_Browser__computer"],
+                "connector_names": ["Claude_Browser"],
+            }
+        )
+        by_name = {item["name"]: item for item in result["items"]}
+
+        self.assertEqual(
+            by_name["mcp__Claude_Browser__computer"]["status"],
+            "best_effort",
+        )
+        self.assertEqual(by_name["Claude_Browser"]["status"], "not_available")
+        self.assertEqual(result["resolution_actions"][0]["action"], "import_from_claude")
 
     def test_exact_local_skill_is_ready_without_copying_it(self) -> None:
         skill = self.codex_home / "skills" / "game-design"
