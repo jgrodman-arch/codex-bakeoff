@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import html
 import json
 import os
 import re
 import stat
 import subprocess
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -662,6 +664,56 @@ def _pricing() -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+@functools.lru_cache(maxsize=1)
+def _fetch_dynamic_pricing(url: str) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            loaded = json.loads(response.read().decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _configured_rate(models: Mapping[str, Any], model: str) -> Mapping[str, Any] | None:
+    direct = models.get(model)
+    if isinstance(direct, Mapping):
+        return direct
+    for candidate in models.values():
+        if not isinstance(candidate, Mapping):
+            continue
+        aliases = candidate.get("aliases")
+        if isinstance(aliases, list) and model in aliases:
+            return candidate
+    return None
+
+
+def _dynamic_rate(pricing: Mapping[str, Any], model: str) -> dict[str, float] | None:
+    fallback = pricing.get("dynamic_fallback")
+    if not isinstance(fallback, Mapping):
+        return None
+    url = fallback.get("url")
+    if not isinstance(url, str) or not url:
+        return None
+    candidate = _fetch_dynamic_pricing(url).get(model)
+    if not isinstance(candidate, Mapping):
+        return None
+
+    fields = {
+        "input": "input_cost_per_token",
+        "cached_input": "cache_read_input_token_cost",
+        "cache_write": "cache_creation_input_token_cost",
+        "cache_write_5m": "cache_creation_input_token_cost",
+        "cache_write_1h": "cache_creation_input_token_cost_above_1hr",
+        "output": "output_cost_per_token",
+    }
+    rate: dict[str, float] = {}
+    for target, source in fields.items():
+        value = candidate.get(source)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            rate[target] = float(value) * 1_000_000
+    return rate if "input" in rate and "output" in rate else None
+
+
 def _usage_value(record: UsageRecord | Mapping[str, Any], name: str) -> int:
     value = getattr(record, name, 0) if isinstance(record, UsageRecord) else record.get(name, 0)
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
@@ -721,8 +773,13 @@ def estimate_api_equivalent_cost(records: Sequence[UsageRecord]) -> dict[str, An
     models = models if isinstance(models, Mapping) else pricing
     total = 0.0
     missing: list[str] = []
+    dynamic: list[str] = []
     for record in records:
-        rate = models.get(record.model) if isinstance(models, Mapping) else None
+        rate = _configured_rate(models, record.model) if isinstance(models, Mapping) else None
+        if rate is None:
+            rate = _dynamic_rate(pricing, record.model)
+            if rate is not None:
+                dynamic.append(record.model)
         if not isinstance(rate, Mapping):
             missing.append(record.model)
             continue
@@ -737,8 +794,9 @@ def estimate_api_equivalent_cost(records: Sequence[UsageRecord]) -> dict[str, An
         total += cache_write_1h * float(rate.get("cache_write_1h", cache_rate)) / 1_000_000
     return {
         "status": "estimated" if not missing else "partial",
-        "usd": round(total, 6),
+        "usd": round(total, 6) if not missing else None,
         "missing_models": sorted(set(missing)),
+        "dynamic_models": sorted(set(dynamic)),
         "basis": "published API-equivalent token pricing",
         "actual_charge": "not observed",
     }

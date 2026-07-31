@@ -201,6 +201,100 @@ class LeanExecutionTests(unittest.TestCase):
 
         self.assertEqual(result["usd"], 0.00024)
 
+    def test_estimated_cost_resolves_configured_alias(self) -> None:
+        pricing = self.root / "pricing.json"
+        pricing.write_text(
+            json.dumps(
+                {
+                    "models": {
+                        "claude-sonnet-4-6": {
+                            "aliases": ["claude-sonnet-4.6"],
+                            "input": 3.0,
+                            "output": 15.0,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        usage = execution.UsageRecord(
+            provider="anthropic",
+            model="claude-sonnet-4.6",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+        )
+
+        with mock.patch.object(execution, "MODEL_PRICING_PATH", pricing):
+            result = execution.estimate_api_equivalent_cost((usage,))
+
+        self.assertEqual(result["usd"], 18.0)
+        self.assertEqual(result["missing_models"], [])
+
+    def test_estimated_cost_looks_up_unknown_model_dynamically(self) -> None:
+        pricing = self.root / "pricing.json"
+        pricing.write_text(
+            json.dumps(
+                {
+                    "dynamic_fallback": {"url": "https://example.test/pricing.json"},
+                    "models": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        usage = execution.UsageRecord(
+            provider="anthropic",
+            model="claude-new",
+            input_tokens=1_000_000,
+            cached_input_tokens=100_000,
+            cache_write_tokens=100_000,
+            output_tokens=1_000_000,
+        )
+        dynamic = {
+            "claude-new": {
+                "input_cost_per_token": 3e-6,
+                "cache_read_input_token_cost": 0.3e-6,
+                "cache_creation_input_token_cost": 3.75e-6,
+                "output_cost_per_token": 15e-6,
+            }
+        }
+
+        with (
+            mock.patch.object(execution, "MODEL_PRICING_PATH", pricing),
+            mock.patch.object(execution, "_fetch_dynamic_pricing", return_value=dynamic),
+        ):
+            result = execution.estimate_api_equivalent_cost((usage,))
+
+        self.assertEqual(result["usd"], 18.405)
+        self.assertEqual(result["dynamic_models"], ["claude-new"])
+        self.assertEqual(result["missing_models"], [])
+
+    def test_estimated_cost_is_unavailable_when_model_cannot_be_resolved(self) -> None:
+        pricing = self.root / "pricing.json"
+        pricing.write_text(
+            json.dumps(
+                {
+                    "dynamic_fallback": {"url": "https://example.test/pricing.json"},
+                    "models": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        usage = execution.UsageRecord(
+            provider="anthropic",
+            model="missing-model",
+            input_tokens=1_000_000,
+        )
+
+        with (
+            mock.patch.object(execution, "MODEL_PRICING_PATH", pricing),
+            mock.patch.object(execution, "_fetch_dynamic_pricing", return_value={}),
+        ):
+            result = execution.estimate_api_equivalent_cost((usage,))
+
+        self.assertIsNone(result["usd"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["missing_models"], ["missing-model"])
+
     def test_report_uses_polished_dashboard_with_unblinded_results(self) -> None:
         report = execution.generate_report(
             original_request="<build the thing>",

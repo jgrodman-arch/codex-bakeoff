@@ -662,6 +662,7 @@ class McpServerTests(unittest.TestCase):
         self.assertIn('class="token-label" tabindex="0"', controller)
         self.assertIn('class="token-tooltip" role="tooltip"', controller)
         self.assertIn("function comparisonClass(value, otherValue)", controller)
+        self.assertIn('value === null || value === undefined || value === ""', controller)
         self.assertIn("metric--better", controller)
         self.assertIn("metric--worse", controller)
         self.assertIn("comparisonClass(elapsed, otherElapsed)", controller)

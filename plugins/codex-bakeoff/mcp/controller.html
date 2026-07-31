@@ -1301,6 +1301,7 @@
       };
 
       const formatCost = (value) => {
+        if (value === null || value === undefined || value === "") return "Unavailable";
         const amount = Number(value);
         return Number.isFinite(amount) ? `$${amount.toFixed(amount < .01 ? 4 : 2)}` : "Unavailable";
       };
@@ -2700,6 +2701,9 @@
       }
 
       function comparisonClass(value, otherValue) {
+        if (value === null || value === undefined || otherValue === null || otherValue === undefined) {
+          return "";
+        }
         const own = Number(value);
         const other = Number(otherValue);
         if (
