@@ -272,7 +272,7 @@ class LeanExecutionTests(unittest.TestCase):
                             "categories": {
                                 "task_completion": {
                                     "outcome": "B",
-                                    "explanation": "Candidate B finished.",
+                                    "explanation": "Candidate B finished; A’s summary was shorter.",
                                 },
                                 "style_conciseness": {"outcome": "tie"},
                                 "edge_cases": {"outcome": "not_applicable"},
@@ -310,7 +310,9 @@ class LeanExecutionTests(unittest.TestCase):
         self.assertIn("Ballot normalization", rendered)
         self.assertIn("using gpt-normalizer", rendered)
         self.assertIn("Codex replay leads 1–0", rendered)
-        self.assertIn("Codex replay finished.", rendered)
+        self.assertIn("Codex finished; Claude’s summary was shorter.", rendered)
+        self.assertNotIn("Candidate B finished", rendered)
+        self.assertNotIn("A’s summary", rendered)
         self.assertEqual(report["schema_version"], 2)
         self.assertEqual(
             report["normalized_usage"]["claude"]["total_input_tokens"],

@@ -598,6 +598,10 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("metric--worse", controller)
         self.assertIn("comparisonClass(elapsed, otherElapsed)", controller)
         self.assertIn("comparisonClass(cost?.usd, otherCost?.usd)", controller)
+        self.assertIn("function evaluationTable(evaluation)", controller)
+        self.assertIn("expandCandidateLabels(decision.explanation)", controller)
+        self.assertIn("mapping[label] === \"codex\" ? \"Codex\"", controller)
+        self.assertIn("mapping[label] === \"claude\" ? \"Claude\"", controller)
 
     def test_controller_launch_ignores_completed_runs(self) -> None:
         controller = CONTROLLER_PATH.read_text(encoding="utf-8")

@@ -2602,6 +2602,14 @@
         const mapping = isObject(evaluation.candidate_mapping)
           ? evaluation.candidate_mapping
           : { A: "claude", B: "codex" };
+        const agentName = (label) =>
+          mapping[label] === "codex" ? "Codex"
+            : mapping[label] === "claude" ? "Claude"
+              : `Candidate ${label}`;
+        const expandCandidateLabels = (value) =>
+          text(value, "No explanation recorded.")
+            .replace(/\bCandidate ([AB])\b/g, (_match, label) => agentName(label))
+            .replace(/\b([AB])(?=(?:['’]s)?\b)/g, (_match, label) => agentName(label));
         const name = (outcome) =>
           mapping[outcome] === "codex" ? "Codex replay"
             : mapping[outcome] === "claude" ? "Historical Claude"
@@ -2619,7 +2627,7 @@
               model: text(review.model, "Unknown"),
               category: titleCase(category),
               outcome: name(text(decision.outcome, "not_applicable")),
-              explanation: text(decision.explanation, "No explanation recorded."),
+              explanation: expandCandidateLabels(decision.explanation),
             });
           }
         }

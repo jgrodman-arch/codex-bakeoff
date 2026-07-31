@@ -1011,6 +1011,18 @@ def render_report_html(report: Mapping[str, Any]) -> str:
             "codex": "Codex replay",
         }.get(str(candidate_mapping.get(label)), f"Candidate {label}")
 
+    def expand_candidate_labels(explanation: str) -> str:
+        agent_names = {"claude": "Claude", "codex": "Codex"}
+
+        def replacement(match: re.Match[str]) -> str:
+            label = match.group(1)
+            return agent_names.get(
+                str(candidate_mapping.get(label)), f"Candidate {label}"
+            )
+
+        explanation = re.sub(r"\bCandidate ([AB])\b", replacement, explanation)
+        return re.sub(r"\b([AB])(?=(?:['’]s)?\b)", replacement, explanation)
+
     totals = mapping(evaluation.get("totals"))
     score_rows = []
     for label in ("A", "B"):
@@ -1073,8 +1085,7 @@ def render_report_html(report: Mapping[str, Any]) -> str:
                 else ("N/A" if outcome == "not_applicable" else outcome.title())
             )
             explanation = str(decision.get("explanation") or "—")
-            explanation = explanation.replace("Candidate A", candidate_name("A"))
-            explanation = explanation.replace("Candidate B", candidate_name("B"))
+            explanation = expand_candidate_labels(explanation)
             evaluation_rows.append(
                 "<tr>"
                 f"<td>{esc(review.get('evaluator') or 'Unknown')}</td>"

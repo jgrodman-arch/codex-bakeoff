@@ -1,6 +1,6 @@
 {
   "name": "codex-bakeoff",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Run a Codex bakeoff from an external-browser controller.",
   "author": {
     "name": "OpenAI",
