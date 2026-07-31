@@ -547,6 +547,84 @@ def _reviewed_git_baseline(
     }
 
 
+def _with_historical_ending_commit(
+    replay: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+    reviewed_ending_commit: str,
+) -> dict[str, Any]:
+    result = dict(baseline)
+    if result.get("kind") != "git_commit":
+        return result
+    repository = result.get("repository")
+    starting_commit = result.get("commit")
+    if not isinstance(repository, str) or not isinstance(starting_commit, str):
+        return result
+    recovery_replay = {
+        **replay,
+        "project_dir": repository,
+        "project_dirs": [repository],
+    }
+    try:
+        inferred = _discovery().recover_historical_solution(
+            recovery_replay,
+            starting_commit,
+            baseline_kind="git_commit",
+        )
+    except Exception as error:
+        if not reviewed_ending_commit:
+            return {
+                **result,
+                "ending_commit": None,
+                "ending_commit_confidence": "unavailable",
+            }
+        inferred = {}
+
+    inferred_commit = inferred.get("commit")
+    reviewed_matches_inferred = (
+        re.fullmatch(r"[0-9a-fA-F]{7,64}", reviewed_ending_commit) is not None
+        and isinstance(inferred_commit, str)
+        and inferred_commit.lower().startswith(reviewed_ending_commit.lower())
+        and isinstance(inferred.get("diff"), str)
+    )
+    reviewed_override = bool(reviewed_ending_commit) and not reviewed_matches_inferred
+    if reviewed_override:
+        try:
+            recovery = _discovery().recover_historical_solution(
+                recovery_replay,
+                starting_commit,
+                baseline_kind="git_commit",
+                ending_commit=reviewed_ending_commit,
+            )
+        except Exception as error:
+            raise BakeoffError(_redact(error)) from error
+    else:
+        recovery = inferred
+    ending_commit = recovery.get("commit")
+    if reviewed_override and (
+        not isinstance(ending_commit, str)
+        or not isinstance(recovery.get("diff"), str)
+    ):
+        limitations = recovery.get("limitations")
+        detail = (
+            str(limitations[0])
+            if isinstance(limitations, list) and limitations
+            else "The reviewed historical ending commit is invalid."
+        )
+        raise BakeoffError(detail)
+    return {
+        **result,
+        "ending_commit": ending_commit if isinstance(ending_commit, str) else None,
+        "ending_commit_confidence": (
+            "user_confirmed"
+            if reviewed_override
+            else "inferred"
+            if isinstance(ending_commit, str)
+            else "unavailable"
+        ),
+        "ending_commit_reviewed_override": reviewed_override,
+    }
+
+
 def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, Any]:
     inspected_replay = dict(replay)
     raw_selected_project = args.repo or replay.get("project_dir")
@@ -563,8 +641,11 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
         inspected_replay["project_dirs"] = [inspected_replay["project_dir"]]
     manual_kind = getattr(args, "baseline_kind", None)
     manual_commit = str(getattr(args, "baseline_commit", "") or "").strip()
+    manual_ending_commit = str(getattr(args, "ending_commit", "") or "").strip()
     if manual_commit and manual_kind != "git_commit":
         raise BakeoffError("Choose a Git-commit baseline for the reviewed commit.")
+    if manual_ending_commit and manual_kind != "git_commit":
+        raise BakeoffError("Choose a Git-commit baseline for the reviewed ending commit.")
     inspection_failed = False
     try:
         inspected = _discovery().inspect_baseline(inspected_replay)
@@ -588,7 +669,7 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
                 "working_tree_state",
                 reviewed["working_tree_state"],
             )
-        return {
+        baseline = {
             **inspected,
             **reviewed,
             "reviewed_override": inspection_failed or not (
@@ -596,10 +677,15 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
                 and str(inspected.get("commit") or "").lower() == reviewed["commit"]
             ),
         }
+        return _with_historical_ending_commit(
+            inspected_replay,
+            baseline,
+            manual_ending_commit,
+        )
 
     if manual_kind == "empty_directory":
-        if manual_commit:
-            raise BakeoffError("An empty-directory baseline cannot have a Git commit.")
+        if manual_commit or manual_ending_commit:
+            raise BakeoffError("An empty-directory baseline cannot have Git commits.")
         if selected_project is None:
             raise BakeoffError("Enter a replay repository for the empty-directory baseline.")
         if (
@@ -646,12 +732,13 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
                 "attribution_root": str(attribution_root),
                 "source_kind": "git",
             }
-        return {
+        baseline = {
             **inspected,
             "repository": str(git_root),
             "attribution_root": str(attribution_root),
             "source_kind": "git",
         }
+        return _with_historical_ending_commit(inspected_replay, baseline, "")
 
     if selected_project is not None:
         repository = selected_project
@@ -915,6 +1002,8 @@ def _configuration(
             "attribution_root": baseline.get("attribution_root"),
             "repository_resolution": baseline.get("repository_resolution"),
             "commit": baseline.get("commit"),
+            "ending_commit": baseline.get("ending_commit"),
+            "ending_commit_confidence": baseline.get("ending_commit_confidence"),
             "confidence": baseline.get("confidence"),
             "historical_working_tree_state": baseline.get("working_tree_state"),
             "current_working_tree_state": baseline.get("current_working_tree_state"),
@@ -939,6 +1028,9 @@ def _configuration(
                 review_decisions.get("transcript_overridden")
             ),
             "baseline_overridden": bool(baseline.get("reviewed_override")),
+            "ending_commit_overridden": bool(
+                baseline.get("ending_commit_reviewed_override")
+            ),
             "request_overridden": bool(review_decisions.get("request_overridden")),
             "empty_starting_directory_confirmed": bool(
                 context["file_selection"].get("empty_starting_directory_confirmed")
@@ -1243,6 +1335,11 @@ def _historical_candidate(
                 recovery_replay,
                 baseline.get("commit"),
                 baseline_kind=baseline.get("kind", "git_commit"),
+                ending_commit=(
+                    baseline.get("ending_commit")
+                    if baseline.get("ending_commit_reviewed_override") is True
+                    else None
+                ),
             )
         except Exception as error:
             recovery = {
@@ -1304,7 +1401,7 @@ def _historical_candidate(
                 **recovery,
                 "file_selection": dict(selection),
             }
-    if not isinstance(diff, str):
+    if not isinstance(diff, str) or not diff.strip():
         raise BakeoffError(
             "No attributable historical Claude patch could be captured; "
             "the comparison cannot be completed."
@@ -1883,6 +1980,10 @@ def _add_baseline(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--baseline-commit",
         help="Use an explicitly reviewed historical Git commit.",
+    )
+    parser.add_argument(
+        "--ending-commit",
+        help="Use an explicitly reviewed historical ending Git commit.",
     )
     parser.add_argument(
         "--confirm-repository-selection",

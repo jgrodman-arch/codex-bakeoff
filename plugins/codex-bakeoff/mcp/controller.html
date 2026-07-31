@@ -407,16 +407,6 @@
       gap: 14px;
     }
 
-    .summary-card {
-      min-width: 0;
-      padding: 16px;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: var(--panel-soft);
-    }
-
-    .summary-card h2 { margin-bottom: 12px; }
-
     .metrics {
       display: grid;
       gap: 0;
@@ -539,7 +529,7 @@
 
     .field-grid {
       display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(160px, .5fr);
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 14px;
     }
 
@@ -1063,8 +1053,7 @@
 
       const STEPS = [
         { id: "thread", name: "Choose thread", short: "Imported history" },
-        { id: "configure", name: "Configure", short: "Baseline and files" },
-        { id: "review", name: "Review", short: "Exact configuration" },
+        { id: "configure", name: "Configure", short: "Exact configuration" },
         { id: "run", name: "Run", short: "Isolated replay" },
         { id: "results", name: "Results", short: "Comparison report" },
       ];
@@ -1079,10 +1068,10 @@
         ["reporting", "Finalizing report"],
       ];
 
-      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v2";
+      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v3";
       const CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1";
-      const DRAFT_VERSION = 2;
-      const DRAFT_STEPS = new Set(["thread", "configure", "review"]);
+      const DRAFT_VERSION = 3;
+      const DRAFT_STEPS = new Set(["thread", "configure"]);
 
       const state = {
         step: "thread",
@@ -1146,13 +1135,18 @@
         }
       };
 
+      function configurationForDisplay(value) {
+        if (Array.isArray(value)) return value.map(configurationForDisplay);
+        if (!isObject(value)) return value;
+        return Object.fromEntries(
+          Object.entries(value)
+            .filter(([key]) => !["source_path", "thread_id", "imported_thread_id"].includes(key))
+            .map(([key, item]) => [key, configurationForDisplay(item)])
+        );
+      }
+
       const stringList = (value) => asArray(value)
         .map((item) => text(item).trim())
-        .filter((item, index, values) => item && values.indexOf(item) === index);
-
-      const pathLines = (value) => text(value)
-        .split(/\r?\n/)
-        .map((item) => item.trim())
         .filter((item, index, values) => item && values.indexOf(item) === index);
 
       function normalizeReviewDraft(value) {
@@ -1167,12 +1161,9 @@
             ? value.baseline_kind
             : "",
           baseline_commit: text(value.baseline_commit),
+          ending_commit: text(value.ending_commit),
           model: text(value.model),
           timeout_seconds: text(value.timeout_seconds),
-          claude_output_files: stringList(value.claude_output_files),
-          created_by_claude: stringList(value.created_by_claude),
-          excluded_files: stringList(value.excluded_files),
-          confirm_file_selection: value.confirm_file_selection === true,
         };
       }
 
@@ -1538,8 +1529,48 @@
         render({ focus: true });
       }
 
+      function selectionNeedsRefresh() {
+        const draft = normalizeReviewDraft(state.reviewDraft);
+        if (!draft || !state.inspection) return false;
+        const { baseline, replay, kind } = inspectionParts();
+        const inspectedKind = (
+          kind === "git" || baseline.kind === "git_commit"
+            ? "git_commit"
+            : kind === "non_git" ||
+                baseline.kind === "empty_directory" ||
+                baseline.proposed_kind === "empty_directory"
+              ? "empty_directory"
+              : ""
+        );
+        const inspectedRepository = text(
+          baseline.attribution_root ||
+          baseline.repository ||
+          replay.project_dir
+        );
+        return (
+          !inspectedKind ||
+          draft.message_uuid.trim() !== text(replay.message_uuid).trim() ||
+          draft.repo.trim() !== inspectedRepository.trim() ||
+          draft.baseline_kind !== inspectedKind ||
+          (
+            draft.baseline_kind === "git_commit" &&
+            (
+              draft.baseline_commit.trim().toLowerCase() !==
+                text(baseline.commit).trim().toLowerCase() ||
+              draft.ending_commit.trim().toLowerCase() !==
+                text(baseline.ending_commit).trim().toLowerCase()
+            )
+          )
+        );
+      }
+
       function selectionPayload() {
         const { baseline, files, kind } = inspectionParts();
+        const draft = normalizeReviewDraft(state.reviewDraft);
+        const isGit = draft
+          ? draft.baseline_kind === "git_commit"
+          : kind === "git";
+        const refreshing = selectionNeedsRefresh();
         const claude = [];
         const excluded = [];
         for (const file of files) {
@@ -1553,17 +1584,67 @@
           model: state.model,
           timeout_seconds: Number(state.timeoutSeconds),
           repo: text(baseline.attribution_root || baseline.repository) || undefined,
-          claude_output_files: kind === "git" ? claude : [],
-          created_by_claude: kind === "non_git" ? claude : [],
-          excluded_files: kind === "non_git" ? excluded : [],
-          confirm_file_selection:
-            kind === "non_git"
-              ? state.nonGitBaseline === "empty"
-              : (files.length === 0 || state.gitSelectionConfirmed),
+          claude_output_files: isGit && !refreshing ? claude : [],
+          created_by_claude: !isGit && !refreshing ? claude : [],
+          excluded_files: !isGit && !refreshing ? excluded : [],
+          confirm_file_selection: refreshing
+            ? false
+            : isGit
+              ? kind === "git" && (files.length === 0 || state.gitSelectionConfirmed)
+              : kind === "non_git" && state.nonGitBaseline === "empty",
         };
         return Object.fromEntries(
           Object.entries(common).filter(([, value]) => value !== undefined)
         );
+      }
+
+      function applyPreparationInspection(preparation) {
+        if (!isObject(preparation)) return;
+        const current = isObject(state.inspection) ? state.inspection : {};
+        const baseline = isObject(preparation.baseline)
+          ? preparation.baseline
+          : current.baseline;
+        const replay = isObject(preparation.replay)
+          ? preparation.replay
+          : current.replay;
+        const selection = isObject(preparation.file_selection)
+          ? preparation.file_selection
+          : current.file_selection;
+        const capabilities = isObject(preparation.capabilities)
+          ? preparation.capabilities
+          : current.capabilities;
+        const workspace = {
+          ...(isObject(current.workspace) ? current.workspace : {}),
+          kind: text(selection?.source_kind),
+          files: asArray(selection?.candidates),
+        };
+        state.inspection = {
+          ...current,
+          baseline,
+          replay,
+          file_selection: selection,
+          capabilities,
+          workspace,
+        };
+        if (state.reviewDraft) {
+          if (typeof replay?.message_uuid === "string") {
+            state.reviewDraft.message_uuid = replay.message_uuid;
+          }
+          if (typeof replay?.request === "string") {
+            state.reviewDraft.request = replay.request;
+          }
+          const repository = text(
+            baseline?.attribution_root || baseline?.repository || replay?.project_dir
+          );
+          if (repository) state.reviewDraft.repo = repository;
+          if (typeof baseline?.commit === "string") {
+            state.reviewDraft.baseline_commit = baseline.commit;
+          }
+          if (typeof baseline?.ending_commit === "string") {
+            state.reviewDraft.ending_commit = baseline.ending_commit;
+          }
+        }
+        initializeClassifications();
       }
 
       function inspectionDiagnostics() {
@@ -1580,7 +1661,6 @@
 
       function reviewDraftFromConfiguration() {
         const { inspection, baseline, replay } = inspectionParts();
-        const selection = selectionPayload();
         const failedSteps = new Set(
           asArray(inspection.diagnostics)
             .map((item) => text(isObject(item) ? item.step : ""))
@@ -1590,7 +1670,7 @@
           ? "git_commit"
           : (baseline.kind === "empty_directory" || baseline.proposed_kind === "empty_directory")
             ? "empty_directory"
-            : "";
+            : "git_commit";
         const baselineUnresolved = (
           failedSteps.has("baseline") ||
           asArray(inspection.repository_blockers).length > 0 ||
@@ -1611,27 +1691,16 @@
               state.selectedThread?.project_dir,
           baseline_kind: baselineKind,
           baseline_commit: baselineUnresolved ? "" : baseline.commit,
+          ending_commit: baselineUnresolved ? "" : baseline.ending_commit,
           model: state.model,
           timeout_seconds: state.timeoutSeconds,
-          claude_output_files: selection.claude_output_files,
-          created_by_claude: selection.created_by_claude,
-          excluded_files: selection.excluded_files,
-          confirm_file_selection: baselineUnresolved
-            ? false
-            : selection.confirm_file_selection,
         });
-      }
-
-      function reviewIncludedFiles() {
-        const draft = normalizeReviewDraft(state.reviewDraft) || {};
-        return draft.baseline_kind === "git_commit"
-          ? stringList(draft.claude_output_files)
-          : stringList(draft.created_by_claude);
       }
 
       function reviewPayload() {
         const draft = normalizeReviewDraft(state.reviewDraft) || {};
         const isGit = draft.baseline_kind === "git_commit";
+        const selection = selectionPayload();
         return {
           thread_id: text(draft.thread_id).trim(),
           source_path: text(draft.source_path).trim(),
@@ -1640,35 +1709,48 @@
           repo: text(draft.repo).trim(),
           baseline_kind: text(draft.baseline_kind),
           baseline_commit: isGit ? text(draft.baseline_commit).trim() : "",
+          ending_commit: isGit ? text(draft.ending_commit).trim() : "",
           confirm_repository_selection: Boolean(text(draft.repo).trim()),
           model: text(draft.model).trim(),
           timeout_seconds: Number(draft.timeout_seconds),
-          claude_output_files: isGit ? stringList(draft.claude_output_files) : [],
-          created_by_claude: isGit ? [] : stringList(draft.created_by_claude),
-          excluded_files: isGit ? [] : stringList(draft.excluded_files),
-          confirm_file_selection: draft.confirm_file_selection === true,
+          claude_output_files: isGit ? stringList(selection.claude_output_files) : [],
+          created_by_claude: isGit ? [] : stringList(selection.created_by_claude),
+          excluded_files: isGit ? [] : stringList(selection.excluded_files),
+          confirm_file_selection: selection.confirm_file_selection === true,
         };
       }
 
       function reviewProblems() {
         const draft = normalizeReviewDraft(state.reviewDraft);
         if (!draft) return ["Open a configuration draft."];
+        const selection = selectionPayload();
         const problems = [];
-        if (!draft.thread_id.trim()) problems.push("Enter the imported thread ID.");
-        if (!draft.source_path.trim()) problems.push("Enter the source transcript path.");
-        if (!draft.message_uuid.trim()) problems.push("Enter the original user-message UUID.");
+        if (!draft.thread_id.trim()) problems.push("Choose the Claude task again.");
+        if (!draft.source_path.trim()) {
+          problems.push("The selected Claude task has no source transcript.");
+        }
+        if (!draft.message_uuid.trim()) {
+          problems.push("Enter the message ID within the original thread.");
+        }
         if (!draft.request.trim()) problems.push("Enter the original request.");
         if (!draft.repo.trim()) problems.push("Enter the replay repository.");
         if (!draft.baseline_kind) problems.push("Choose the historical baseline type.");
         if (draft.baseline_kind === "git_commit" && !draft.baseline_commit.trim()) {
-          problems.push("Enter the historical baseline commit.");
+          problems.push("Enter the historical starting commit.");
+        }
+        if (draft.baseline_kind === "git_commit" && !draft.ending_commit.trim()) {
+          problems.push("Enter the historical ending commit.");
         }
         if (!draft.model.trim()) problems.push("Enter a Codex model.");
         const timeout = Number(draft.timeout_seconds);
         if (!Number.isInteger(timeout) || timeout < 1 || timeout > 14400) {
           problems.push("Set a timeout from 1 through 14,400 seconds.");
         }
-        if (draft.baseline_kind && !draft.confirm_file_selection) {
+        if (
+          draft.baseline_kind &&
+          !selectionNeedsRefresh() &&
+          selection.confirm_file_selection !== true
+        ) {
           problems.push(
             draft.baseline_kind === "empty_directory"
               ? "Confirm the file classification and empty starting directory."
@@ -1684,88 +1766,17 @@
         state.approvalChecked = false;
         state.error = "";
         state.notice = "";
-        const approval = document.querySelector('[data-action="open-approval"]');
-        if (approval instanceof HTMLButtonElement) {
-          approval.hidden = true;
-          approval.disabled = true;
-        }
-        const validate = document.querySelector('[data-action="validate-review"]');
-        if (validate instanceof HTMLButtonElement) {
-          validate.hidden = false;
-          validate.disabled = Boolean(state.busy);
-        }
-        const status = document.getElementById("review-status");
-        if (status) {
-          status.classList.remove("pill--good");
-          status.classList.add("pill--warning");
-          status.textContent = "Needs attention";
-        }
-        const statusCopy = document.getElementById("review-status-copy");
-        if (statusCopy) {
-          statusCopy.textContent = "Complete every required field, then validate this configuration.";
-        }
-        const evidence = document.getElementById("prepared-evidence");
-        if (evidence) evidence.hidden = true;
         const dialog = document.getElementById("approval-dialog");
         if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
       }
 
-      function clearReviewAttestation(field, id) {
-        if (!state.reviewDraft) return;
-        state.reviewDraft[field] = false;
-        const checkbox = document.getElementById(id);
-        if (checkbox instanceof HTMLInputElement) checkbox.checked = false;
-      }
-
       function invalidateConfigurationReview() {
         state.reviewRevision += 1;
-        state.reviewDraft = null;
         state.preparation = null;
         state.approvalChecked = false;
         state.error = "";
         state.notice = "";
         saveDraft();
-      }
-
-      function configurationProblems() {
-        const problems = [];
-        const { inspection, selection, files, kind } = inspectionParts();
-        if (!state.selectedThreadId || !state.inspection) {
-          problems.push("Choose and inspect an imported thread.");
-        }
-        if (!state.model) problems.push("Choose a Codex model.");
-        const timeout = Number(state.timeoutSeconds);
-        if (!Number.isInteger(timeout) || timeout < 1 || timeout > 14400) {
-          problems.push("Set a timeout from 1 through 14,400 seconds.");
-        }
-        if (kind === "git" && files.length > 0 && !state.gitSelectionConfirmed) {
-          problems.push("Confirm the Git working-tree attribution.");
-        }
-        if (kind === "non_git") {
-          const unclassified = files.filter((file) => {
-            const path = text(file?.path);
-            return path && !["claude", "exclude"].includes(state.classifications[path]);
-          });
-          if (unclassified.length) {
-            problems.push(`Classify all ${files.length} non-Git files.`);
-          }
-          if (state.nonGitBaseline !== "empty") {
-            problems.push(
-              state.nonGitBaseline === "existing"
-                ? "A non-empty non-Git baseline is unsupported."
-                : "Confirm whether the directory was empty before Claude."
-            );
-          }
-        }
-        for (const item of asArray(inspection.blockers)) {
-          const value = text(item);
-          if (value) problems.push(value);
-        }
-        for (const item of asArray(selection.blocking_reasons)) {
-          const value = text(item);
-          if (value) problems.push(value);
-        }
-        return [...new Set(problems)];
       }
 
       function preparationBlockers() {
@@ -1835,7 +1846,6 @@
         if (id === state.step) return false;
         if (id === "thread") return true;
         if (id === "configure") return Boolean(state.inspection);
-        if (id === "review") return Boolean(state.reviewDraft);
         if (id === "run") return Boolean(state.run);
         if (id === "results") return Boolean(state.report);
         return false;
@@ -2106,7 +2116,7 @@
                             data-file-kind="git"
                             data-path="${escapeHtml(path)}"
                             ${selected ? "checked" : ""}
-                            ${selectable ? "" : "disabled"}
+                            ${selectable && state.busy !== "prepare" ? "" : "disabled"}
                           >
                           <span>Credit to Claude output</span>
                         </label>
@@ -2123,6 +2133,7 @@
                       id="git-confirmation"
                       type="checkbox"
                       ${state.gitSelectionConfirmed ? "checked" : ""}
+                      ${state.busy === "prepare" ? "disabled" : ""}
                     >
                     <span>I reviewed every current Git change and this attribution is complete.</span>
                   </label>
@@ -2158,7 +2169,7 @@
                               data-file-kind="non_git"
                               data-path="${escapeHtml(path)}"
                               ${selected === "claude" ? "checked" : ""}
-                              ${selectable ? "" : "disabled"}
+                              ${selectable && state.busy !== "prepare" ? "" : "disabled"}
                             >
                             <span>Created by Claude</span>
                           </label>
@@ -2170,6 +2181,7 @@
                               data-file-kind="non_git"
                               data-path="${escapeHtml(path)}"
                               ${selected === "exclude" ? "checked" : ""}
+                              ${state.busy === "prepare" ? "disabled" : ""}
                             >
                             <span>Exclude</span>
                           </label>
@@ -2188,6 +2200,7 @@
                   name="non-git-baseline"
                   value="empty"
                   ${state.nonGitBaseline === "empty" ? "checked" : ""}
+                  ${state.busy === "prepare" ? "disabled" : ""}
                 >
                 <span>The directory was empty before Claude.</span>
               </label>
@@ -2197,6 +2210,7 @@
                   name="non-git-baseline"
                   value="existing"
                   ${state.nonGitBaseline === "existing" ? "checked" : ""}
+                  ${state.busy === "prepare" ? "disabled" : ""}
                 >
                 <span>At least one file already existed.</span>
               </label>
@@ -2215,38 +2229,150 @@
       }
 
       function renderConfigureStep() {
-        const { baseline, selection, capabilities, replay, files, kind } = inspectionParts();
-        const problems = configurationProblems();
-        const sourceLabel = kind === "git" ? "Git repository" : kind === "non_git" ? "Non-Git directory" : titleCase(kind);
-        const workingState = text(
-          selection.working_tree_state ||
-          baseline.current_working_tree_state ||
-          baseline.working_tree_state,
-          "Not recorded"
+        const draft = normalizeReviewDraft(state.reviewDraft) || reviewDraftFromConfiguration();
+        const { selection, capabilities, replay, files, kind } = inspectionParts();
+        const diagnostics = inspectionDiagnostics();
+        const blockers = preparationBlockers();
+        const problems = reviewProblems();
+        const approved = approvedConfiguration();
+        const summary = reviewSummary(evidenceConfiguration());
+        const isGit = draft.baseline_kind === "git_commit";
+        const selectionRefreshing = selectionNeedsRefresh();
+        const showAttribution = selectionRefreshing || !isGit || files.length > 0;
+        const originalThreadId = text(
+          replay.session_id || state.selectedThread?.session_id,
+          "Unavailable"
         );
         return `
           ${pageHeading(
             "Configuration",
-            "Review the baseline and replay settings",
-            "File decisions apply symmetrically to the historical result and the isolated Codex replay."
+            "Complete the run configuration",
+            "Review the discovered values, make any changes, then approve one isolated replay."
           )}
-          <div class="grid-2">
-            <section class="summary-card" aria-labelledby="baseline-heading">
-              <h2 id="baseline-heading">Historical baseline</h2>
-              <dl class="metrics">
-                <div class="metric"><dt>Thread</dt><dd>${escapeHtml(threadTitle(replay))}</dd></div>
-                <div class="metric"><dt>Source</dt><dd>${escapeHtml(sourceLabel || "Unknown")}</dd></div>
-                <div class="metric"><dt>Project</dt><dd><code>${escapeHtml(baseline.attribution_root || baseline.repository || replay.project_dir || "Unavailable")}</code></dd></div>
-                <div class="metric"><dt>Commit</dt><dd><code>${escapeHtml(baseline.commit || baseline.proposed_kind || baseline.kind || "Not applicable")}</code></dd></div>
-                <div class="metric"><dt>Working tree</dt><dd><span class="pill ${workingState === "clean" ? "pill--good" : workingState === "dirty" ? "pill--warning" : ""}">${escapeHtml(titleCase(workingState))}</span></dd></div>
-                <div class="metric"><dt>Confidence</dt><dd>${escapeHtml(titleCase(baseline.confidence || "unknown"))}</dd></div>
-              </dl>
-            </section>
-            <section class="summary-card" aria-labelledby="capability-heading">
-              <h2 id="capability-heading">Capability parity</h2>
-              <ul class="capability-list">
-                ${capabilityRows(capabilities)}
-              </ul>
+          ${diagnostics.length
+            ? `<div class="banner banner--warning" role="status">
+                <span class="banner__mark" aria-hidden="true">i</span>
+                <div class="banner__body">
+                  <strong>Some values could not be discovered</strong>
+                  <p>Complete the affected fields below.</p>
+                  <ul>${diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+                </div>
+              </div>`
+            : ""}
+          ${blockers.length
+            ? `<div class="banner banner--warning" role="status">
+                <span class="banner__mark" aria-hidden="true">!</span>
+                <div class="banner__body">
+                  <strong>The configuration still needs attention</strong>
+                  <ul>${blockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+                </div>
+              </div>`
+            : ""}
+          <section class="panel" aria-labelledby="configuration-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="configuration-heading">Editable configuration</h2>
+                <p>Validation runs automatically when you approve and start.</p>
+              </div>
+            </div>
+            <div class="panel__body">
+              <fieldset class="review-fields" ${state.busy === "prepare" ? "disabled" : ""}>
+                <div class="field-grid">
+                <div class="field">
+                  <label for="original-thread">Original Claude thread ID</label>
+                  <input id="original-thread" type="text" value="${escapeHtml(originalThreadId)}" readonly>
+                  <small>Selected on the previous step.</small>
+                </div>
+                <div class="field">
+                  <label for="review-model">Codex model</label>
+                  <input id="review-model" type="text" list="review-model-options" value="${escapeHtml(draft.model)}">
+                  <datalist id="review-model-options">
+                    ${state.models.map((model) => `<option value="${escapeHtml(model.id)}">${escapeHtml(model.label)}</option>`).join("")}
+                  </datalist>
+                </div>
+                <div class="field field--wide">
+                  <label for="review-message-uuid">Message ID within the original thread</label>
+                  <input id="review-message-uuid" type="text" value="${escapeHtml(draft.message_uuid)}">
+                </div>
+                <div class="field field--wide">
+                  <label for="review-request">Original request</label>
+                  <textarea id="review-request">${escapeHtml(draft.request)}</textarea>
+                </div>
+                <div class="field field--wide">
+                  <label for="review-repo">Replay repository</label>
+                  <input id="review-repo" type="text" value="${escapeHtml(draft.repo)}" placeholder="/absolute/path/to/project">
+                </div>
+                <div class="field">
+                  <label for="review-baseline-kind">Historical baseline type</label>
+                  <select id="review-baseline-kind">
+                    <option value="git_commit" ${isGit ? "selected" : ""}>Git commit</option>
+                    <option value="empty_directory" ${isGit ? "" : "selected"}>Empty directory</option>
+                  </select>
+                </div>
+                ${isGit
+                  ? `<div class="field">
+                      <label for="review-baseline-commit">Historical starting commit</label>
+                      <input id="review-baseline-commit" type="text" value="${escapeHtml(draft.baseline_commit)}">
+                      <small>Inferred starting state; editable.</small>
+                    </div>
+                    <div class="field">
+                      <label for="review-ending-commit">Historical ending commit</label>
+                      <input id="review-ending-commit" type="text" value="${escapeHtml(draft.ending_commit)}">
+                      <small>Inferred Claude completion state; editable.</small>
+                    </div>`
+                  : ""}
+                <div class="field">
+                  <label for="review-timeout">Timeout in seconds</label>
+                  <input id="review-timeout" type="number" min="1" max="14400" step="1" value="${escapeHtml(draft.timeout_seconds)}">
+                  <small>Maximum 4 hours.</small>
+                </div>
+                </div>
+              </fieldset>
+            </div>
+          </section>
+
+          ${showAttribution
+            ? `<section class="panel" aria-labelledby="files-heading">
+                <div class="panel__header">
+                  <div>
+                    <h2 id="files-heading">${selectionRefreshing
+                      ? "Working-tree attribution"
+                      : isGit
+                        ? "Additional uncommitted changes attributed to Claude"
+                        : "Current file classification"}</h2>
+                    <p>${selectionRefreshing
+                      ? "The selected repository and commit range will be checked automatically."
+                      : isGit
+                        ? "Select additional uncommitted changes attributed to Claude."
+                        : "Classify every surfaced file. Unsafe or generated entries are locked to Exclude."}</p>
+                  </div>
+                  ${selectionRefreshing
+                    ? '<span class="pill pill--warning">Refresh required</span>'
+                    : `<span class="pill">${files.length} ${files.length === 1 ? "item" : "items"}</span>`}
+                </div>
+                ${selectionRefreshing
+                  ? '<div class="panel__body"><p class="empty">This attribution will refresh automatically before the approval dialog opens.</p></div>'
+                  : isGit
+                    ? renderGitFiles(files, selection)
+                    : kind === "non_git"
+                      ? renderNonGitFiles(files)
+                      : `<div class="panel__body"><div class="banner banner--error" role="alert">
+                          <span class="banner__mark" aria-hidden="true">!</span>
+                          <div class="banner__body"><strong>Unsupported source</strong><p>The controller could not determine whether this project is Git or non-Git.</p></div>
+                        </div></div>`
+                }
+              </section>`
+            : ""}
+
+          <section class="panel" aria-labelledby="capability-heading">
+            <div class="panel__header">
+              <div>
+                <h2 id="capability-heading">Capability parity</h2>
+                <p>Observed Claude capabilities and Codex equivalents for this replay.</p>
+              </div>
+            </div>
+            <div class="panel__body">
+              <ul class="capability-list">${capabilityRows(capabilities)}</ul>
               ${asArray(capabilities.resolution_actions).length
                 ? `<details>
                     <summary>Guidance</summary>
@@ -2255,91 +2381,32 @@
                     </ul>
                   </details>`
                 : ""}
-            </section>
-          </div>
-
-          <section class="panel" aria-labelledby="runtime-heading">
-            <div class="panel__header">
-              <div>
-                <h2 id="runtime-heading">Codex replay</h2>
-                <p>One implementation will run with this model and timeout.</p>
-              </div>
             </div>
-            <div class="panel__body">
-              <div class="field-grid">
-                <div class="field">
-                  <label for="model">Codex model</label>
-                  ${state.models.length
-                    ? `<select id="model">
-                        <option value="">Choose a model</option>
-                        ${state.models.map((model) => `
-                          <option value="${escapeHtml(model.id)}" ${model.id === state.model ? "selected" : ""}>
-                            ${escapeHtml(model.label)}${model.recommended ? " — recommended" : ""}
-                          </option>
-                        `).join("")}
-                      </select>`
-                    : `<input id="model" type="text" value="${escapeHtml(state.model)}" placeholder="No local model catalog available">`
-                  }
-                  <small>${escapeHtml(
-                    state.models.find((model) => model.id === state.model)?.description ||
-                    (state.models.length
-                      ? "Only locally available API-supported models are shown."
-                      : "The local model catalog is unavailable; enter the exact model ID.")
-                  )}</small>
-                </div>
-                <div class="field">
-                  <label for="timeout">Timeout in seconds</label>
-                  <input id="timeout" type="number" min="1" max="14400" step="1" value="${escapeHtml(state.timeoutSeconds)}">
-                  <small>Maximum 4 hours.</small>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section class="panel" aria-labelledby="files-heading">
-            <div class="panel__header">
-              <div>
-                <h2 id="files-heading">${kind === "git" ? "Current Git change attribution" : "Current file classification"}</h2>
-                <p>${kind === "git"
-                  ? "Select only current changes that belong to the recorded Claude output."
-                  : "Classify every surfaced file. Unsafe or generated entries are locked to Exclude."}</p>
-              </div>
-              <span class="pill">${files.length} ${files.length === 1 ? "item" : "items"}</span>
-            </div>
-            ${kind === "git"
-              ? renderGitFiles(files, selection)
-              : kind === "non_git"
-                ? renderNonGitFiles(files)
-                : `<div class="panel__body"><div class="banner banner--error" role="alert">
-                    <span class="banner__mark" aria-hidden="true">!</span>
-                    <div class="banner__body"><strong>Unsupported source</strong><p>The controller could not determine whether this project is Git or non-Git.</p></div>
-                  </div></div>`
-            }
           </section>
 
           ${problems.length
             ? `<div class="banner banner--warning" role="status" style="margin-top:14px">
                 <span class="banner__mark" aria-hidden="true">i</span>
                 <div class="banner__body">
-                  <strong>Before review</strong>
-                  <p>Anything unresolved here can be completed manually in Review.</p>
+                  <strong>Required before approval</strong>
                   <ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul>
                 </div>
               </div>`
             : ""}
 
           <div class="footer-actions">
-            <span class="footer-actions__note">The original Claude output and checkout will not be modified.</span>
+            <span class="footer-actions__note">The exact configuration is checked before approval.</span>
             <button type="button" class="button button--quiet" data-action="go-step" data-step="thread">Back</button>
             <button
               type="button"
               class="button button--primary"
-              data-action="review-configuration"
+              data-action="approve-configuration"
               ${state.busy ? "disabled" : ""}
             >
-              Review and complete configuration
+              ${state.busy === "prepare" ? '<span class="spinner" aria-hidden="true"></span>Checking configuration…' : "Approve and start…"}
             </button>
           </div>
+          ${preparationReady() ? renderApprovalDialog(approved, summary) : ""}
         `;
       }
 
@@ -2392,14 +2459,20 @@
           task.original_project || repositoryResolution.original_project_dir
         );
         return {
-          thread: text(task.imported_thread_id || direct.thread_id || state.selectedThreadId),
+          thread: text(
+            task.original_session_id ||
+            state.inspection?.replay?.session_id ||
+            state.selectedThread?.session_id,
+            "Unavailable"
+          ),
           replayRepository,
           originalThreadCwd:
             originalThreadCwd && originalThreadCwd !== replayRepository
               ? originalThreadCwd
               : "",
           repositoryResolutionSource: text(repositoryResolution.source),
-          baseline: text(baseline.commit || baseline.kind || baseline.proposed_kind),
+          baseline: text(baseline.commit || direct.baseline_commit || baseline.kind || baseline.proposed_kind),
+          endingCommit: text(baseline.ending_commit || direct.ending_commit),
           model: text(configuration.model || direct.model || state.model),
           timeout: Number(runtime.timeout_seconds ?? direct.timeout_seconds ?? state.timeoutSeconds),
           sandbox: text(runtime.sandbox_policy?.type || runtime.sandbox_policy || "workspaceWrite"),
@@ -2409,191 +2482,25 @@
         };
       }
 
-      function renderReviewStep() {
-        const draft = normalizeReviewDraft(state.reviewDraft) || normalizeReviewDraft({});
-        const evidence = evidenceConfiguration();
-        const approved = approvedConfiguration();
-        const summary = reviewSummary(evidence);
-        const blockers = preparationBlockers();
-        const diagnostics = inspectionDiagnostics();
-        const problems = reviewProblems();
-        const ready = preparationReady();
-        const included = reviewIncludedFiles().join("\n");
-        return `
-          ${pageHeading(
-            "Review",
-            "Complete the run configuration",
-            "Every run field is editable. Discovered values are suggestions until the server validates this draft."
-          )}
-          ${diagnostics.length
-            ? `<div class="banner banner--warning" role="status">
-                <span class="banner__mark" aria-hidden="true">i</span>
-                <div class="banner__body">
-                  <strong>Some values could not be discovered</strong>
-                  <p>Fill the blank fields below. Discovery details are retained for context.</p>
-                  <ul>${diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
-                </div>
-              </div>`
-            : ""}
-          ${blockers.length
-            ? `<div class="banner banner--warning" role="status">
-                <span class="banner__mark" aria-hidden="true">!</span>
-                <div class="banner__body">
-                  <strong>The server still needs information</strong>
-                  <ul>${blockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
-                </div>
-              </div>`
-            : ""}
-          <section class="panel" aria-labelledby="review-heading">
-            <div class="panel__header">
-              <div>
-                <h2 id="review-heading">Editable configuration</h2>
-                <p id="review-status-copy">${ready ? "Validated and ready for explicit approval." : "Complete every required field, then validate this configuration."}</p>
-              </div>
-              <span id="review-status" class="pill ${ready ? "pill--good" : "pill--warning"}">${ready ? "Ready" : "Needs attention"}</span>
-            </div>
-            <div class="panel__body">
-              <fieldset class="review-fields" ${state.busy === "prepare" ? "disabled" : ""}>
-                <div class="field-grid">
-                <div class="field">
-                  <label for="review-thread">Imported thread ID</label>
-                  <input id="review-thread" type="text" value="${escapeHtml(draft.thread_id)}">
-                </div>
-                <div class="field">
-                  <label for="review-model">Codex model</label>
-                  <input id="review-model" type="text" list="review-model-options" value="${escapeHtml(draft.model)}">
-                  <datalist id="review-model-options">
-                    ${state.models.map((model) => `<option value="${escapeHtml(model.id)}">${escapeHtml(model.label)}</option>`).join("")}
-                  </datalist>
-                </div>
-                <div class="field field--wide">
-                  <label for="review-source-path">Source transcript path</label>
-                  <input id="review-source-path" type="text" value="${escapeHtml(draft.source_path)}" placeholder="/absolute/path/to/transcript.jsonl">
-                </div>
-                <div class="field field--wide">
-                  <label for="review-message-uuid">Original user-message UUID</label>
-                  <input id="review-message-uuid" type="text" value="${escapeHtml(draft.message_uuid)}">
-                </div>
-                <div class="field field--wide">
-                  <label for="review-request">Original request</label>
-                  <textarea id="review-request">${escapeHtml(draft.request)}</textarea>
-                </div>
-                <div class="field field--wide">
-                  <label for="review-repo">Replay repository</label>
-                  <input id="review-repo" type="text" value="${escapeHtml(draft.repo)}" placeholder="/absolute/path/to/project">
-                </div>
-                <div class="field">
-                  <label for="review-baseline-kind">Historical baseline type</label>
-                  <select id="review-baseline-kind">
-                    <option value="" ${draft.baseline_kind ? "" : "selected"}>Choose a baseline</option>
-                    <option value="git_commit" ${draft.baseline_kind === "git_commit" ? "selected" : ""}>Git commit</option>
-                    <option value="empty_directory" ${draft.baseline_kind === "empty_directory" ? "selected" : ""}>Empty directory</option>
-                  </select>
-                </div>
-                ${draft.baseline_kind === "git_commit"
-                  ? `<div class="field">
-                      <label for="review-baseline-commit">Historical baseline commit</label>
-                      <input id="review-baseline-commit" type="text" value="${escapeHtml(draft.baseline_commit)}">
-                    </div>`
-                  : ""}
-                <div class="field">
-                  <label for="review-timeout">Timeout in seconds</label>
-                  <input id="review-timeout" type="number" min="1" max="14400" step="1" value="${escapeHtml(draft.timeout_seconds)}">
-                </div>
-                ${draft.baseline_kind
-                  ? `<div class="field field--wide">
-                      <label for="review-included-files">Claude output paths</label>
-                      <textarea id="review-included-files" placeholder="One repository-relative path per line">${escapeHtml(included)}</textarea>
-                      <small>${draft.baseline_kind === "git_commit"
-                        ? "Current Git changes not listed here remain protected from the historical candidate."
-                        : "List every current path created by Claude."}</small>
-                    </div>`
-                  : `<div class="banner banner--warning field--wide" role="status">
-                      <span class="banner__mark" aria-hidden="true">i</span>
-                      <div class="banner__body"><strong>Choose a baseline type before classifying files.</strong></div>
-                    </div>`}
-                ${draft.baseline_kind === "empty_directory"
-                  ? `<div class="field field--wide">
-                      <label for="review-excluded-files">Excluded paths</label>
-                      <textarea id="review-excluded-files" placeholder="One repository-relative path per line">${escapeHtml(draft.excluded_files.join("\n"))}</textarea>
-                      <small>Every surfaced non-Git path must be classified as Claude output or excluded.</small>
-                    </div>`
-                  : ""}
-                ${draft.baseline_kind
-                  ? `<label class="choice field--wide">
-                      <input id="review-confirmation" type="checkbox" ${draft.confirm_file_selection ? "checked" : ""}>
-                      <span>${draft.baseline_kind === "empty_directory"
-                        ? "I confirm this complete file classification and that the directory was empty before Claude."
-                        : "I confirm this complete Git working-tree attribution."}</span>
-                    </label>`
-                  : ""}
-                </div>
-              </fieldset>
-              ${problems.length
-                ? `<div class="banner banner--warning" role="status" style="margin-top:14px">
-                    <span class="banner__mark" aria-hidden="true">i</span>
-                    <div class="banner__body">
-                      <strong>Required before approval</strong>
-                      <ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul>
-                    </div>
-                  </div>`
-                : ""}
-            </div>
-          </section>
-          ${state.preparation
-            ? `<section id="prepared-evidence" class="panel" aria-labelledby="prepared-heading" style="margin-top:14px">
-                <div class="panel__header">
-                  <div>
-                    <h2 id="prepared-heading">Server-prepared evidence</h2>
-                    <p>Derived baseline, sandbox, and file-selection details for the current draft.</p>
-                  </div>
-                </div>
-                <div class="panel__body">
-                  <div class="review-grid">
-                    ${reviewItem("Imported thread", summary.thread, true)}
-                    ${reviewItem("Replay repository", summary.replayRepository, true)}
-                    ${reviewItem("Historical baseline", summary.baseline, true)}
-                    ${reviewItem("Codex model", summary.model, true)}
-                    ${reviewItem("Timeout", formatDuration(summary.timeout))}
-                    ${reviewItem("Sandbox / network", `${titleCase(summary.sandbox)} · ${summary.network}`)}
-                    ${reviewItem("Included Claude files", `${summary.included.length}`)}
-                    ${reviewItem("Excluded files", `${summary.excluded.length}`)}
-                  </div>
-                  <details>
-                    <summary>Exact server configuration</summary>
-                    <pre>${escapeHtml(safeJson(evidence))}</pre>
-                  </details>
-                </div>
-              </section>`
-            : ""}
-          <div class="footer-actions">
-            <span class="footer-actions__note">Starting creates exactly one isolated Codex implementation.</span>
-            <button type="button" class="button button--quiet" data-action="go-step" data-step="configure" ${state.busy ? "disabled" : ""}>Back</button>
-            <button type="button" class="button button--primary" data-action="open-approval" ${ready ? "" : "hidden disabled"} ${state.busy ? "disabled" : ""}>Approve and start…</button>
-            <button type="button" class="button button--primary" data-action="validate-review" ${ready ? "hidden" : ""} ${state.busy ? "disabled" : ""}>
-              ${state.busy === "prepare" ? '<span class="spinner" aria-hidden="true"></span>Validating…' : "Validate configuration"}
-            </button>
-          </div>
-          ${ready ? renderApprovalDialog(approved, summary) : ""}
-        `;
-      }
-
       function renderApprovalDialog(configuration, summary) {
         return `
           <dialog id="approval-dialog" aria-labelledby="approval-title">
             <div class="dialog__header">
-              <h2 id="approval-title">Start one isolated Codex replay?</h2>
+              <h2 id="approval-title">Approve and start one isolated Codex replay?</h2>
               <p>Review the final guarantees, then explicitly approve this prepared configuration.</p>
             </div>
             <div class="dialog__body">
               <div class="review-grid">
-                ${reviewItem("Thread", summary.thread, true)}
+                ${reviewItem("Original Claude thread ID", summary.thread, true)}
                 ${reviewItem("Model", summary.model, true)}
                 ${reviewItem("Replay repository", summary.replayRepository, true)}
                 ${summary.originalThreadCwd
                   ? reviewItem("Original thread cwd", summary.originalThreadCwd, true)
                   : ""}
-                ${reviewItem("Baseline", summary.baseline, true)}
+                ${reviewItem("Starting commit", summary.baseline, true)}
+                ${summary.endingCommit
+                  ? reviewItem("Ending commit", summary.endingCommit, true)
+                  : ""}
                 ${reviewItem("Timeout", formatDuration(summary.timeout))}
               </div>
               <ul class="approval-promises">
@@ -2604,7 +2511,7 @@
               </ul>
               <details>
                 <summary>Exact configuration sent on approval</summary>
-                <pre>${escapeHtml(safeJson(configuration))}</pre>
+                <pre>${escapeHtml(safeJson(configurationForDisplay(configuration)))}</pre>
               </details>
               <label class="choice" style="margin-top:16px">
                 <input id="approval-check" type="checkbox" ${state.approvalChecked ? "checked" : ""}>
@@ -2620,7 +2527,7 @@
                 data-action="start"
                 ${state.approvalChecked || state.busy === "start" ? "" : "disabled"}
               >
-                ${state.busy === "start" ? '<span class="spinner" aria-hidden="true"></span>Starting…' : "Start isolated replay"}
+                ${state.busy === "start" ? '<span class="spinner" aria-hidden="true"></span>Starting…' : "Approve and start"}
               </button>
             </div>
           </dialog>
@@ -3102,8 +3009,7 @@
         }
         const body =
           state.step === "configure" ? renderConfigureStep()
-            : state.step === "review" ? renderReviewStep()
-              : state.step === "run" ? renderRunStep()
+            : state.step === "run" ? renderRunStep()
                 : state.step === "results" ? renderResultsStep()
                   : renderThreadStep();
         return `${renderGlobalMessages()}${body}`;
@@ -3203,12 +3109,8 @@
                 : selectedModelDefault();
               initializeClassifications();
               applyDraftToInspection(restoredDraft);
-              state.step = restoredDraft.step === "review" && state.reviewDraft
-                ? "review"
-                : restoredDraft.step === "thread" ? "thread" : "configure";
-              if (state.step === "review") {
-                state.notice = "Review draft restored. Validate it again before approval.";
-              }
+              state.reviewDraft = state.reviewDraft || reviewDraftFromConfiguration();
+              state.step = restoredDraft.step === "thread" ? "thread" : "configure";
             } catch (error) {
               state.inspection = {
                 replay: selected || { imported_thread_id: restoredDraft.selectedThreadId },
@@ -3218,7 +3120,7 @@
                 }],
               };
               state.reviewDraft = normalizeReviewDraft(restoredDraft.reviewDraft) || reviewDraftFromConfiguration();
-              state.step = state.reviewDraft ? "review" : "configure";
+              state.step = "configure";
               state.error = "";
             }
           }
@@ -3262,6 +3164,7 @@
             state.model = selectedModelDefault();
           }
           initializeClassifications();
+          state.reviewDraft = reviewDraftFromConfiguration();
           state.step = "configure";
         } catch (error) {
           state.inspection = {
@@ -3272,6 +3175,7 @@
             }],
           };
           initializeClassifications();
+          state.reviewDraft = reviewDraftFromConfiguration();
           state.step = "configure";
         } finally {
           state.busy = "";
@@ -3279,22 +3183,11 @@
         }
       }
 
-      function openReview() {
-        if (!state.reviewDraft) {
-          state.reviewDraft = reviewDraftFromConfiguration();
-        }
-        state.preparation = null;
-        state.approvalChecked = false;
-        state.error = "";
-        state.notice = "";
-        state.step = "review";
-        render({ focus: true });
-      }
-
       async function prepareRun() {
         const problems = reviewProblems();
         if (problems.length) {
-          state.error = problems.join(" ");
+          state.error = "";
+          state.notice = "";
           render();
           return;
         }
@@ -3305,25 +3198,31 @@
         state.notice = "";
         const reviewRevision = state.reviewRevision;
         const configuration = reviewPayload();
+        let openApproval = false;
         render();
         try {
           const preparation = await callTool("prepare_run", configuration);
           if (
             reviewRevision !== state.reviewRevision ||
-            state.step !== "review" ||
+            state.step !== "configure" ||
             !state.reviewDraft
           ) return;
           state.preparation = preparation;
-          state.notice = preparationReady()
-            ? "The bakeoff engine validated this configuration."
-            : "";
+          applyPreparationInspection(preparation);
+          openApproval = preparationReady();
         } catch (error) {
-          if (reviewRevision === state.reviewRevision && state.step === "review") {
+          if (reviewRevision === state.reviewRevision && state.step === "configure") {
             state.error = error instanceof Error ? error.message : String(error);
           }
         } finally {
           state.busy = "";
           render({ focus: true });
+          if (openApproval) {
+            requestAnimationFrame(() => {
+              const dialog = document.getElementById("approval-dialog");
+              if (dialog && !dialog.open) dialog.showModal();
+            });
+          }
         }
       }
 
@@ -3506,19 +3405,13 @@
         if (action === "retry-init") initialize();
         if (action === "refresh-threads") loadThreads(state.query);
         if (action === "select-thread") selectThread(target.dataset.threadId || "");
-        if (action === "review-configuration") openReview();
-        if (action === "validate-review") prepareRun();
+        if (action === "approve-configuration") prepareRun();
         if (action === "start") startRun();
         if (action === "refresh-run") refreshRun();
         if (action === "load-report") loadReport();
         if (action === "copy-report-path") copyReportPath();
         if (action === "download-report") downloadReport(target.dataset.format || "");
         if (action === "reset-controller") resetController();
-        if (action === "open-approval") {
-          state.approvalChecked = false;
-          const dialog = document.getElementById("approval-dialog");
-          if (dialog && !dialog.open) dialog.showModal();
-        }
         if (action === "close-approval") {
           document.getElementById("approval-dialog")?.close();
         }
@@ -3549,63 +3442,25 @@
             }
           });
         }
-        if (target.id === "timeout") {
-          state.timeoutSeconds = Number(target.value);
-          invalidateConfigurationReview();
-        }
-        if (target.id === "model") {
-          state.model = target.value;
-          invalidateConfigurationReview();
-        }
         if (target.id === "approval-check") {
           state.approvalChecked = target.checked;
           const start = document.getElementById("start-run");
           if (start) start.disabled = !target.checked;
         }
         const reviewFields = {
-          "review-thread": "thread_id",
-          "review-source-path": "source_path",
           "review-message-uuid": "message_uuid",
           "review-model": "model",
           "review-request": "request",
           "review-repo": "repo",
           "review-baseline-commit": "baseline_commit",
+          "review-ending-commit": "ending_commit",
           "review-timeout": "timeout_seconds",
         };
         const reviewKey = reviewFields[target.id];
         if (reviewKey && state.reviewDraft) {
           state.reviewDraft[reviewKey] = target.value;
-          if (["review-thread", "review-source-path", "review-message-uuid"].includes(target.id)) {
-            clearReviewAttestation("confirm_file_selection", "review-confirmation");
-          }
-          if (target.id === "review-repo") {
-            clearReviewAttestation("confirm_file_selection", "review-confirmation");
-          }
-          if (target.id === "review-baseline-commit") {
-            clearReviewAttestation("confirm_file_selection", "review-confirmation");
-          }
           invalidateReviewPreparation();
           saveDraft();
-          document.querySelector('[data-action="open-approval"]')?.setAttribute("disabled", "");
-        }
-        if (target.id === "review-included-files" && state.reviewDraft) {
-          const values = pathLines(target.value);
-          if (state.reviewDraft.baseline_kind === "git_commit") {
-            state.reviewDraft.claude_output_files = values;
-          } else {
-            state.reviewDraft.created_by_claude = values;
-          }
-          clearReviewAttestation("confirm_file_selection", "review-confirmation");
-          invalidateReviewPreparation();
-          saveDraft();
-          document.querySelector('[data-action="open-approval"]')?.setAttribute("disabled", "");
-        }
-        if (target.id === "review-excluded-files" && state.reviewDraft) {
-          state.reviewDraft.excluded_files = pathLines(target.value);
-          clearReviewAttestation("confirm_file_selection", "review-confirmation");
-          invalidateReviewPreparation();
-          saveDraft();
-          document.querySelector('[data-action="open-approval"]')?.setAttribute("disabled", "");
         }
       });
 
@@ -3620,26 +3475,7 @@
         state.notice = "";
         if (target.id === "review-baseline-kind" && state.reviewDraft) {
           state.reviewDraft.baseline_kind = target.value;
-          state.reviewDraft.confirm_file_selection = false;
           invalidateReviewPreparation();
-          render();
-          return;
-        }
-        if (target.id === "review-confirmation" && state.reviewDraft) {
-          state.reviewDraft.confirm_file_selection = target.checked;
-          invalidateReviewPreparation();
-          render();
-          return;
-        }
-        if (target.id === "model") {
-          state.model = target.value;
-          invalidateConfigurationReview();
-          render();
-          return;
-        }
-        if (target.id === "timeout") {
-          state.timeoutSeconds = Number(target.value);
-          invalidateConfigurationReview();
           render();
           return;
         }

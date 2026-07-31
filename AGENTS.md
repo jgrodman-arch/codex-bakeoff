@@ -4,3 +4,4 @@
 - Only add tests when they are meaningful. Avoid tautological tests
 - Always bump the plugin version after making a change, unless there is already an uncommitted version bump
 - Do not commit to git. Dev will review
+- put plans in the relevant plans/ dir

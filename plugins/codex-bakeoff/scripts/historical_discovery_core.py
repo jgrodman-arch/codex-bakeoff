@@ -2258,6 +2258,7 @@ def recover_historical_solution(
     baseline_commit: str | None = None,
     *,
     baseline_kind: str = "git_commit",
+    ending_commit: str | None = None,
 ) -> dict[str, Any]:
     """Recover only transcript-attributable Claude changes against one baseline.
 
@@ -2312,6 +2313,73 @@ def recover_historical_solution(
         result["baseline_commit"] = resolved_baseline
     else:
         result["baseline_commit"] = None
+
+    if baseline_kind == "git_commit" and ending_commit is not None:
+        raw_ending = ending_commit.strip()
+        ok, commit_output = _git_capture(
+            repo,
+            "rev-parse",
+            "--verify",
+            f"{raw_ending}^{{commit}}",
+        )
+        resolved_ending = commit_output.strip()
+        if (
+            not ok
+            or re.fullmatch(r"[a-fA-F0-9]{40,64}", resolved_ending) is None
+        ):
+            result["limitations"].append(
+                "The reviewed historical ending commit is not available in the selected repository."
+            )
+            return result
+        ancestor, _ = _git_capture(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            resolved_baseline,
+            resolved_ending,
+        )
+        if not ancestor:
+            result["limitations"].append(
+                "The reviewed historical ending commit does not descend from the starting commit."
+            )
+            return result
+        ok, diff = _git_capture(
+            repo,
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            f"{resolved_baseline}..{resolved_ending}",
+        )
+        if not ok:
+            result["limitations"].append(
+                "The reviewed historical commit range could not be captured."
+            )
+            return result
+        names_ok, names = _git_capture(
+            repo,
+            "diff",
+            "--name-only",
+            "--no-ext-diff",
+            f"{resolved_baseline}..{resolved_ending}",
+        )
+        result.update(
+            {
+                "provenance": "user_reviewed_git_commit",
+                "commit": resolved_ending,
+                "diff": diff,
+                "changed_files": (
+                    [line for line in names.splitlines() if line] if names_ok else []
+                ),
+                "evidence": [
+                    {
+                        "source": "reviewed_historical_ending_commit",
+                        "commit": resolved_ending,
+                        "baseline_ancestry_verified": True,
+                    }
+                ],
+            }
+        )
+        return result
 
     pending_commits: dict[str, str] = {}
     pending_diffs: dict[str, str] = {}

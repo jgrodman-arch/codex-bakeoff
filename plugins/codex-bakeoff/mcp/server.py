@@ -203,6 +203,16 @@ def _configuration_schema(*, approval: bool = False) -> dict[str, Any]:
         "model": {"type": "string", "minLength": 1},
         "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 14_400},
         "repo": {"type": "string", "minLength": 1},
+        "source_path": {"type": "string", "minLength": 1},
+        "message_uuid": {"type": "string", "minLength": 1},
+        "request": {"type": "string", "minLength": 1},
+        "baseline_kind": {
+            "type": "string",
+            "enum": ["git_commit", "empty_directory"],
+        },
+        "baseline_commit": {"type": "string", "minLength": 7, "maxLength": 64},
+        "ending_commit": {"type": "string", "minLength": 7, "maxLength": 64},
+        "confirm_repository_selection": {"type": "boolean"},
         "claude_output_files": _string_array("Git working-tree changes attributed to Claude."),
         "created_by_claude": _string_array("Non-Git files created by Claude."),
         "excluded_files": _string_array("Non-Git files deliberately excluded."),
@@ -1357,6 +1367,22 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
         raise ControllerError("An empty-directory baseline cannot have a Git commit.")
     if baseline_commit is not None and baseline_kind != "git_commit":
         raise ControllerError("Choose a Git-commit baseline for baseline_commit.")
+    ending_commit = arguments.get("ending_commit")
+    if ending_commit is not None:
+        if not isinstance(ending_commit, str):
+            raise ControllerError("ending_commit must be a Git commit.")
+        ending_commit = ending_commit.strip()
+        if not ending_commit:
+            ending_commit = None
+    if baseline_kind == "git_commit" and (
+        not isinstance(ending_commit, str)
+        or COMMIT_PATTERN.fullmatch(ending_commit) is None
+    ):
+        raise ControllerError("Enter a valid historical ending Git commit.")
+    if baseline_kind == "empty_directory" and ending_commit is not None:
+        raise ControllerError("An empty-directory baseline cannot have an ending commit.")
+    if ending_commit is not None and baseline_kind != "git_commit":
+        raise ControllerError("Choose a Git-commit baseline for ending_commit.")
     return {
         "thread_id": _thread_id(arguments),
         "source_path": source_path,
@@ -1372,6 +1398,7 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
         "repo": repo.strip() if isinstance(repo, str) else None,
         "baseline_kind": baseline_kind,
         "baseline_commit": baseline_commit,
+        "ending_commit": ending_commit,
         "confirm_repository_selection": (
             arguments.get("confirm_repository_selection") is True
         ),
@@ -1418,6 +1445,9 @@ def _configuration_arguments(arguments: Mapping[str, Any]) -> list[str]:
     baseline_commit = configuration["baseline_commit"]
     if isinstance(baseline_commit, str):
         result.extend(("--baseline-commit", baseline_commit))
+    ending_commit = configuration["ending_commit"]
+    if isinstance(ending_commit, str):
+        result.extend(("--ending-commit", ending_commit))
     if configuration["confirm_repository_selection"] is True:
         result.append("--confirm-repository-selection")
     for key, flag in (

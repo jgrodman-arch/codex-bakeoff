@@ -326,7 +326,7 @@ class McpServerTests(unittest.TestCase):
             with mock.patch.object(server, "APP_HTML", Path("/deleted/controller.html")):
                 status, _, body = request("GET", "/")
             self.assertEqual(status, 200)
-            self.assertIn(b"codex-bakeoff.controller-draft.v2", body)
+            self.assertIn(b"codex-bakeoff.controller-draft.v3", body)
             self.assertNotIn(b"window.openai", body)
 
             tool_result = {
@@ -514,7 +514,7 @@ class McpServerTests(unittest.TestCase):
         snapshot = controller.split("function draftSnapshot()", 1)[1].split(
             "function saveDraft()", 1
         )[0]
-        self.assertIn("codex-bakeoff.controller-draft.v2", controller)
+        self.assertIn("codex-bakeoff.controller-draft.v3", controller)
         self.assertIn("codex-bakeoff.controller-session.v1", controller)
         self.assertIn("X-Codex-Bakeoff-Session", controller)
         self.assertIn("localStorage.getItem(CONTROLLER_SESSION_STORAGE_KEY)", controller)
@@ -552,6 +552,49 @@ class McpServerTests(unittest.TestCase):
             self.assertIn(field, snapshot)
         for transient in ("preparation", "approvalChecked", "runId", "report"):
             self.assertNotIn(transient, snapshot)
+
+        steps = controller.split("const STEPS = [", 1)[1].split("];", 1)[0]
+        self.assertIn('id: "configure"', steps)
+        self.assertNotIn('id: "review"', steps)
+        self.assertIn('id: "run"', steps)
+        self.assertIn('id: "results"', steps)
+
+        configure = controller.split("function renderConfigureStep()", 1)[1].split(
+            "function reviewItem", 1
+        )[0]
+        self.assertIn("Original Claude thread ID", configure)
+        self.assertIn('id="original-thread"', configure)
+        self.assertIn("readonly", configure)
+        self.assertIn("Message ID within the original thread", configure)
+        self.assertIn("Historical starting commit", configure)
+        self.assertIn("Historical ending commit", configure)
+        self.assertIn('id="review-ending-commit"', configure)
+        self.assertIn("Additional uncommitted changes attributed to Claude", configure)
+        self.assertIn('data-action="approve-configuration"', configure)
+        self.assertIn("Checking configuration", configure)
+        self.assertNotIn("Validate configuration", controller)
+        self.assertNotIn("Choose a baseline", controller)
+        self.assertNotIn("Source transcript path", controller)
+        self.assertNotIn("Imported thread ID", controller)
+        self.assertNotIn("Claude output paths", controller)
+        self.assertNotIn(
+            "Current Git changes not listed here remain protected",
+            controller,
+        )
+        self.assertNotIn('id="review-thread"', controller)
+        self.assertNotIn('id="review-source-path"', controller)
+        self.assertNotIn("function renderReviewStep", controller)
+
+        prepare_run = controller.split("async function prepareRun()", 1)[1].split(
+            "async function startRun", 1
+        )[0]
+        self.assertIn("const reviewRevision = state.reviewRevision", prepare_run)
+        self.assertIn('callTool("prepare_run", configuration)', prepare_run)
+        self.assertIn("reviewRevision !== state.reviewRevision", prepare_run)
+        self.assertIn('state.step !== "configure"', prepare_run)
+        self.assertIn("dialog.showModal()", prepare_run)
+        self.assertIn("approvedConfiguration()", controller)
+
         start_run = controller.split("async function startRun()", 1)[1].split(
             "async function refreshRun", 1
         )[0]
@@ -567,83 +610,30 @@ class McpServerTests(unittest.TestCase):
         select_thread = controller.split("async function selectThread", 1)[1].split(
             "async function prepareRun", 1
         )[0]
+        self.assertIn("state.reviewDraft = reviewDraftFromConfiguration()", select_thread)
         self.assertLess(
             select_thread.index("state.classifications = Object.create(null)"),
             select_thread.index("render();"),
         )
-        for field_id in (
-            "review-thread",
-            "review-source-path",
-            "review-message-uuid",
-            "review-model",
-            "review-request",
-            "review-repo",
-            "review-baseline-kind",
-            "review-baseline-commit",
-            "review-timeout",
-            "review-included-files",
-            "review-excluded-files",
-            "review-confirmation",
-        ):
-            self.assertIn(field_id, controller)
-        self.assertNotIn("review-repository-confirmation", controller)
-        self.assertNotIn("I confirm this is the one repository to evaluate", controller)
-        prepare_run = controller.split("async function prepareRun()", 1)[1].split(
-            "async function startRun", 1
-        )[0]
-        self.assertIn("const reviewRevision = state.reviewRevision", prepare_run)
-        self.assertIn('callTool("prepare_run", configuration)', prepare_run)
-        self.assertIn("reviewRevision !== state.reviewRevision", prepare_run)
-        self.assertIn('state.step !== "review"', prepare_run)
-        self.assertIn("approvedConfiguration()", start_run)
-        self.assertIn("invalidateReviewPreparation()", controller)
-        self.assertIn("invalidateConfigurationReview()", controller)
-        self.assertIn("...asArray(preparation.questions)", controller)
-        open_review = controller.split("function openReview()", 1)[1].split(
-            "async function prepareRun", 1
-        )[0]
-        self.assertIn("if (!state.reviewDraft)", open_review)
-        change_handler = controller.split(
-            'app.addEventListener("change"', 1
-        )[1].split('document.addEventListener("keydown"', 1)[0]
-        self.assertNotIn('target.id.startsWith("review-")', change_handler)
-        baseline_change = change_handler.split(
-            'target.id === "review-baseline-kind"', 1
-        )[1].split('target.id === "review-confirmation"', 1)[0]
-        self.assertNotIn("claude_output_files =", baseline_change)
-        self.assertNotIn("created_by_claude =", baseline_change)
-        self.assertNotIn("excluded_files =", baseline_change)
-        render_review = controller.split("function renderReviewStep()", 1)[1].split(
-            "function renderApprovalDialog", 1
-        )[0]
-        self.assertIn("renderApprovalDialog(approved, summary)", render_review)
-        self.assertIn('data-action="open-approval"', render_review)
-        self.assertIn('data-action="validate-review"', render_review)
-        self.assertIn('state.busy === "prepare" ? "disabled"', render_review)
         navigation = controller.split("function canNavigateTo", 1)[1].split(
             "function renderRail", 1
         )[0]
         self.assertIn("if (state.busy) return false", navigation)
-        invalidation = controller.split(
-            "function invalidateReviewPreparation()", 1
-        )[1].split("function clearReviewAttestation", 1)[0]
-        self.assertIn("approval.hidden = true", invalidation)
-        self.assertIn("validate.hidden = false", invalidation)
-        self.assertIn("evidence.hidden = true", invalidation)
 
     def test_controller_shows_capability_status_and_optional_guidance(self) -> None:
         controller = CONTROLLER_PATH.read_text(encoding="utf-8")
         capability_rows = controller.split("function capabilityRows", 1)[1].split(
             "function fileMetadata", 1
         )[0]
-        review = controller.split('id="capability-heading"', 1)[1].split(
-            'id="runtime-heading"', 1
+        configure = controller.split("function renderConfigureStep", 1)[1].split(
+            "function reviewItem", 1
         )[0]
 
         self.assertIn("titleCase(record.status)", capability_rows)
         self.assertIn("record.guidance", capability_rows)
         self.assertIn("not_available", capability_rows)
-        self.assertIn("item.remediation_action", review)
+        self.assertIn('id="capability-heading"', configure)
+        self.assertIn("item.remediation_action", configure)
 
     def test_controller_report_restores_comparisons_and_token_breakdown(self) -> None:
         controller = CONTROLLER_PATH.read_text(encoding="utf-8")
@@ -790,6 +780,40 @@ class McpServerTests(unittest.TestCase):
                 }
             )
 
+    def test_reviewed_git_configuration_requires_an_ending_commit(self) -> None:
+        server = load_server()
+        with self.assertRaisesRegex(server.ControllerError, "historical ending Git commit"):
+            server._normalized_configuration(
+                {
+                    "thread_id": "thread-1",
+                    "request": "Build it.",
+                    "repo": "/tmp/repository",
+                    "baseline_kind": "git_commit",
+                    "baseline_commit": "a" * 40,
+                    "model": "gpt-test",
+                    "timeout_seconds": 1200,
+                }
+            )
+
+    def test_reviewed_git_configuration_forwards_both_commits(self) -> None:
+        server = load_server()
+        arguments = server._configuration_arguments(
+            {
+                "thread_id": "thread-1",
+                "request": "Build it.",
+                "repo": "/tmp/repository",
+                "baseline_kind": "git_commit",
+                "baseline_commit": "a" * 40,
+                "ending_commit": "b" * 40,
+                "model": "gpt-test",
+                "timeout_seconds": 1200,
+            }
+        )
+        self.assertIn("--baseline-commit", arguments)
+        self.assertIn("a" * 40, arguments)
+        self.assertIn("--ending-commit", arguments)
+        self.assertIn("b" * 40, arguments)
+
     def test_reviewed_baseline_kind_rejects_non_text_values(self) -> None:
         server = load_server()
         for value in ([], {}):
@@ -869,6 +893,9 @@ class McpServerTests(unittest.TestCase):
                 "source_path": "/tmp/transcript.jsonl",
                 "message_uuid": "message-1",
                 "request": "Build the reviewed thing.",
+                "baseline_kind": "git_commit",
+                "baseline_commit": "a" * 40,
+                "ending_commit": "b" * 40,
                 "model": "gpt-5.6-terra",
                 "timeout_seconds": 1200,
             }
@@ -902,6 +929,11 @@ class McpServerTests(unittest.TestCase):
                     server._start_run(
                         {**approved, "message_uuid": "different-message"}
                     )
+                with self.assertRaisesRegex(
+                    server.ControllerError,
+                    "configuration changed",
+                ):
+                    server._start_run({**approved, "ending_commit": "c" * 40})
 
             self.assertEqual(run_calls, 1)
             self.assertFalse(first["idempotent"])

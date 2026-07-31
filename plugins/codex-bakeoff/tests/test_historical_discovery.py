@@ -476,6 +476,90 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         self.assertEqual(evidence["state"], "unknown")
         self.assertIsNone(evidence["evidence"])
 
+    def test_reviewed_ending_commit_controls_historical_git_range(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.project), "config", "user.name", "Test User"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.project), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        target = self.project / "feature.txt"
+        target.write_text("start\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.project), "add", "feature.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.project), "commit", "-qm", "start"],
+            check=True,
+        )
+        start = subprocess.run(
+            ["git", "-C", str(self.project), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        target.write_text("ending\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.project), "add", "feature.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.project), "commit", "-qm", "ending"],
+            check=True,
+        )
+        ending = subprocess.run(
+            ["git", "-C", str(self.project), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        source = self.write_transcript(
+            "reviewed-ending",
+            [self.user("u1", "change it", "2026-01-01T10:00:00Z")],
+        )
+        replay = {
+            "project_dir": str(self.project),
+            "source_path": str(source),
+            "message_uuid": "u1",
+        }
+
+        recovered = discovery.recover_historical_solution(
+            replay,
+            start,
+            ending_commit=ending,
+        )
+        self.assertEqual(recovered["provenance"], "user_reviewed_git_commit")
+        self.assertEqual(recovered["commit"], ending)
+        self.assertEqual(recovered["changed_files"], ["feature.txt"])
+        self.assertIn("+ending", recovered["diff"])
+
+        unchanged = discovery.recover_historical_solution(
+            replay,
+            start,
+            ending_commit=start,
+        )
+        self.assertEqual(unchanged["commit"], start)
+        self.assertEqual(unchanged["diff"], "")
+
+        tree = subprocess.run(
+            ["git", "-C", str(self.project), "rev-parse", f"{ending}^{{tree}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        unrelated = subprocess.run(
+            ["git", "-C", str(self.project), "commit-tree", tree],
+            check=True,
+            capture_output=True,
+            text=True,
+            input="unrelated\n",
+        ).stdout.strip()
+        rejected = discovery.recover_historical_solution(
+            replay,
+            start,
+            ending_commit=unrelated,
+        )
+        self.assertIsNone(rejected["diff"])
+        self.assertIn("does not descend", rejected["limitations"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

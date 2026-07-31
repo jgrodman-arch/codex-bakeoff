@@ -442,6 +442,113 @@ class LeanBakeoffTests(unittest.TestCase):
         ):
             bakeoff._historical_candidate(run)
 
+    def test_empty_git_recovery_stops_completion(self) -> None:
+        repository = self.root / "repository"
+        repository.mkdir()
+        run = {
+            "replay": {
+                "source_path": str(self.root / "rollout.jsonl"),
+                "message_uuid": "message-1",
+                "task_scope": "whole_thread",
+            },
+            "baseline": {
+                "kind": "git_commit",
+                "repository": str(repository),
+                "commit": "a" * 40,
+            },
+            "file_selection": {
+                "source_kind": "git",
+                "working_tree_state": "clean",
+                "claude_output_changes": [],
+            },
+            "model": "gpt-test",
+        }
+
+        with (
+            mock.patch.object(
+                bakeoff._discovery(),
+                "recover_historical_solution",
+                return_value={"diff": ""},
+            ),
+            self.assertRaisesRegex(
+                bakeoff.BakeoffError,
+                "comparison cannot be completed",
+            ),
+        ):
+            bakeoff._historical_candidate(run)
+
+    def test_selected_dirty_changes_can_supplement_an_empty_commit_range(self) -> None:
+        repository = self.root / "repository"
+        repository.mkdir()
+        run = {
+            "replay": {
+                "source_path": str(self.root / "rollout.jsonl"),
+                "message_uuid": "message-1",
+                "task_scope": "whole_thread",
+            },
+            "baseline": {
+                "kind": "git_commit",
+                "repository": str(repository),
+                "commit": "a" * 40,
+            },
+            "file_selection": {
+                "source_kind": "git",
+                "working_tree_state": "dirty",
+                "claude_output_changes": [{"path": "changed.txt"}],
+            },
+            "model": "gpt-test",
+        }
+        captured = "diff --git a/changed.txt b/changed.txt\n"
+
+        with (
+            mock.patch.object(
+                bakeoff._discovery(),
+                "recover_historical_solution",
+                return_value={"diff": "", "provenance": "user_reviewed_git_commit"},
+            ),
+            mock.patch.object(
+                bakeoff._file_selection(),
+                "build_git_candidate_patch",
+                return_value=(captured, ["changed.txt"]),
+            ),
+            mock.patch.object(
+                bakeoff._discovery(),
+                "recover_historical_final_response",
+                return_value="done",
+            ),
+        ):
+            candidate, recovery, _ = bakeoff._historical_candidate(run)
+
+        self.assertEqual(candidate.diff, captured)
+        self.assertEqual(recovery["changed_files"], ["changed.txt"])
+
+    def test_unchanged_inferred_ending_commit_is_not_recorded_as_an_override(self) -> None:
+        inferred_commit = "b" * 40
+        baseline = {
+            "kind": "git_commit",
+            "repository": str(self.root),
+            "commit": "a" * 40,
+        }
+        recovery = {
+            "commit": inferred_commit,
+            "diff": "diff --git a/app.py b/app.py\n",
+        }
+
+        with mock.patch.object(
+            bakeoff._discovery(),
+            "recover_historical_solution",
+            return_value=recovery,
+        ) as recover:
+            reviewed = bakeoff._with_historical_ending_commit(
+                {},
+                baseline,
+                inferred_commit,
+            )
+
+        self.assertEqual(recover.call_count, 1)
+        self.assertEqual(reviewed["ending_commit_confidence"], "inferred")
+        self.assertFalse(reviewed["ending_commit_reviewed_override"])
+
     def test_cross_repository_changes_resolve_one_effective_repository(self) -> None:
         original = self._git_repository("original")
         effective = self._git_repository("effective")
