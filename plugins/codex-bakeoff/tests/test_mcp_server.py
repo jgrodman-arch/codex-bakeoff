@@ -631,6 +631,20 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("validate.hidden = false", invalidation)
         self.assertIn("evidence.hidden = true", invalidation)
 
+    def test_controller_shows_capability_status_and_optional_guidance(self) -> None:
+        controller = CONTROLLER_PATH.read_text(encoding="utf-8")
+        capability_rows = controller.split("function capabilityRows", 1)[1].split(
+            "function fileMetadata", 1
+        )[0]
+        review = controller.split('id="capability-heading"', 1)[1].split(
+            'id="runtime-heading"', 1
+        )[0]
+
+        self.assertIn("titleCase(record.status)", capability_rows)
+        self.assertIn("record.guidance", capability_rows)
+        self.assertIn("not_available", capability_rows)
+        self.assertIn("item.remediation_action", review)
+
     def test_controller_report_restores_comparisons_and_token_breakdown(self) -> None:
         controller = CONTROLLER_PATH.read_text(encoding="utf-8")
         self.assertIn("Claude worktree", controller)

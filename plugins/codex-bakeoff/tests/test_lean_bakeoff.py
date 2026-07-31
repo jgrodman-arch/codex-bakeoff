@@ -1032,6 +1032,35 @@ class LeanBakeoffTests(unittest.TestCase):
             ["capability discovery unavailable"],
         )
 
+    def test_optional_capability_import_does_not_block_prepare(self) -> None:
+        patches, replay, baseline, _ = self._patch_context("git_commit")
+        parity = {
+            "items": [{"name": "missing-skill", "status": "not_available"}],
+            "unavailable_capabilities": [
+                {"name": "missing-skill", "status": "not_available"}
+            ],
+            "resolution_actions": [
+                {
+                    "status": "optional",
+                    "action": "import_from_claude",
+                    "remediation_action": (
+                        "Go to Settings > Import to review and import this Claude skill."
+                    ),
+                }
+            ],
+        }
+        args = _args(self.root, kind="git_commit")
+        with patches as values:
+            values["_selected_replay"].return_value = replay
+            values["_baseline"].return_value = baseline
+            values["_capabilities"].return_value = parity
+            prepared = bakeoff._command_prepare(args)
+
+        self.assertEqual(prepared["status"], "ready_for_approval")
+        self.assertTrue(prepared["can_run"])
+        self.assertEqual(prepared["blocking_reasons"], [])
+        self.assertEqual(prepared["capabilities"], parity)
+
     def test_prepare_blocks_when_the_historical_patch_is_unavailable(self) -> None:
         patches, replay, baseline, parity = self._patch_context("git_commit")
         replay.update(

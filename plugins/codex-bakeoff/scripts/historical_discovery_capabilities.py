@@ -227,18 +227,18 @@ def _resolution_action(
     remediation: str,
     readiness_action_id: str | None = None,
 ) -> dict[str, Any]:
-    required_steps = [action]
+    suggested_steps = [action]
     readiness_ids: list[str] = []
     if readiness_action_id:
-        required_steps.append("verify_access")
+        suggested_steps.append("verify_access")
         readiness_ids.append(readiness_action_id)
     return {
         "id": action_id,
         "kind": "resolution",
         "title": title,
-        "status": "blocked",
+        "status": "optional",
         "action": action,
-        "required_steps": required_steps,
+        "suggested_steps": suggested_steps,
         "readiness_action_ids": readiness_ids,
         "capability_ids": [capability_id],
         "remediation_action": remediation,
@@ -291,11 +291,12 @@ def inspect_capabilities(
             "description": description,
             "evidence": description,
             "equivalent": equivalent,
-            "readiness": "ready" if status != "blocked" else "blocked",
+            "readiness": "ready" if status != "not_available" else "not_available",
             "readiness_action_id": readiness_action_id,
             "resolution_action_id": action.get("id") if action else None,
             "resolution_action": action.get("action") if action else None,
             "remediation_action": action.get("remediation_action") if action else None,
+            "guidance": action.get("remediation_action") if action else None,
         }
         if details:
             item.update(details)
@@ -355,13 +356,13 @@ def inspect_capabilities(
             action="import_from_claude",
             title=f"Import Claude skill · {name}",
             capability_id=capability_id,
-            remediation="Use Settings > Import to review and import this Claude skill.",
+            remediation="Go to Settings > Import to review and import this Claude skill.",
         )
         add(
             capability_id=capability_id,
             kind="skill",
             name=name,
-            status="blocked",
+            status="not_available",
             resolution="ported_from_claude",
             description="No exact local Codex skill is available.",
             action=action,
@@ -397,13 +398,13 @@ def inspect_capabilities(
             action="import_from_claude",
             title=f"Import Claude plugin · {raw_name}",
             capability_id=capability_id,
-            remediation="Use Settings > Import to review and import this Claude plugin.",
+            remediation="Go to Settings > Import to review and import this Claude plugin.",
         )
         add(
             capability_id=capability_id,
             kind="plugin",
             name=raw_name,
-            status="blocked",
+            status="not_available",
             resolution="ported_from_claude",
             description="No exact installed Codex plugin is available.",
             action=action,
@@ -431,19 +432,27 @@ def inspect_capabilities(
                 readiness_action_id=readiness_id,
             )
             continue
+        configured = _identity(name) in connectors
         action = _resolution_action(
-            action_id=readiness_id,
-            action="verify_access",
-            title=f"Verify connector · {name}",
+            action_id=(
+                readiness_id if configured else f"import:claude-connector:{_identity(name)}"
+            ),
+            action="verify_access" if configured else "import_from_claude",
+            title=(f"Verify connector · {name}" if configured else f"Import connector · {name}"),
             capability_id=capability_id,
-            remediation="Configure and exercise the exact connector operation, then record readiness.",
+            remediation=(
+                "Exercise this configured connector, then verify access."
+                if configured
+                else "Go to Settings > Import to review and import this Claude connector."
+            ),
+            readiness_action_id=None if configured else readiness_id,
         )
         add(
             capability_id=capability_id,
             kind="connector",
             name=name,
-            status="blocked",
-            resolution=("local_equivalent" if _identity(name) in connectors else "blocked"),
+            status="not_available",
+            resolution=("local_equivalent" if configured else "not_available"),
             description="Connector readiness has not been observed in this session.",
             action=action,
             readiness_action_id=readiness_id,
@@ -452,19 +461,43 @@ def inspect_capabilities(
     for raw_path in sorted(set(replay_spec.get("observed_instruction_paths") or [])):
         name = str(raw_path)
         capability_id = f"instruction:{name}"
+        path = Path(name).expanduser()
+        if not path.is_absolute() and isinstance(replay_spec.get("project_dir"), str):
+            path = Path(replay_spec["project_dir"]).expanduser() / path
+        if path.name == "AGENTS.md" and path.is_file():
+            add(
+                capability_id=capability_id,
+                kind="instruction",
+                name=name,
+                status="codex_native_equivalent",
+                resolution="local_equivalent",
+                description="This AGENTS.md file is natively supported by Codex.",
+                equivalent="Codex AGENTS.md instructions",
+            )
+            continue
+        if path.name != "CLAUDE.md" or not path.is_file() or path.with_name("AGENTS.md").exists():
+            add(
+                capability_id=capability_id,
+                kind="instruction",
+                name=name,
+                status="not_available",
+                resolution="not_available",
+                description="The observed instruction file has no verified Codex equivalent.",
+            )
+            continue
         action_id = f"import:claude-instruction:{_identity(name)}"
         action = _resolution_action(
             action_id=action_id,
             action="import_from_claude",
             title=f"Import Claude instruction · {name}",
             capability_id=capability_id,
-            remediation="Use Settings > Import to review this Claude instruction.",
+            remediation="Go to Settings > Import to import this CLAUDE.md as AGENTS.md.",
         )
         add(
             capability_id=capability_id,
             kind="instruction",
             name=name,
-            status="blocked",
+            status="not_available",
             resolution="ported_from_claude",
             description="The observed Claude instruction has no exact local Codex match.",
             action=action,
@@ -475,9 +508,10 @@ def inspect_capabilities(
     return {
         "items": items,
         "summary": counts,
-        "unresolved_capabilities": [item for item in items if item["status"] == "blocked"],
+        "unavailable_capabilities": [
+            item for item in items if item["status"] == "not_available"
+        ],
         "resolution_actions": resolution_actions,
-        "unresolved_blockers": resolution_actions,
         "known_readiness_action_ids": sorted(known_readiness),
         "verified_readiness_action_ids": sorted(applied_readiness),
         "unapplied_verified_action_ids": sorted((verified & known_readiness) - applied_readiness),

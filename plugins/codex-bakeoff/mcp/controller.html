@@ -2043,7 +2043,7 @@
         return items.map((item) => {
           const record = isObject(item) ? item : { name: text(item) };
           const status = text(record.status || record.parity || "available").toLowerCase();
-          const tone = /missing|blocked|unsupported|failed/.test(status)
+          const tone = /missing|not_available|unsupported|failed/.test(status)
             ? "bad"
             : /partial|warning|limited|manual/.test(status)
               ? "warning"
@@ -2053,9 +2053,10 @@
               <span class="capability__dot" aria-hidden="true"></span>
               <span>
                 ${escapeHtml(record.name || record.capability || record.tool || "Observed capability")}
-                ${record.guidance || record.reason || record.status
-                  ? `<small>${escapeHtml(record.guidance || record.reason || titleCase(record.status))}</small>`
+                ${record.reason || record.status
+                  ? `<small>${escapeHtml(record.reason || titleCase(record.status))}</small>`
                   : ""}
+                ${record.guidance ? `<small>${escapeHtml(record.guidance)}</small>` : ""}
               </span>
             </li>
           `;
@@ -2250,7 +2251,7 @@
                 ? `<details>
                     <summary>Guidance</summary>
                     <ul class="plain-list">
-                      ${asArray(capabilities.resolution_actions).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+                      ${asArray(capabilities.resolution_actions).map((item) => `<li>${escapeHtml(isObject(item) ? item.remediation_action || item.title : item)}</li>`).join("")}
                     </ul>
                   </details>`
                 : ""}
