@@ -49,6 +49,7 @@ CONTROLLER_RUNTIME_PATH = CONTROLLER_CACHE_ROOT / "controller-server.json"
 CONTROLLER_LOCK_PATH = CONTROLLER_CACHE_ROOT / "controller-server.lock"
 CONTROLLER_LOG_PATH = CONTROLLER_CACHE_ROOT / "controller-server.log"
 CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1"
+CONTROLLER_INSTANCE_STORAGE_KEY = "codex-bakeoff.controller-instance.v1"
 CONTROLLER_SESSION_HEADER = "X-Codex-Bakeoff-Session"
 MAX_TEXT_BYTES = 32 * 1024
 MAX_STATE_BYTES = 512 * 1024
@@ -716,6 +717,8 @@ class _ControllerHTTPServer(http.server.ThreadingHTTPServer):
         control_token: str,
     ) -> None:
         self.control_token = control_token
+        self.instance_id = secrets.token_urlsafe(24)
+        self.app_html = APP_HTML.read_bytes()
         self.login_tokens: dict[str, float] = {}
         self.login_lock = threading.Lock()
         self.session_tokens: dict[str, float] = {}
@@ -882,6 +885,10 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             bootstrap = (
                 '<!doctype html><meta charset="utf-8"><title>Opening controller</title>'
                 "<script>"
+                f"if(localStorage.getItem({json.dumps(CONTROLLER_INSTANCE_STORAGE_KEY)})!=="
+                f"{json.dumps(self.server.instance_id)})localStorage.clear();"
+                f"localStorage.setItem({json.dumps(CONTROLLER_INSTANCE_STORAGE_KEY)},"
+                f"{json.dumps(self.server.instance_id)});"
                 f"localStorage.setItem({json.dumps(CONTROLLER_SESSION_STORAGE_KEY)},"
                 f"{json.dumps(session_token)});"
                 "location.replace('/');"
@@ -899,12 +906,9 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         if parsed.path != "/":
             self._send(404, b"Not found.")
             return
-        if not APP_HTML.is_file():
-            self._send(500, b"The controller HTML is unavailable.")
-            return
         self._send(
             200,
-            APP_HTML.read_bytes(),
+            self.server.app_html,
             content_type="text/html; charset=utf-8",
         )
 

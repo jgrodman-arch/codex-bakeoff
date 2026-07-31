@@ -316,11 +316,15 @@ class McpServerTests(unittest.TestCase):
 
             status, _, body = request("GET", auth_path)
             self.assertEqual(status, 200)
+            self.assertIn(b"localStorage.clear()", body)
+            self.assertIn(b"codex-bakeoff.controller-instance.v1", body)
+            self.assertIn(httpd.instance_id.encode(), body)
             self.assertIn(b"localStorage.setItem", body)
             self.assertNotIn(b"sessionStorage", body)
             session_token = next(iter(httpd.session_tokens))
 
-            status, _, body = request("GET", "/")
+            with mock.patch.object(server, "APP_HTML", Path("/deleted/controller.html")):
+                status, _, body = request("GET", "/")
             self.assertEqual(status, 200)
             self.assertIn(b"codex-bakeoff.controller-draft.v2", body)
             self.assertNotIn(b"window.openai", body)
