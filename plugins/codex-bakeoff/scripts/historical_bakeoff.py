@@ -21,7 +21,7 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 PLUGIN_ROOT = SCRIPT_ROOT.parent
 DEFAULT_LEDGER = Path.home() / ".codex" / "external_agent_session_imports.json"
 DEFAULT_MODEL_CACHE = Path.home() / ".codex" / "models_cache.json"
-DEFAULT_RUN_ROOT = Path.home() / ".cache" / "claude-bakeoff" / "runs"
+DEFAULT_RUN_ROOT = Path.home() / ".cache" / "codex-bakeoff" / "runs"
 PRICING_PATH = PLUGIN_ROOT / "assets" / "model-pricing.json"
 MAX_TIMEOUT_SECONDS = 14_400
 THREAD_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}\Z")
@@ -408,7 +408,7 @@ def _target_for_baseline(
     if baseline.get("kind") == "empty_directory":
         return {
             "type": "projectless",
-            "directoryName": f"claude-bakeoff-{run_directory.name[-10:]}",
+            "directoryName": f"codex-bakeoff-{run_directory.name[-10:]}",
         }
     # Retain legacy classified-directory targeting so already-started runs can
     # still be completed. New runs no longer produce this baseline kind.
@@ -1067,7 +1067,7 @@ def _command_verify(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _available_evaluators(model: str) -> list[dict[str, Any]]:
-    denied = os.environ.get("CLAUDE_BAKEOFF_DENIED_HOSTS", "api.anthropic.com,claude.ai")
+    denied = os.environ.get("CODEX_BAKEOFF_DENIED_HOSTS", "api.anthropic.com,claude.ai")
     entries = _execution().check_evaluator_availability(
         denied_hosts=[item.strip() for item in denied.split(",") if item.strip()],
         codex_model=model,

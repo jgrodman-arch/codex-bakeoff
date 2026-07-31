@@ -13,9 +13,9 @@
         "CODEX_CLI_PATH",
         "CODEX_MCP_NODE_PATH",
         "PATH",
-        "CLAUDE_BAKEOFF_RUN_ROOT",
-        "CLAUDE_BAKEOFF_DENIED_HOSTS",
-        "CLAUDE_BAKEOFF_CONTROLLER_PORT"
+        "CODEX_BAKEOFF_RUN_ROOT",
+        "CODEX_BAKEOFF_DENIED_HOSTS",
+        "CODEX_BAKEOFF_CONTROLLER_PORT"
       ],
       "tool_timeout_sec": 300
     }

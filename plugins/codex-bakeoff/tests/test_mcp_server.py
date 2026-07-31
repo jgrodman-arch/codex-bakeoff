@@ -24,7 +24,7 @@ CONTROLLER_PATH = PLUGIN_ROOT / "mcp" / "controller.html"
 
 
 def load_server():
-    spec = importlib.util.spec_from_file_location("claude_bakeoff_mcp_server", SERVER_PATH)
+    spec = importlib.util.spec_from_file_location("codex_bakeoff_mcp_server", SERVER_PATH)
     if spec is None or spec.loader is None:
         raise AssertionError("Cannot load the MCP server.")
     module = importlib.util.module_from_spec(spec)
@@ -308,7 +308,7 @@ class McpServerTests(unittest.TestCase):
                 body="{}",
                 headers={
                     "Content-Type": "application/json",
-                    "X-Claude-Bakeoff-Control": control_token,
+                    "X-Codex-Bakeoff-Control": control_token,
                 },
             )
             self.assertEqual(status, 200)
@@ -322,7 +322,7 @@ class McpServerTests(unittest.TestCase):
 
             status, _, body = request("GET", "/")
             self.assertEqual(status, 200)
-            self.assertIn(b"claude-bakeoff.controller-draft.v1", body)
+            self.assertIn(b"codex-bakeoff.controller-draft.v1", body)
             self.assertNotIn(b"window.openai", body)
 
             tool_result = {
@@ -336,7 +336,7 @@ class McpServerTests(unittest.TestCase):
                     body=json.dumps({"name": "get_state", "arguments": {}}),
                     headers={
                         "Content-Type": "application/json",
-                        "X-Claude-Bakeoff-Session": session_token,
+                        "X-Codex-Bakeoff-Session": session_token,
                         "Origin": httpd.origin,
                     },
                 )
@@ -349,7 +349,7 @@ class McpServerTests(unittest.TestCase):
                     body=json.dumps({"name": "get_state", "arguments": {}}),
                     headers={
                         "Content-Type": "application/json",
-                        "X-Claude-Bakeoff-Session": session_token,
+                        "X-Codex-Bakeoff-Session": session_token,
                         "Origin": "https://example.com",
                     },
                 )
@@ -399,7 +399,7 @@ class McpServerTests(unittest.TestCase):
                         "Origin": httpd.origin,
                     }
                     if authorized:
-                        headers["X-Claude-Bakeoff-Session"] = session_token
+                        headers["X-Codex-Bakeoff-Session"] = session_token
                     try:
                         connection.request(
                             "POST",
@@ -421,7 +421,7 @@ class McpServerTests(unittest.TestCase):
                         self.assertEqual(
                             headers["Content-Disposition"],
                             (
-                                f'attachment; filename="claude-bakeoff-run-1-report.'
+                                f'attachment; filename="codex-bakeoff-run-1-report.'
                                 f'{artifact_format}"'
                             ),
                         )
@@ -441,8 +441,8 @@ class McpServerTests(unittest.TestCase):
                 port = int(reservation.getsockname()[1])
             environment = {
                 **os.environ,
-                "CLAUDE_BAKEOFF_RUN_ROOT": str(root / "runs"),
-                "CLAUDE_BAKEOFF_CONTROLLER_PORT": str(port),
+                "CODEX_BAKEOFF_RUN_ROOT": str(root / "runs"),
+                "CODEX_BAKEOFF_CONTROLLER_PORT": str(port),
             }
             process = subprocess.Popen(
                 [sys.executable, str(SERVER_PATH), "--http"],
@@ -492,7 +492,7 @@ class McpServerTests(unittest.TestCase):
                     body="{}",
                     headers={
                         "Content-Type": "application/json",
-                        "X-Claude-Bakeoff-Control": runtime["control_token"],
+                        "X-Codex-Bakeoff-Control": runtime["control_token"],
                     },
                 )
                 self.assertEqual(status, 200)
@@ -510,9 +510,9 @@ class McpServerTests(unittest.TestCase):
         snapshot = controller.split("function draftSnapshot()", 1)[1].split(
             "function saveDraft()", 1
         )[0]
-        self.assertIn("claude-bakeoff.controller-draft.v1", controller)
-        self.assertIn("claude-bakeoff.controller-session.v1", controller)
-        self.assertIn("X-Claude-Bakeoff-Session", controller)
+        self.assertIn("codex-bakeoff.controller-draft.v1", controller)
+        self.assertIn("codex-bakeoff.controller-session.v1", controller)
+        self.assertIn("X-Codex-Bakeoff-Session", controller)
         self.assertIn("localStorage.getItem(CONTROLLER_SESSION_STORAGE_KEY)", controller)
         self.assertNotIn("sessionStorage", controller)
         self.assertIn('fetch("/api/call"', controller)

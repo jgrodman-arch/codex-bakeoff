@@ -34,8 +34,8 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PLUGIN_ROOT / "scripts" / "historical_bakeoff.py"
 APP_HTML = Path(__file__).resolve().parent / "controller.html"
 WORKER = Path(__file__).resolve().parent / "codex-worker.mjs"
-DEFAULT_RUN_ROOT = Path.home() / ".cache" / "claude-bakeoff" / "runs"
-RUN_ROOT = Path(os.environ.get("CLAUDE_BAKEOFF_RUN_ROOT", DEFAULT_RUN_ROOT)).expanduser().resolve()
+DEFAULT_RUN_ROOT = Path.home() / ".cache" / "codex-bakeoff" / "runs"
+RUN_ROOT = Path(os.environ.get("CODEX_BAKEOFF_RUN_ROOT", DEFAULT_RUN_ROOT)).expanduser().resolve()
 STATE_NAME = "controller-state.json"
 
 SERVER_NAME = "codex-bakeoff"
@@ -47,8 +47,8 @@ CONTROLLER_CACHE_ROOT = RUN_ROOT.parent
 CONTROLLER_RUNTIME_PATH = CONTROLLER_CACHE_ROOT / "controller-server.json"
 CONTROLLER_LOCK_PATH = CONTROLLER_CACHE_ROOT / "controller-server.lock"
 CONTROLLER_LOG_PATH = CONTROLLER_CACHE_ROOT / "controller-server.log"
-CONTROLLER_SESSION_STORAGE_KEY = "claude-bakeoff.controller-session.v1"
-CONTROLLER_SESSION_HEADER = "X-Claude-Bakeoff-Session"
+CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1"
+CONTROLLER_SESSION_HEADER = "X-Codex-Bakeoff-Session"
 MAX_TEXT_BYTES = 32 * 1024
 MAX_STATE_BYTES = 512 * 1024
 MAX_REPORT_BYTES = 16 * 1024 * 1024
@@ -296,13 +296,13 @@ def _argument_object(params: Any) -> dict[str, Any]:
 
 
 def _controller_port() -> int:
-    raw = os.environ.get("CLAUDE_BAKEOFF_CONTROLLER_PORT", str(DEFAULT_CONTROLLER_PORT))
+    raw = os.environ.get("CODEX_BAKEOFF_CONTROLLER_PORT", str(DEFAULT_CONTROLLER_PORT))
     try:
         port = int(raw)
     except ValueError as error:
-        raise ControllerError("CLAUDE_BAKEOFF_CONTROLLER_PORT must be an integer.") from error
+        raise ControllerError("CODEX_BAKEOFF_CONTROLLER_PORT must be an integer.") from error
     if port < 1024 or port > 65_535:
-        raise ControllerError("CLAUDE_BAKEOFF_CONTROLLER_PORT must be from 1024 through 65535.")
+        raise ControllerError("CODEX_BAKEOFF_CONTROLLER_PORT must be from 1024 through 65535.")
     return port
 
 
@@ -561,7 +561,7 @@ def _control_request(
         f"{_controller_origin(port)}{path}",
         headers={
             "Content-Type": "application/json",
-            "X-Claude-Bakeoff-Control": token,
+            "X-Codex-Bakeoff-Control": token,
         },
         data=b"{}",
         timeout=timeout,
@@ -817,7 +817,7 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         return self.headers.get("Host") == self.server.expected_host
 
     def _control_authorized(self) -> bool:
-        supplied = self.headers.get("X-Claude-Bakeoff-Control", "")
+        supplied = self.headers.get("X-Codex-Bakeoff-Control", "")
         return bool(supplied) and secrets.compare_digest(
             supplied,
             self.server.control_token,
@@ -968,7 +968,7 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                     }[artifact_format],
                     headers={
                         "Content-Disposition": (
-                            f'attachment; filename="claude-bakeoff-{run_id}-report.'
+                            f'attachment; filename="codex-bakeoff-{run_id}-report.'
                             f'{artifact_format}"'
                         )
                     },
@@ -1917,7 +1917,7 @@ def _start_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
     thread = threading.Thread(
         target=_coordinator,
         args=(run_directory, dict(task_request)),
-        name=f"claude-bakeoff-{run_directory.name}",
+        name=f"codex-bakeoff-{run_directory.name}",
         daemon=True,
     )
     with _jobs_lock:

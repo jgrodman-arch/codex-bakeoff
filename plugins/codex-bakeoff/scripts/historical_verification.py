@@ -358,7 +358,7 @@ def verify_candidates(
             "limitations": discovery["limitations"],
         }
 
-    with tempfile.TemporaryDirectory(prefix="claude-bakeoff-verify-") as raw:
+    with tempfile.TemporaryDirectory(prefix="codex-bakeoff-verify-") as raw:
         temporary = Path(raw)
         roots = {
             "baseline": temporary / "baseline",

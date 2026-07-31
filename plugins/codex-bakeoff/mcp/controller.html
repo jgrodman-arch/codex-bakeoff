@@ -1031,8 +1031,8 @@
         ["reporting", "Finalizing report"],
       ];
 
-      const DRAFT_STORAGE_KEY = "claude-bakeoff.controller-draft.v1";
-      const CONTROLLER_SESSION_STORAGE_KEY = "claude-bakeoff.controller-session.v1";
+      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v1";
+      const CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1";
       const DRAFT_VERSION = 1;
       const DRAFT_STEPS = new Set(["thread", "configure", "review"]);
 
@@ -1275,7 +1275,7 @@
             credentials: "same-origin",
             headers: {
               "Content-Type": "application/json",
-              "X-Claude-Bakeoff-Session": sessionToken,
+              "X-Codex-Bakeoff-Session": sessionToken,
             },
             body: JSON.stringify({ name, arguments: args }),
           });
@@ -3009,7 +3009,7 @@
             credentials: "same-origin",
             headers: {
               "Content-Type": "application/json",
-              "X-Claude-Bakeoff-Session": sessionToken,
+              "X-Codex-Bakeoff-Session": sessionToken,
             },
             body: JSON.stringify({ run_id: state.runId, format }),
           });
@@ -3026,7 +3026,7 @@
           const url = URL.createObjectURL(await response.blob());
           const link = document.createElement("a");
           link.href = url;
-          link.download = `claude-bakeoff-${state.runId}-report.${format}`;
+          link.download = `codex-bakeoff-${state.runId}-report.${format}`;
           document.body.append(link);
           try {
             link.click();

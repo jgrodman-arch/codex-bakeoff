@@ -278,7 +278,7 @@ test("timeout terminates the active Codex process tree", async () => {
 });
 
 async function fakeCodexFixture() {
-  const root = await mkdtemp(path.join(tmpdir(), "claude-bakeoff-worker-"));
+  const root = await mkdtemp(path.join(tmpdir(), "codex-bakeoff-worker-"));
   temporaryRoots.push(root);
   const executablePath = path.join(root, "fake-codex.mjs");
   const grandchildPath = path.join(root, "fake-grandchild.mjs");

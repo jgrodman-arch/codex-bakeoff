@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,18 @@ MCP_WORKER = PLUGIN_ROOT / "mcp" / "codex-worker.mjs"
 
 
 class PluginContractTests(unittest.TestCase):
+    def test_legacy_plugin_name_is_absent(self) -> None:
+        legacy_name = re.compile(r"claude[-_ ]bakeoff", re.IGNORECASE)
+        for path in PLUGIN_ROOT.rglob("*"):
+            if not path.is_file() or "node_modules" in path.parts:
+                continue
+            if path.suffix not in {".html", ".json", ".md", ".mjs", ".py", ".yaml"}:
+                continue
+            self.assertIsNone(
+                legacy_name.search(path.read_text(encoding="utf-8")),
+                str(path.relative_to(PLUGIN_ROOT)),
+            )
+
     def test_manifest_is_valid_and_points_inside_plugin(self) -> None:
         payload = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.assertEqual(payload["name"], "codex-bakeoff")
@@ -85,7 +98,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(server["cwd"], ".")
         self.assertIn("CODEX_MCP_NODE_PATH", server["env_vars"])
         self.assertIn("PATH", server["env_vars"])
-        self.assertIn("CLAUDE_BAKEOFF_CONTROLLER_PORT", server["env_vars"])
+        self.assertIn("CODEX_BAKEOFF_CONTROLLER_PORT", server["env_vars"])
         self.assertTrue(MCP_SERVER.is_file())
         self.assertTrue(MCP_CONTROLLER.is_file())
         self.assertTrue(MCP_WORKER.is_file())

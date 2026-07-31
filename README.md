@@ -40,13 +40,6 @@ codex plugin add codex-bakeoff@codex-bakeoff
 
 Start a fresh Codex task after installation.
 
-## Local behavior
-
-The plugin opens an authenticated controller on `127.0.0.1`, reads the local
-Codex import ledger, and invokes the local Codex CLI. Runs and reports are stored
-under `~/.cache/claude-bakeoff/`. The selected source project is not modified;
-implementation work runs in an isolated workspace.
-
 ## Development
 
 From the repository root:
