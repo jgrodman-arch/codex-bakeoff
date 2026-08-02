@@ -174,8 +174,167 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         self.assertEqual(replay["request"], task["request"])
         self.assertEqual(replay["message_uuids"], ["u1", "u2"])
         self.assertEqual(replay["preceding_context"], [])
+        self.assertEqual(
+            replay["prompt_reconstruction_turns"],
+            [
+                {"role": "user", "text": "build it"},
+                {"role": "user", "text": "make it blue"},
+            ],
+        )
+        self.assertFalse(replay["prompt_reconstruction_truncated"])
         self.assertNotIn("source_sha256", replay)
         self.assertNotIn("configuration_fingerprint", replay)
+
+    def test_prompt_reconstruction_resolves_numbered_reply_without_solution_output(self) -> None:
+        clarification = (
+            "I need clarification. Are you asking me to:\n\n"
+            "1. Create a CLI script?\n"
+            "2. Add a documentation example?\n"
+            "3. Add a simple program somewhere in the project?\n"
+            "4. Something else?\n\n"
+            "What would be most helpful?"
+        )
+        session, task = self.select(
+            [
+                self.user("u1", "add hello world", "2026-01-01T10:00:00Z"),
+                self.assistant(
+                    "a1",
+                    "I inspected the project and found the implementation location.",
+                    "2026-01-01T10:01:00Z",
+                ),
+                self.assistant("a2", clarification, "2026-01-01T10:02:00Z"),
+                self.user("u2", "3", "2026-01-01T10:03:00Z"),
+                self.assistant(
+                    "a3",
+                    "Implemented the program and all tests pass.",
+                    "2026-01-01T10:04:00Z",
+                ),
+                self.user("u3", "make it executable", "2026-01-01T10:05:00Z"),
+            ]
+        )
+
+        replay = discovery.build_replay_spec(session, task)
+
+        self.assertEqual(
+            replay["prompt_reconstruction_turns"],
+            [
+                {"role": "user", "text": "add hello world"},
+                {
+                    "role": "assistant",
+                    "text": (
+                        "1. Create a CLI script?\n"
+                        "2. Add a documentation example?\n"
+                        "3. Add a simple program somewhere in the project?\n"
+                        "4. Something else?\n\n"
+                        "What would be most helpful?"
+                    ),
+                },
+                {"role": "user", "text": "3"},
+                {"role": "user", "text": "make it executable"},
+            ],
+        )
+        serialized = json.dumps(replay["prompt_reconstruction_turns"])
+        self.assertNotIn("implementation location", serialized)
+        self.assertNotIn("all tests pass", serialized)
+
+    def test_prompt_reconstruction_includes_structured_question_answers(self) -> None:
+        question_event = {
+            "type": "assistant",
+            "uuid": "a1",
+            "sessionId": "claude-session",
+            "cwd": str(self.project),
+            "timestamp": "2026-01-01T10:01:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "question-1",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [
+                                {
+                                    "question": "Which output should I create?",
+                                    "options": [
+                                        {
+                                            "label": "CLI",
+                                            "description": "Create a command-line example.",
+                                        },
+                                        {
+                                            "label": "Docs",
+                                            "description": "Create a documentation example.",
+                                        },
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+        }
+        answer_event = {
+            "type": "user",
+            "uuid": "answer-1",
+            "sessionId": "claude-session",
+            "cwd": str(self.project),
+            "timestamp": "2026-01-01T10:02:00Z",
+            "sourceToolAssistantUUID": "a1",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "question-1",
+                        "content": "The user selected CLI.",
+                    }
+                ],
+            },
+            "toolUseResult": {
+                "answers": {"Which output should I create?": "CLI"}
+            },
+        }
+        session, task = self.select(
+            [
+                self.user("u1", "add an example", "2026-01-01T10:00:00Z"),
+                question_event,
+                answer_event,
+            ]
+        )
+
+        replay = discovery.build_replay_spec(session, task)
+
+        self.assertEqual(
+            replay["prompt_reconstruction_turns"],
+            [
+                {"role": "user", "text": "add an example"},
+                {
+                    "role": "assistant",
+                    "text": (
+                        "Which output should I create?\n"
+                        "1. CLI — Create a command-line example.\n"
+                        "2. Docs — Create a documentation example."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "text": "Which output should I create?: CLI",
+                },
+            ],
+        )
+
+    def test_prompt_reconstruction_marks_truncated_turns(self) -> None:
+        request = "x" * (discovery.MAX_PROMPT_RECONSTRUCTION_TURN_CHARS + 1)
+        session, task = self.select(
+            [self.user("u1", request, "2026-01-01T10:00:00Z")]
+        )
+
+        replay = discovery.build_replay_spec(session, task)
+
+        self.assertTrue(replay["prompt_reconstruction_truncated"])
+        self.assertEqual(
+            len(replay["prompt_reconstruction_turns"][0]["text"]),
+            discovery.MAX_PROMPT_RECONSTRUCTION_TURN_CHARS,
+        )
 
     def test_source_changes_do_not_invalidate_replay(self) -> None:
         session, task = self.select([self.user("u1", "request", "2026-01-01T10:00:00Z")])
@@ -559,6 +718,50 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         )
         self.assertIsNone(rejected["diff"])
         self.assertIn("does not descend", rejected["limitations"][0])
+
+    def test_non_git_beginning_to_git_end_diffs_from_empty_tree(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.project), "config", "user.name", "Test User"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.project), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        (self.project / "index.html").write_text("<h1>Hello</h1>\n", encoding="utf-8")
+        (self.project / "app.js").write_text("console.log('ready');\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.project), "add", "index.html", "app.js"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.project), "commit", "-qm", "historical result"],
+            check=True,
+        )
+        ending = subprocess.run(
+            ["git", "-C", str(self.project), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        source = self.write_transcript(
+            "non-git-to-git",
+            [self.user("u1", "build it", "2026-01-01T10:00:00Z")],
+        )
+
+        recovered = discovery.recover_historical_solution(
+            {
+                "project_dir": str(self.project),
+                "source_path": str(source),
+                "message_uuid": "u1",
+            },
+            baseline_kind="empty_directory",
+            ending_commit=ending,
+        )
+
+        self.assertEqual(recovered["provenance"], "user_reviewed_git_commit")
+        self.assertEqual(recovered["commit"], ending)
+        self.assertEqual(recovered["changed_files"], ["app.js", "index.html"])
+        self.assertIn("+<h1>Hello</h1>", recovered["diff"])
+        self.assertTrue(recovered["evidence"][0]["empty_tree_baseline"])
 
 
 if __name__ == "__main__":

@@ -326,7 +326,7 @@ class McpServerTests(unittest.TestCase):
             with mock.patch.object(server, "APP_HTML", Path("/deleted/controller.html")):
                 status, _, body = request("GET", "/")
             self.assertEqual(status, 200)
-            self.assertIn(b"codex-bakeoff.controller-draft.v3", body)
+            self.assertIn(b"codex-bakeoff.controller-draft.v4", body)
             self.assertNotIn(b"window.openai", body)
 
             tool_result = {
@@ -514,7 +514,7 @@ class McpServerTests(unittest.TestCase):
         snapshot = controller.split("function draftSnapshot()", 1)[1].split(
             "function saveDraft()", 1
         )[0]
-        self.assertIn("codex-bakeoff.controller-draft.v3", controller)
+        self.assertIn("codex-bakeoff.controller-draft.v4", controller)
         self.assertIn("codex-bakeoff.controller-session.v1", controller)
         self.assertIn("X-Codex-Bakeoff-Session", controller)
         self.assertIn("localStorage.getItem(CONTROLLER_SESSION_STORAGE_KEY)", controller)
@@ -545,8 +545,7 @@ class McpServerTests(unittest.TestCase):
             "model",
             "timeoutSeconds",
             "classifications",
-            "gitSelectionConfirmed",
-            "nonGitBaseline",
+            "emptyBeginningConfirmed",
             "reviewDraft",
         ):
             self.assertIn(field, snapshot)
@@ -566,10 +565,18 @@ class McpServerTests(unittest.TestCase):
         self.assertIn('id="original-thread"', configure)
         self.assertIn("readonly", configure)
         self.assertIn("Message ID within the original thread", configure)
-        self.assertIn("Historical starting commit", configure)
-        self.assertIn("Historical ending commit", configure)
+        self.assertIn("1. Beginning state", configure)
+        self.assertIn("2. End state", configure)
+        self.assertIn("Starting commit", configure)
+        self.assertIn("Ending commit", configure)
         self.assertIn('id="review-ending-commit"', configure)
-        self.assertIn("Additional uncommitted changes attributed to Claude", configure)
+        self.assertIn("Uncommitted files from this run", configure)
+        self.assertIn("Reconstructed task prompt", configure)
+        self.assertIn("All locally available Codex models in one list", configure)
+        self.assertNotIn(
+            "I reviewed every current Git change and this attribution is complete",
+            controller,
+        )
         self.assertIn('data-action="approve-configuration"', configure)
         self.assertIn("Checking configuration", configure)
         self.assertNotIn("Validate configuration", controller)
@@ -705,8 +712,162 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(inspected["capabilities"]["items"][0]["name"], "shell")
         self.assertEqual(inspected["models"], [{"id": "gpt-test"}])
         self.assertEqual(
+            inspected["replay"]["request_generation"],
+            {"method": "concatenated_fallback"},
+        )
+        self.assertEqual(
             [item["step"] for item in inspected["diagnostics"]],
             ["thread", "baseline"],
+        )
+
+    def test_inspection_synthesizes_reconstructed_request_in_read_only_workspace(self) -> None:
+        server = load_server()
+        turns = [
+            {"role": "user", "text": "add hello world"},
+            {
+                "role": "assistant",
+                "text": "1. Add docs?\n2. Add a CLI?\n3. Add a simple program?",
+            },
+            {"role": "user", "text": "3"},
+        ]
+
+        def fake_engine(command: str, arguments=()):
+            if command == "replay":
+                return {
+                    "replay": {
+                        "imported_thread_id": "thread-1",
+                        "request": "add hello world\n\n3",
+                        "prompt_reconstruction_turns": turns,
+                        "prompt_reconstruction_truncated": False,
+                    }
+                }
+            if command == "capabilities":
+                return {"items": []}
+            if command == "baseline":
+                return {}
+            if command == "models":
+                return {"options": [{"id": "gpt-5.6-sol"}, {"id": "gpt-test"}]}
+            raise AssertionError(command)
+
+        def fake_worker(
+            request,
+            *,
+            run_directory,
+            working_directory,
+            read_only,
+            log_label,
+        ):
+            self.assertEqual(request["model"], "gpt-5.6-sol")
+            self.assertEqual(request["expected_schema"], server.REQUEST_SYNTHESIS_SCHEMA)
+            self.assertEqual(request["timeout_seconds"], 180)
+            self.assertIn(json.dumps(turns, ensure_ascii=False), request["prompt"])
+            self.assertTrue(read_only)
+            self.assertEqual(run_directory, working_directory)
+            self.assertTrue(working_directory.is_dir())
+            self.assertEqual(log_label, "prompt-synthesis")
+            return {
+                "finalResponse": json.dumps(
+                    {"request": "Add a simple hello world program to the project."}
+                )
+            }
+
+        with (
+            mock.patch.object(server, "_engine", side_effect=fake_engine),
+            mock.patch.object(server, "_run_worker", side_effect=fake_worker),
+        ):
+            inspected = server._inspect_thread({"thread_id": "thread-1"})
+
+        self.assertEqual(
+            inspected["replay"]["request"],
+            "Add a simple hello world program to the project.",
+        )
+        self.assertEqual(
+            inspected["replay"]["request_generation"],
+            {"method": "llm_synthesis", "model": "gpt-5.6-sol"},
+        )
+        for record in (inspected["thread"], inspected["replay"]):
+            self.assertNotIn("prompt_reconstruction_turns", record)
+            self.assertNotIn("prompt_reconstruction_truncated", record)
+
+    def test_inspection_keeps_exact_concatenation_when_synthesis_fails(self) -> None:
+        server = load_server()
+        fallback = "add hello world\n\n3"
+
+        def fake_engine(command: str, arguments=()):
+            if command == "replay":
+                return {
+                    "replay": {
+                        "imported_thread_id": "thread-1",
+                        "request": fallback,
+                        "prompt_reconstruction_turns": [
+                            {"role": "user", "text": "add hello world"},
+                            {"role": "user", "text": "3"},
+                        ],
+                        "prompt_reconstruction_truncated": False,
+                    }
+                }
+            if command == "capabilities":
+                return {"items": []}
+            if command == "baseline":
+                return {}
+            if command == "models":
+                return {"options": [{"id": "gpt-5.6-sol"}]}
+            raise AssertionError(command)
+
+        outcomes = (
+            server.WorkerError("stream_error", "failed"),
+            {"finalResponse": "not json"},
+            {"finalResponse": '{"request":"   "}'},
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                worker_patch = (
+                    mock.patch.object(server, "_run_worker", side_effect=outcome)
+                    if isinstance(outcome, Exception)
+                    else mock.patch.object(server, "_run_worker", return_value=outcome)
+                )
+                with mock.patch.object(server, "_engine", side_effect=fake_engine), worker_patch:
+                    inspected = server._inspect_thread({"thread_id": "thread-1"})
+
+                self.assertEqual(inspected["replay"]["request"], fallback)
+                self.assertEqual(
+                    inspected["replay"]["request_generation"],
+                    {"method": "concatenated_fallback"},
+                )
+                self.assertNotIn("prompt_reconstruction_turns", inspected["replay"])
+                self.assertNotIn("prompt_reconstruction_truncated", inspected["replay"])
+
+    def test_inspection_does_not_synthesize_without_sol(self) -> None:
+        server = load_server()
+
+        def fake_engine(command: str, arguments=()):
+            if command == "replay":
+                return {
+                    "replay": {
+                        "request": "keep this exact request",
+                        "prompt_reconstruction_turns": [
+                            {"role": "user", "text": "keep this exact request"}
+                        ],
+                        "prompt_reconstruction_truncated": False,
+                    }
+                }
+            if command in {"capabilities", "baseline"}:
+                return {}
+            if command == "models":
+                return {"options": [{"id": "gpt-5.6-terra"}]}
+            raise AssertionError(command)
+
+        with (
+            mock.patch.object(server, "_engine", side_effect=fake_engine),
+            mock.patch.object(server, "_run_worker") as worker,
+        ):
+            inspected = server._inspect_thread({"thread_id": "thread-1"})
+
+        worker.assert_not_called()
+        self.assertEqual(inspected["replay"]["request"], "keep this exact request")
+        self.assertEqual(
+            inspected["replay"]["request_generation"],
+            {"method": "concatenated_fallback"},
         )
 
     def test_prepare_maps_ui_classification_to_existing_engine_flags(self) -> None:
@@ -732,7 +893,9 @@ class McpServerTests(unittest.TestCase):
                     "message_uuid": "message-1",
                     "request": "Build the reviewed thing.",
                     "repo": "/tmp/reviewed-repo",
-                    "baseline_kind": "empty_directory",
+                    "beginning_kind": "non_git",
+                    "ending_kind": "non_git",
+                    "confirm_empty_beginning": True,
                     "confirm_repository_selection": True,
                     "model": "gpt-5.6-terra",
                     "timeout_seconds": 1200,
@@ -758,8 +921,10 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("--request-stdin", arguments)
         self.assertNotIn("Build the reviewed thing.", arguments)
         self.assertEqual(observed[0][2], "Build the reviewed thing.")
-        self.assertIn("--baseline-kind", arguments)
-        self.assertIn("empty_directory", arguments)
+        self.assertIn("--beginning-kind", arguments)
+        self.assertIn("--ending-kind", arguments)
+        self.assertIn("non_git", arguments)
+        self.assertIn("--confirm-empty-beginning", arguments)
         self.assertIn("--confirm-repository-selection", arguments)
         self.assertIn("--source-path", arguments)
         self.assertIn("/tmp/reviewed-transcript.jsonl", arguments)
@@ -775,7 +940,8 @@ class McpServerTests(unittest.TestCase):
                     "thread_id": "thread-1",
                     "request": "Build it.",
                     "repo": "/tmp/repository",
-                    "baseline_kind": "git_commit",
+                    "beginning_kind": "git",
+                    "ending_kind": "git",
                     "model": "gpt-test",
                     "timeout_seconds": 1200,
                 }
@@ -789,7 +955,8 @@ class McpServerTests(unittest.TestCase):
                     "thread_id": "thread-1",
                     "request": "Build it.",
                     "repo": "/tmp/repository",
-                    "baseline_kind": "git_commit",
+                    "beginning_kind": "git",
+                    "ending_kind": "git",
                     "baseline_commit": "a" * 40,
                     "model": "gpt-test",
                     "timeout_seconds": 1200,
@@ -803,7 +970,8 @@ class McpServerTests(unittest.TestCase):
                 "thread_id": "thread-1",
                 "request": "Build it.",
                 "repo": "/tmp/repository",
-                "baseline_kind": "git_commit",
+                "beginning_kind": "git",
+                "ending_kind": "git",
                 "baseline_commit": "a" * 40,
                 "ending_commit": "b" * 40,
                 "model": "gpt-test",
@@ -815,20 +983,34 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("--ending-commit", arguments)
         self.assertIn("b" * 40, arguments)
 
-    def test_reviewed_baseline_kind_rejects_non_text_values(self) -> None:
+    def test_reviewed_state_kinds_reject_non_text_values(self) -> None:
         server = load_server()
-        for value in ([], {}):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                server.ControllerError,
-                "Git commit or empty-directory baseline",
-            ):
-                server._normalized_configuration(
-                    {
-                        "thread_id": "thread-1",
-                        "baseline_kind": value,
-                        "model": "gpt-test",
-                    }
-                )
+        for field in ("beginning_kind", "ending_kind"):
+            for value in ([], {}):
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    server.ControllerError,
+                    "Git or Non-Git",
+                ):
+                    server._normalized_configuration(
+                        {
+                            "thread_id": "thread-1",
+                            field: value,
+                            "model": "gpt-test",
+                        }
+                    )
+
+    def test_git_beginning_rejects_non_git_end(self) -> None:
+        server = load_server()
+        with self.assertRaisesRegex(server.ControllerError, "requires a Git end state"):
+            server._normalized_configuration(
+                {
+                    "thread_id": "thread-1",
+                    "beginning_kind": "git",
+                    "ending_kind": "non_git",
+                    "baseline_commit": "a" * 40,
+                    "model": "gpt-test",
+                }
+            )
 
     def test_prepare_token_binds_config_and_makes_start_idempotent(self) -> None:
         server = load_server()
@@ -894,7 +1076,8 @@ class McpServerTests(unittest.TestCase):
                 "source_path": "/tmp/transcript.jsonl",
                 "message_uuid": "message-1",
                 "request": "Build the reviewed thing.",
-                "baseline_kind": "git_commit",
+                "beginning_kind": "git",
+                "ending_kind": "git",
                 "baseline_commit": "a" * 40,
                 "ending_commit": "b" * 40,
                 "model": "gpt-5.6-terra",

@@ -534,6 +534,7 @@ def select_directory(
     existed_before_claude: Iterable[str] = (),
     exclude_files: Iterable[str] = (),
     confirmed: bool = False,
+    empty_starting_directory_confirmed: bool | None = None,
     allow_git_with_commits: bool = False,
 ) -> dict[str, Any]:
     """Require one classification for every bounded non-Git inventory entry."""
@@ -592,7 +593,12 @@ def select_directory(
 
     unclassified = sorted(set(by_path) - all_selected)
     confirmation_recorded = bool(confirmed)
-    complete = confirmation_recorded and not unclassified
+    empty_confirmed = (
+        confirmation_recorded
+        if empty_starting_directory_confirmed is None
+        else bool(empty_starting_directory_confirmed)
+    )
+    complete = confirmation_recorded and empty_confirmed and not unclassified
     output_paths = classes["created_by_claude"]
     selected_bytes = sum(
         int(entry["size"]) for entry in baseline_entries if isinstance(entry.get("size"), int)
@@ -610,7 +616,8 @@ def select_directory(
         "source_root": str(directory),
         "requires_confirmation": True,
         "confirmed": confirmation_recorded,
-        "empty_starting_directory_confirmed": (confirmation_recorded and not baseline_entries),
+        "requires_empty_beginning_confirmation": not baseline_entries,
+        "empty_starting_directory_confirmed": empty_confirmed and not baseline_entries,
         "complete": complete,
         "candidates": candidates,
         "unclassified_files": unclassified,
@@ -1436,15 +1443,46 @@ def _neutralize_temp_git_attributes(root: Path) -> None:
     )
 
 
+def _checkout_empty_baseline(root: Path) -> None:
+    tree = _git(root, "mktree", input_bytes=b"").stdout.decode("ascii", errors="strict").strip()
+    if re.fullmatch(r"[a-fA-F0-9]{40,64}", tree) is None:
+        raise FileSelectionError("Git could not create the empty candidate baseline.")
+    commit = (
+        _git(
+            root,
+            "-c",
+            "user.name=Codex Bakeoff",
+            "-c",
+            "user.email=bakeoff@localhost",
+            "commit-tree",
+            tree,
+            "-m",
+            "empty baseline",
+        )
+        .stdout.decode("ascii", errors="strict")
+        .strip()
+    )
+    if re.fullmatch(r"[a-fA-F0-9]{40,64}", commit) is None:
+        raise FileSelectionError("Git could not create the empty candidate baseline.")
+    _git(root, "checkout", "--quiet", "--detach", commit)
+
+
 def build_git_candidate_patch(
     *,
     repository: Path | str,
-    baseline_commit: str,
+    baseline_commit: str | None,
+    baseline_kind: str = "git_commit",
     recovered_patch: str | None,
     selection: Mapping[str, Any],
 ) -> tuple[str, tuple[str, ...]]:
     """Overlay selected live Git changes onto the recovered historical result."""
 
+    if baseline_kind not in {"git_commit", "empty_directory"}:
+        raise FileSelectionError("The Git candidate baseline kind is unsupported.")
+    if baseline_kind == "git_commit" and not baseline_commit:
+        raise FileSelectionError("The Git candidate baseline commit is required.")
+    if baseline_kind == "empty_directory" and baseline_commit:
+        raise FileSelectionError("An empty candidate baseline cannot have a Git commit.")
     source = _absolute_no_follow(repository)
     selected = selection.get("claude_output_changes")
     if not isinstance(selected, list):
@@ -1468,10 +1506,10 @@ def build_git_candidate_patch(
         if os.path.lexists(current):
             live_sources.append(current)
     live_bytes = _check_live_sources(live_sources)
-    baseline_bytes = _check_git_baseline_sources(
-        source,
-        baseline_commit,
-        affected_paths,
+    baseline_bytes = (
+        _check_git_baseline_sources(source, baseline_commit, affected_paths)
+        if baseline_kind == "git_commit" and baseline_commit is not None
+        else 0
     )
     if live_bytes + baseline_bytes > MAX_TOTAL_BYTES:
         raise FileSelectionError(
@@ -1510,7 +1548,10 @@ def build_git_candidate_patch(
         if clone.returncode:
             detail = clone.stderr.decode("utf-8", errors="replace").strip()
             raise FileSelectionError(detail or "Cannot clone the Git baseline.")
-        _git(candidate, "checkout", "--quiet", "--detach", baseline_commit)
+        if baseline_kind == "git_commit" and baseline_commit is not None:
+            _git(candidate, "checkout", "--quiet", "--detach", baseline_commit)
+        else:
+            _checkout_empty_baseline(candidate)
         if isinstance(recovered_patch, str) and recovered_patch.strip():
             applied = _git(
                 candidate,

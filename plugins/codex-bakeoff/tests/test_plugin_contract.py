@@ -55,26 +55,22 @@ class PluginContractTests(unittest.TestCase):
         self.assertNotIn("--approve", text)
         self.assertNotIn("Do not open a browser automatically", text)
 
-    def test_non_git_baseline_contract_requires_an_empty_start(self) -> None:
+    def test_beginning_and_end_state_contract(self) -> None:
         text = BASELINE_HANDLING.read_text(encoding="utf-8")
         flat = " ".join(text.split())
-        non_git = text.split("## Non-Git directories", 1)[1].split(
-            "## Preparation and approval", 1
-        )[0]
-        headings = [line for line in non_git.splitlines() if line.startswith("### ")]
-        self.assertEqual(
-            headings,
-            [
-                "### Created by Claude",
-                "### Exclude",
-            ],
-        )
+        self.assertIn("Git     -> Git", text)
+        self.assertIn("Non-Git -> Git", text)
+        self.assertIn("Non-Git -> Non-Git", text)
+        self.assertIn("`Git -> Non-Git` is invalid", text)
+        self.assertIn("--confirm-empty-beginning", text)
+        self.assertIn("does not confirm the beginning state", text)
+        self.assertIn("diffing the empty Git tree", text)
+        self.assertIn("All committed files come from the ending commit", text)
         self.assertIn("live source paths", flat)
         self.assertIn("completed Codex workspace", flat)
         self.assertIn("unchanged and available through `complete-run`", flat)
         self.assertIn("excluded symmetrically from both candidate", flat)
         self.assertIn("comparison limitation", flat)
-        self.assertIn("directory was empty before Claude", flat)
         self.assertIn("If any file existed before Claude, stop", flat)
         self.assertNotIn("--registered-baseline-project", text)
         self.assertNotIn("--registered-baseline-project-id", text)

@@ -25,10 +25,15 @@ def _args(root: Path, *, kind: str) -> argparse.Namespace:
         imported_thread_id="thread-1",
         ledger=root / "ledger.json",
         repo=None,
+        beginning_kind=None,
+        ending_kind=None,
+        baseline_commit=None,
+        ending_commit=None,
         claude_output_file=None,
         created_by_claude=None,
         exclude_file=None,
         confirm_file_selection=False,
+        confirm_empty_beginning=False,
         model="gpt-test",
         model_cache=root / "models.json",
         timeout_seconds=1800,
@@ -93,6 +98,68 @@ class LeanBakeoffTests(unittest.TestCase):
         with self.assertRaisesRegex(bakeoff.BakeoffError, "not locally available"):
             bakeoff._selected_model("gpt-manually-reviewed", self.root / "models.json")
 
+    def test_model_catalog_includes_every_available_slug_and_defaults_to_sol(self) -> None:
+        catalog_path = self.root / "catalog.json"
+        catalog_path.write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "lanturn-1000",
+                            "visibility": "list",
+                            "supported_in_api": True,
+                            "is_default": True,
+                        },
+                        {
+                            "slug": "gpt-5.6-sol",
+                            "visibility": "list",
+                            "supported_in_api": True,
+                        },
+                        {
+                            "slug": "model-experimental",
+                            "visibility": "list",
+                            "supported_in_api": True,
+                        },
+                        {
+                            "slug": "hidden-model",
+                            "visibility": "hide",
+                            "supported_in_api": True,
+                        },
+                        {
+                            "slug": "unsupported-model",
+                            "visibility": "list",
+                            "supported_in_api": False,
+                        },
+                        {
+                            "slug": "deprecated-model",
+                            "visibility": "list",
+                            "supported_in_api": True,
+                            "upgrade": {"model": "gpt-5.6-sol"},
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        catalog = bakeoff.discover_codex_models(catalog_path)
+
+        self.assertEqual(
+            [item["id"] for item in catalog["options"]],
+            ["lanturn-1000", "gpt-5.6-sol", "model-experimental"],
+        )
+        self.assertEqual(
+            [item["id"] for item in catalog["options"] if item["recommended"]],
+            ["gpt-5.6-sol"],
+        )
+        self.assertEqual(
+            bakeoff._selected_model("lanturn-1000", catalog_path),
+            "lanturn-1000",
+        )
+
+        fallback = bakeoff.discover_codex_models(self.root / "models.json")
+        self.assertTrue(fallback["options"][0]["recommended"])
+
     def _git_repository(self, name: str) -> Path:
         repository = self.root / name
         repository.mkdir()
@@ -143,6 +210,8 @@ class LeanBakeoffTests(unittest.TestCase):
             "kind": kind,
             "repository": str(repository),
             "commit": "a" * 40 if kind == "git_commit" else None,
+            "beginning_kind": "git" if kind == "git_commit" else "non_git",
+            "ending_kind": "git" if kind == "git_commit" else "non_git",
             "confidence": "verified" if kind == "git_commit" else "user_confirmed",
             "working_tree_state": ("verified_clean" if kind == "git_commit" else "unknown"),
             "source_kind": "git" if kind == "git_commit" else "non_git",
@@ -188,12 +257,13 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_capabilities"].return_value = parity
             prepared = bakeoff._command_prepare(args)
         self.assertEqual(prepared["status"], "needs_user_input")
-        self.assertIn(
-            "directory was empty before Claude",
-            prepared["questions"][0]["question"],
+        self.assertEqual(
+            {question["id"] for question in prepared["questions"]},
+            {"classify_non_git_files", "confirm_empty_beginning"},
         )
 
         args.confirm_file_selection = True
+        args.confirm_empty_beginning = True
         with patches as values:
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
@@ -219,7 +289,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "Browser and shared verification happen after implementation.",
             request["prompt"],
         )
-        self.assertIn("Original user requests:\nbuild the thing", request["prompt"])
+        self.assertIn("Task prompt:\nbuild the thing", request["prompt"])
         run = json.loads((Path(result["run_directory"]) / "run.json").read_text(encoding="utf-8"))
         self.assertEqual(run["status"], "awaiting_native_task")
         self.assertNotIn("execution_plan", run)
@@ -753,6 +823,7 @@ class LeanBakeoffTests(unittest.TestCase):
 
         prepare_args.created_by_claude = ["page.html"]
         prepare_args.confirm_file_selection = True
+        prepare_args.confirm_empty_beginning = True
         classified, file_selection = bakeoff._classified_baseline(
             prepare_args,
             baseline,
@@ -771,13 +842,22 @@ class LeanBakeoffTests(unittest.TestCase):
         ).stdout.strip()
         args = _args(self.root, kind="git_commit")
         args.repo = repository
-        args.baseline_kind = "git_commit"
+        args.beginning_kind = "git"
+        args.ending_kind = "git"
         args.baseline_commit = commit
+        args.ending_commit = commit
 
-        with mock.patch.object(
-            bakeoff._discovery(),
-            "inspect_baseline",
-            side_effect=RuntimeError("ambiguous baseline"),
+        with (
+            mock.patch.object(
+                bakeoff._discovery(),
+                "inspect_baseline",
+                side_effect=RuntimeError("ambiguous baseline"),
+            ),
+            mock.patch.object(
+                bakeoff._discovery(),
+                "recover_historical_solution",
+                return_value={"commit": commit, "diff": ""},
+            ),
         ):
             baseline = bakeoff._baseline(args, {"project_dir": str(repository)})
 
@@ -796,6 +876,65 @@ class LeanBakeoffTests(unittest.TestCase):
             self.assertRaisesRegex(bakeoff.BakeoffError, "commit is unavailable"),
         ):
             bakeoff._baseline(args, {"project_dir": str(repository)})
+
+    def test_git_beginning_rejects_non_git_end(self) -> None:
+        args = _args(self.root, kind="git_commit")
+        args.beginning_kind = "git"
+        args.ending_kind = "non_git"
+        args.baseline_commit = "a" * 40
+
+        with self.assertRaisesRegex(
+            bakeoff.BakeoffError,
+            "Git beginning state requires a Git end state",
+        ):
+            bakeoff._baseline(args, {})
+
+    def test_reviewed_non_git_beginning_to_git_end_is_runnable(self) -> None:
+        repository = self._git_repository("non-git-to-git")
+        ending_commit = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        transcript = self.root / "non-git-to-git.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "message-1",
+                    "message": {"role": "user", "content": "Build it"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        replay = {
+            "project_dir": str(repository),
+            "source_path": str(transcript),
+            "message_uuid": "message-1",
+        }
+        args = _args(self.root, kind="empty_directory")
+        args.repo = repository
+        args.beginning_kind = "non_git"
+        args.ending_kind = "git"
+        args.ending_commit = ending_commit
+        args.confirm_empty_beginning = True
+
+        baseline = bakeoff._baseline(args, replay)
+        classified, file_selection = bakeoff._classified_baseline(args, baseline)
+
+        self.assertEqual(classified["kind"], "empty_directory")
+        self.assertEqual(classified["beginning_kind"], "non_git")
+        self.assertEqual(classified["ending_kind"], "git")
+        self.assertEqual(classified["ending_commit"], ending_commit)
+        self.assertEqual(file_selection["source_kind"], "git")
+        self.assertTrue(file_selection["complete"])
+        target = bakeoff._target_for_baseline(
+            classified,
+            run_directory=self.root / "run-non-git-to-git",
+        )
+        self.assertEqual(target["type"], "projectless")
 
     def test_reviewed_request_recovers_from_failed_transcript_discovery(self) -> None:
         repository = self.root / "manual-request"
@@ -908,6 +1047,7 @@ class LeanBakeoffTests(unittest.TestCase):
         prepare_args = _args(self.root, kind="empty_directory")
         prepare_args.created_by_claude = ["created.txt"]
         prepare_args.confirm_file_selection = True
+        prepare_args.confirm_empty_beginning = True
         classified, file_selection = bakeoff._classified_baseline(
             prepare_args,
             baseline,
@@ -943,6 +1083,7 @@ class LeanBakeoffTests(unittest.TestCase):
         prepare_args = _args(self.root, kind="empty_directory")
         prepare_args.created_by_claude = ["created.txt"]
         prepare_args.confirm_file_selection = True
+        prepare_args.confirm_empty_beginning = True
         classified, file_selection = bakeoff._classified_baseline(
             prepare_args,
             baseline,
@@ -1069,10 +1210,24 @@ class LeanBakeoffTests(unittest.TestCase):
             "task_timestamp": "2026-01-01T00:00:00Z",
         }
 
-        baseline = bakeoff._baseline(args, replay)
+        ending_commit = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        recovered = {"commit": ending_commit, "diff": "diff --git a/created.html b/created.html\n"}
+        with mock.patch.object(
+            bakeoff._discovery(),
+            "recover_historical_solution",
+            return_value=recovered,
+        ):
+            baseline = bakeoff._baseline(args, replay)
 
         self.assertEqual(baseline["kind"], "unclassified_directory")
-        self.assertEqual(baseline["source_kind"], "non_git")
+        self.assertEqual(baseline["beginning_kind"], "non_git")
+        self.assertEqual(baseline["ending_kind"], "git")
+        self.assertEqual(baseline["source_kind"], "git")
         self.assertEqual(
             baseline["post_task_git_history"]["timestamp"],
             "2026-01-02T00:00:00Z",
@@ -1080,18 +1235,23 @@ class LeanBakeoffTests(unittest.TestCase):
 
         reviewed_args = _args(self.root, kind="empty_directory")
         reviewed_args.repo = repository
-        reviewed_args.baseline_kind = "empty_directory"
-        reviewed_args.baseline_commit = None
-        reviewed_baseline = bakeoff._baseline(reviewed_args, replay)
+        reviewed_args.beginning_kind = "non_git"
+        reviewed_args.ending_kind = "git"
+        reviewed_args.ending_commit = ending_commit
+        with mock.patch.object(
+            bakeoff._discovery(),
+            "recover_historical_solution",
+            return_value=recovered,
+        ):
+            reviewed_baseline = bakeoff._baseline(reviewed_args, replay)
         self.assertEqual(reviewed_baseline["kind"], "unclassified_directory")
-        self.assertEqual(reviewed_baseline["source_kind"], "non_git")
+        self.assertEqual(reviewed_baseline["source_kind"], "git")
         self.assertIn("post_task_git_history", reviewed_baseline)
         self.assertFalse(reviewed_baseline["reviewed_override"])
 
         prepare_args = _args(self.root, kind="empty_directory")
-        prepare_args.created_by_claude = ["created.html"]
-        prepare_args.exclude_file = ["unrelated.txt"]
         prepare_args.confirm_file_selection = True
+        prepare_args.confirm_empty_beginning = True
         classified, file_selection = bakeoff._classified_baseline(
             prepare_args,
             baseline,
@@ -1558,6 +1718,7 @@ class LeanBakeoffTests(unittest.TestCase):
         args.created_by_claude = ["created.txt"]
         args.exclude_file = ["excluded.txt"]
         args.confirm_file_selection = True
+        args.confirm_empty_beginning = True
         with patches as values:
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
@@ -1565,6 +1726,14 @@ class LeanBakeoffTests(unittest.TestCase):
             prepared = bakeoff._command_prepare(args)
         self.assertEqual(prepared["status"], "ready_for_approval")
         self.assertEqual(prepared["configuration"]["baseline"]["kind"], "empty_directory")
+        self.assertEqual(
+            prepared["configuration"]["beginning_state"],
+            {"kind": "non_git", "commit": None},
+        )
+        self.assertEqual(
+            prepared["configuration"]["ending_state"],
+            {"kind": "non_git", "commit": None},
+        )
         self.assertTrue(
             prepared["configuration"]["user_decisions"]["empty_starting_directory_confirmed"]
         )
@@ -1587,14 +1756,20 @@ class LeanBakeoffTests(unittest.TestCase):
         selection = {
             "source_kind": "non_git",
             "complete": False,
+            "requires_empty_beginning_confirmation": True,
+            "empty_starting_directory_confirmed": False,
             "candidates": [{"path": "existing.txt"}],
             "unclassified_files": ["existing.txt"],
             "classifications": {},
         }
-        question = bakeoff._selection_questions(selection)[0]
-        self.assertIn("directory was empty before Claude", question["question"])
-        self.assertIn("stop", question["question"])
-        self.assertNotIn("existed_before_claude", question["classification_flags"])
+        questions = bakeoff._selection_questions(selection)
+        self.assertEqual(
+            [question["id"] for question in questions],
+            ["classify_non_git_files", "confirm_empty_beginning"],
+        )
+        self.assertIn("empty directory", questions[1]["question"])
+        self.assertIn("stop", questions[1]["question"])
+        self.assertNotIn("existed_before_claude", questions[0]["classification_flags"])
 
     def test_cli_has_prepare_but_no_resume_or_plan_commands(self) -> None:
         parser = bakeoff.build_parser()
@@ -1613,8 +1788,11 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertNotIn("--registered-baseline-project-id", baseline_options)
         self.assertNotIn("--modified-by-claude", baseline_options)
         self.assertNotIn("--before-file", baseline_options)
-        self.assertIn("--baseline-kind", baseline_options)
+        self.assertIn("--beginning-kind", baseline_options)
+        self.assertIn("--ending-kind", baseline_options)
         self.assertIn("--baseline-commit", baseline_options)
+        self.assertIn("--ending-commit", baseline_options)
+        self.assertIn("--confirm-empty-beginning", baseline_options)
         self.assertIn("--confirm-repository-selection", baseline_options)
         run_options = {
             option for action in choices["run"]._actions for option in action.option_strings

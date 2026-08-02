@@ -22,6 +22,7 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 PLUGIN_ROOT = SCRIPT_ROOT.parent
 DEFAULT_LEDGER = Path.home() / ".codex" / "external_agent_session_imports.json"
 DEFAULT_MODEL_CACHE = Path.home() / ".codex" / "models_cache.json"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_RUN_ROOT = Path.home() / ".cache" / "codex-bakeoff" / "runs"
 PRICING_PATH = PLUGIN_ROOT / "assets" / "model-pricing.json"
 MAX_TIMEOUT_SECONDS = 14_400
@@ -189,14 +190,9 @@ def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, An
         slug = item.get("slug")
         if (
             not isinstance(slug, str)
-            or not slug.startswith("gpt-")
             or item.get("visibility") != "list"
             or item.get("supported_in_api") is not True
             or item.get("upgrade")
-            or any(
-                marker in slug.casefold()
-                for marker in ("preview", "alpha", "beta", "experimental", "internal")
-            )
         ):
             continue
         options.append(
@@ -204,7 +200,7 @@ def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, An
                 "id": slug,
                 "label": str(item.get("display_name") or item.get("name") or slug),
                 "description": str(item.get("description") or ""),
-                "recommended": bool(item.get("is_default")),
+                "recommended": slug == DEFAULT_CODEX_MODEL,
             }
         )
     if options and not any(item["recommended"] for item in options):
@@ -553,12 +549,26 @@ def _with_historical_ending_commit(
     reviewed_ending_commit: str,
 ) -> dict[str, Any]:
     result = dict(baseline)
-    if result.get("kind") != "git_commit":
+    beginning_kind = result.get("beginning_kind")
+    if beginning_kind not in {"git", "non_git"}:
+        beginning_kind = "git" if result.get("kind") == "git_commit" else "non_git"
+    ending_kind = result.get("ending_kind")
+    if ending_kind not in {"git", "non_git"}:
+        ending_kind = (
+            "git"
+            if result.get("source_kind") == "git" or result.get("kind") == "git_commit"
+            else "non_git"
+        )
+    result.update({"beginning_kind": beginning_kind, "ending_kind": ending_kind})
+    if ending_kind != "git":
         return result
     repository = result.get("repository")
     starting_commit = result.get("commit")
-    if not isinstance(repository, str) or not isinstance(starting_commit, str):
+    if not isinstance(repository, str) or (
+        beginning_kind == "git" and not isinstance(starting_commit, str)
+    ):
         return result
+    baseline_kind = "git_commit" if beginning_kind == "git" else "empty_directory"
     recovery_replay = {
         **replay,
         "project_dir": repository,
@@ -567,10 +577,10 @@ def _with_historical_ending_commit(
     try:
         inferred = _discovery().recover_historical_solution(
             recovery_replay,
-            starting_commit,
-            baseline_kind="git_commit",
+            starting_commit if isinstance(starting_commit, str) else None,
+            baseline_kind=baseline_kind,
         )
-    except Exception as error:
+    except Exception:
         if not reviewed_ending_commit:
             return {
                 **result,
@@ -591,8 +601,8 @@ def _with_historical_ending_commit(
         try:
             recovery = _discovery().recover_historical_solution(
                 recovery_replay,
-                starting_commit,
-                baseline_kind="git_commit",
+                starting_commit if isinstance(starting_commit, str) else None,
+                baseline_kind=baseline_kind,
                 ending_commit=reviewed_ending_commit,
             )
         except Exception as error:
@@ -639,25 +649,42 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
             raise BakeoffError("The selected project root changed or is not a real directory.")
         inspected_replay["project_dir"] = str(selected_project)
         inspected_replay["project_dirs"] = [inspected_replay["project_dir"]]
-    manual_kind = getattr(args, "baseline_kind", None)
+    beginning_kind = getattr(args, "beginning_kind", None)
+    ending_kind = getattr(args, "ending_kind", None)
     manual_commit = str(getattr(args, "baseline_commit", "") or "").strip()
     manual_ending_commit = str(getattr(args, "ending_commit", "") or "").strip()
-    if manual_commit and manual_kind != "git_commit":
-        raise BakeoffError("Choose a Git-commit baseline for the reviewed commit.")
-    if manual_ending_commit and manual_kind != "git_commit":
-        raise BakeoffError("Choose a Git-commit baseline for the reviewed ending commit.")
+    if (beginning_kind is None) != (ending_kind is None):
+        raise BakeoffError("Choose both the beginning state and end state.")
+    if beginning_kind not in {None, "git", "non_git"}:
+        raise BakeoffError("Choose a Git or Non-Git beginning state.")
+    if ending_kind not in {None, "git", "non_git"}:
+        raise BakeoffError("Choose a Git or Non-Git end state.")
+    if beginning_kind == "git" and ending_kind == "non_git":
+        raise BakeoffError("A Git beginning state requires a Git end state.")
+    if beginning_kind == "git" and not manual_commit:
+        raise BakeoffError("Enter a valid historical Git commit.")
+    if beginning_kind == "non_git" and manual_commit:
+        raise BakeoffError("A Non-Git beginning state cannot have a Git commit.")
+    if manual_commit and beginning_kind != "git":
+        raise BakeoffError("Choose a Git beginning state for the reviewed commit.")
+    if ending_kind == "git" and not manual_ending_commit:
+        raise BakeoffError("Enter a valid historical ending Git commit.")
+    if ending_kind == "non_git" and manual_ending_commit:
+        raise BakeoffError("A Non-Git end state cannot have a Git commit.")
+    if manual_ending_commit and ending_kind != "git":
+        raise BakeoffError("Choose a Git end state for the reviewed ending commit.")
     inspection_failed = False
     try:
         inspected = _discovery().inspect_baseline(inspected_replay)
     except Exception as error:
-        if manual_kind is None:
+        if beginning_kind is None:
             raise BakeoffError(_redact(error)) from error
         inspection_failed = True
         inspected = {}
 
-    if manual_kind == "git_commit":
+    if beginning_kind == "git":
         if selected_project is None:
-            raise BakeoffError("Enter a replay repository for the reviewed Git baseline.")
+            raise BakeoffError("Enter a replay repository for the reviewed Git beginning state.")
         reviewed = _reviewed_git_baseline(
             selected_project,
             selected_project,
@@ -672,6 +699,8 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
         baseline = {
             **inspected,
             **reviewed,
+            "beginning_kind": "git",
+            "ending_kind": "git",
             "reviewed_override": inspection_failed or not (
                 inspected.get("kind") == "git_commit"
                 and str(inspected.get("commit") or "").lower() == reviewed["commit"]
@@ -683,29 +712,40 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
             manual_ending_commit,
         )
 
-    if manual_kind == "empty_directory":
-        if manual_commit or manual_ending_commit:
-            raise BakeoffError("An empty-directory baseline cannot have Git commits.")
+    if beginning_kind == "non_git":
         if selected_project is None:
-            raise BakeoffError("Enter a replay repository for the empty-directory baseline.")
-        if (
-            _git_root(selected_project) is not None
-            and not inspected.get("post_task_git_history")
-        ):
-            raise BakeoffError(
-                "A Git repository with commits cannot use an empty-directory baseline."
-            )
-        return {
+            raise BakeoffError("Enter a replay repository for the Non-Git beginning state.")
+        git_root = _git_root(selected_project)
+        if ending_kind == "git" and git_root is None:
+            raise BakeoffError("A Git end state requires an accessible Git repository.")
+        if ending_kind == "non_git" and git_root is not None:
+            raise BakeoffError("A Non-Git end state cannot point inside Git.")
+        baseline = {
             **inspected,
             "kind": "unclassified_directory",
             "proposed_kind": "empty_directory",
-            "repository": str(selected_project),
+            "repository": str(git_root or selected_project),
             "attribution_root": str(selected_project),
-            "source_kind": "non_git",
+            "source_kind": ending_kind,
+            "beginning_kind": "non_git",
+            "ending_kind": ending_kind,
             "commit": None,
             "confidence": "requires_user_classification",
-            "reviewed_override": inspection_failed,
+            "reviewed_override": inspection_failed
+            or not (
+                (ending_kind == "git" and inspected.get("post_task_git_history"))
+                or (ending_kind == "non_git" and _git_root(selected_project) is None)
+            ),
         }
+        return (
+            _with_historical_ending_commit(
+                inspected_replay,
+                baseline,
+                manual_ending_commit,
+            )
+            if ending_kind == "git"
+            else baseline
+        )
 
     raw_repository = args.repo or inspected.get("repository") or replay.get("project_dir")
     if not isinstance(raw_repository, (str, Path)) or not str(raw_repository).strip():
@@ -714,16 +754,19 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
     git_root = _git_root(repository)
     if git_root is not None:
         if inspected.get("post_task_git_history") and selected_project is not None:
-            return {
+            baseline = {
                 **inspected,
                 "kind": "unclassified_directory",
                 "commit": None,
-                "repository": str(selected_project),
+                "repository": str(git_root),
                 "attribution_root": str(selected_project),
-                "source_kind": "non_git",
+                "source_kind": "git",
+                "beginning_kind": "non_git",
+                "ending_kind": "git",
                 "confidence": "requires_user_classification",
-                "proposed_kind": None,
+                "proposed_kind": "empty_directory",
             }
+            return _with_historical_ending_commit(inspected_replay, baseline, "")
         attribution_root = selected_project or git_root
         if inspected.get("kind") != "git_commit" or not isinstance(inspected.get("commit"), str):
             return {
@@ -731,12 +774,16 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
                 "repository": str(git_root),
                 "attribution_root": str(attribution_root),
                 "source_kind": "git",
+                "beginning_kind": "git",
+                "ending_kind": "git",
             }
         baseline = {
             **inspected,
             "repository": str(git_root),
             "attribution_root": str(attribution_root),
             "source_kind": "git",
+            "beginning_kind": "git",
+            "ending_kind": "git",
         }
         return _with_historical_ending_commit(inspected_replay, baseline, "")
 
@@ -748,6 +795,8 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
             "repository": str(repository),
             "attribution_root": str(repository),
             "source_kind": "non_git",
+            "beginning_kind": "non_git",
+            "ending_kind": "non_git",
         }
     return {
         **inspected,
@@ -756,8 +805,10 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
         "repository": str(repository),
         "attribution_root": str(repository),
         "source_kind": "non_git",
+        "beginning_kind": "non_git",
+        "ending_kind": "non_git",
         "confidence": "requires_user_classification",
-        "proposed_kind": None,
+        "proposed_kind": "empty_directory",
     }
 
 
@@ -773,13 +824,13 @@ def _prompt(replay: Mapping[str, Any]) -> str:
     if not request:
         raise BakeoffError("The selected Claude thread has no replayable request.")
     return (
-        "Implement the complete original historical user conversation as one task. "
+        "Implement the reconstructed historical task as one task. "
         "Do not inspect or modify the original Claude output directory. "
         "Ignore the contents of memory_summary.md. "
         "Do not read memory files or invoke the codex-bakeoff skill. "
         "Do not run browser-control or browser-based end-to-end tests. Use non-browser validation only. "
-        "Implement only from the original request and current workspace. "
-        f"Original user requests:\n{request}"
+        "Implement only from the task prompt and current workspace. "
+        f"Task prompt:\n{request}"
     )
 
 
@@ -863,12 +914,36 @@ def _classified_baseline(
                 claude_output_files=(getattr(args, "claude_output_file", None) or ()),
                 confirmed=bool(getattr(args, "confirm_file_selection", False)),
             )
+            empty_beginning_required = baseline.get("beginning_kind") == "non_git"
+            empty_beginning_confirmed = bool(
+                getattr(args, "confirm_empty_beginning", False)
+            )
+            selection = {
+                **selection,
+                "requires_empty_beginning_confirmation": empty_beginning_required,
+                "empty_starting_directory_confirmed": (
+                    empty_beginning_required and empty_beginning_confirmed
+                ),
+                "complete": selection["complete"]
+                and (not empty_beginning_required or empty_beginning_confirmed),
+            }
+            classified_kind = (
+                "empty_directory"
+                if empty_beginning_required and empty_beginning_confirmed
+                else baseline.get("kind")
+            )
             return (
                 {
                     **baseline,
                     "repository": selection["source_root"],
                     "attribution_root": selection["attribution_root"],
+                    "kind": classified_kind,
                     "current_working_tree_state": selection["working_tree_state"],
+                    "confidence": (
+                        "user_confirmed_empty"
+                        if classified_kind == "empty_directory"
+                        else baseline.get("confidence")
+                    ),
                 },
                 selection,
             )
@@ -881,7 +956,9 @@ def _classified_baseline(
                 created_by_claude=(getattr(args, "created_by_claude", None) or ()),
                 exclude_files=(getattr(args, "exclude_file", None) or ()),
                 confirmed=bool(getattr(args, "confirm_file_selection", False)),
-                allow_git_with_commits=bool(baseline.get("post_task_git_history")),
+                empty_starting_directory_confirmed=bool(
+                    getattr(args, "confirm_empty_beginning", False)
+                ),
             )
             classified_kind = (
                 "empty_directory" if selection["complete"] else "unclassified_directory"
@@ -923,11 +1000,14 @@ def _classified_baseline(
 def _selection_questions(
     selection: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    if selection.get("complete") is True:
-        return []
+    questions: list[dict[str, Any]] = []
     source_kind = selection.get("source_kind")
-    if source_kind == "git":
-        return [
+    if (
+        source_kind == "git"
+        and selection.get("requires_confirmation") is True
+        and selection.get("confirmed") is not True
+    ):
+        questions.append(
             {
                 "id": "classify_git_working_tree",
                 "question": (
@@ -941,16 +1021,17 @@ def _selection_questions(
                 "changes": list(selection.get("candidates") or []),
                 "selected_changes": list(selection.get("claude_output_changes") or []),
             }
-        ]
-    if source_kind == "non_git":
-        return [
+        )
+    if source_kind == "non_git" and (
+        selection.get("confirmed") is not True
+        or bool(selection.get("unclassified_files"))
+    ):
+        questions.append(
             {
                 "id": "classify_non_git_files",
                 "question": (
                     "Classify every current file as Created by Claude or Exclude, "
-                    "then confirm the complete selection and that the directory "
-                    "was empty before Claude. If any file existed before Claude, "
-                    "stop: non-empty non-Git baselines are unsupported."
+                    "then confirm the complete end-state selection."
                 ),
                 "classification_flags": {
                     "created_by_claude": "--created-by-claude",
@@ -961,8 +1042,23 @@ def _selection_questions(
                 "unclassified_files": list(selection.get("unclassified_files") or []),
                 "classifications": dict(selection.get("classifications") or {}),
             }
-        ]
-    return []
+        )
+    if (
+        selection.get("requires_empty_beginning_confirmation") is True
+        and selection.get("empty_starting_directory_confirmed") is not True
+    ):
+        questions.append(
+            {
+                "id": "confirm_empty_beginning",
+                "question": (
+                    "Confirm that the Non-Git beginning state was an empty directory. "
+                    "If any file existed before Claude, stop: non-empty Non-Git "
+                    "beginning states are unsupported."
+                ),
+                "confirmation_flag": "--confirm-empty-beginning",
+            }
+        )
+    return questions
 
 
 def _blocking_reasons(
@@ -995,8 +1091,24 @@ def _configuration(
             "project": replay.get("project_dir"),
             "original_project": replay.get("original_project_dir"),
         },
+        "beginning_state": {
+            "kind": baseline.get("beginning_kind"),
+            "commit": (
+                baseline.get("commit") if baseline.get("beginning_kind") == "git" else None
+            ),
+        },
+        "ending_state": {
+            "kind": baseline.get("ending_kind"),
+            "commit": (
+                baseline.get("ending_commit")
+                if baseline.get("ending_kind") == "git"
+                else None
+            ),
+        },
         "baseline": {
             "kind": baseline.get("kind"),
+            "beginning_kind": baseline.get("beginning_kind"),
+            "ending_kind": baseline.get("ending_kind"),
             "proposed_kind": baseline.get("proposed_kind"),
             "repository": baseline.get("repository"),
             "attribution_root": baseline.get("attribution_root"),
@@ -1337,7 +1449,7 @@ def _historical_candidate(
                 baseline_kind=baseline.get("kind", "git_commit"),
                 ending_commit=(
                     baseline.get("ending_commit")
-                    if baseline.get("ending_commit_reviewed_override") is True
+                    if baseline.get("ending_kind") == "git"
                     else None
                 ),
             )
@@ -1378,7 +1490,12 @@ def _historical_candidate(
             try:
                 diff, changed = _file_selection().build_git_candidate_patch(
                     repository=repository,
-                    baseline_commit=str(baseline["commit"]),
+                    baseline_commit=(
+                        str(baseline["commit"])
+                        if isinstance(baseline.get("commit"), str)
+                        else None
+                    ),
+                    baseline_kind=str(baseline.get("kind") or "git_commit"),
                     recovered_patch=diff if isinstance(diff, str) else None,
                     selection=selection,
                 )
@@ -1973,9 +2090,14 @@ def _add_session(parser: argparse.ArgumentParser) -> None:
 def _add_baseline(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", type=Path)
     parser.add_argument(
-        "--baseline-kind",
-        choices=("git_commit", "empty_directory"),
-        help="Use an explicitly reviewed historical baseline type.",
+        "--beginning-kind",
+        choices=("git", "non_git"),
+        help="Use an explicitly reviewed Git or Non-Git beginning state.",
+    )
+    parser.add_argument(
+        "--ending-kind",
+        choices=("git", "non_git"),
+        help="Use an explicitly reviewed Git or Non-Git end state.",
     )
     parser.add_argument(
         "--baseline-commit",
@@ -1984,6 +2106,11 @@ def _add_baseline(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ending-commit",
         help="Use an explicitly reviewed historical ending Git commit.",
+    )
+    parser.add_argument(
+        "--confirm-empty-beginning",
+        action="store_true",
+        help="Confirm that the Non-Git beginning state was an empty directory.",
     )
     parser.add_argument(
         "--confirm-repository-selection",
@@ -2012,9 +2139,8 @@ def _add_baseline(parser: argparse.ArgumentParser) -> None:
         "--confirm-file-selection",
         action="store_true",
         help=(
-            "Confirm the complete Git working-tree selection or non-Git file "
-            "classification. For non-Git, this also confirms the directory was "
-            "empty before Claude."
+            "Confirm the complete Git working-tree selection or Non-Git end-state "
+            "file classification."
         ),
     )
 

@@ -198,6 +198,10 @@ INTERRUPTION_PLACEHOLDER = re.compile(
     r"\s*\.?\s*\]\s*\Z",
     re.IGNORECASE,
 )
+CLARIFICATION_OPTION_LINE = re.compile(r"\s*(?:[-*•]|\d+[.)]|[A-Za-z][.)])\s+\S")
+MAX_PROMPT_RECONSTRUCTION_TURNS = 256
+MAX_PROMPT_RECONSTRUCTION_TURN_CHARS = 12_000
+MAX_PROMPT_RECONSTRUCTION_CHARS = 256_000
 CLAUDE_PROJECT_SKILL_PATH = re.compile(
     r"(?<![A-Za-z0-9_.-])\.claude[\\/]skills[\\/]"
     r"(?P<name>[^\\/\s'\"`]+)(?:[\\/]SKILL\.md)?",
@@ -309,6 +313,164 @@ def _visible_message_text(event: dict[str, Any]) -> str:
         and isinstance(block.get("text"), str)
         and block["text"].strip()
     )
+
+
+def _assistant_clarification_text(value: str) -> str:
+    """Extract question context without carrying unrelated assistant output."""
+
+    lines = value.splitlines()
+    question_lines = [index for index, line in enumerate(lines) if "?" in line]
+    if not question_lines:
+        return ""
+    start = question_lines[0]
+    end = question_lines[-1] + 1
+    while end < len(lines):
+        line = lines[end]
+        if not line.strip():
+            next_index = end + 1
+            while next_index < len(lines) and not lines[next_index].strip():
+                next_index += 1
+            if (
+                next_index < len(lines)
+                and CLARIFICATION_OPTION_LINE.fullmatch(lines[next_index]) is not None
+            ):
+                end = next_index
+                continue
+            break
+        if CLARIFICATION_OPTION_LINE.fullmatch(line) is None:
+            break
+        end += 1
+    return "\n".join(lines[start:end]).strip()
+
+
+def _ask_user_question_text(block: dict[str, Any]) -> str:
+    arguments = block.get("input")
+    if not isinstance(arguments, dict):
+        return ""
+    questions = arguments.get("questions")
+    if not isinstance(questions, list):
+        return ""
+    rendered: list[str] = []
+    for raw_question in questions:
+        if not isinstance(raw_question, dict):
+            continue
+        question = raw_question.get("question")
+        if not isinstance(question, str) or not question.strip():
+            continue
+        rendered.append(question.strip())
+        options = raw_question.get("options")
+        if not isinstance(options, list):
+            continue
+        for index, raw_option in enumerate(options, start=1):
+            if not isinstance(raw_option, dict):
+                continue
+            label = raw_option.get("label")
+            if not isinstance(label, str) or not label.strip():
+                continue
+            description = raw_option.get("description")
+            suffix = (
+                f" — {description.strip()}"
+                if isinstance(description, str) and description.strip()
+                else ""
+            )
+            rendered.append(f"{index}. {label.strip()}{suffix}")
+    return "\n".join(rendered)
+
+
+def _ask_user_answer_text(event: dict[str, Any]) -> str:
+    result = event.get("toolUseResult")
+    if not isinstance(result, dict):
+        return ""
+    answers = result.get("answers")
+    if not isinstance(answers, dict):
+        return ""
+    return "\n".join(
+        f"{question}: {answer}"
+        for question, answer in answers.items()
+        if isinstance(question, str)
+        and question.strip()
+        and isinstance(answer, str)
+        and answer.strip()
+    )
+
+
+def _prompt_reconstruction_turns(
+    source_path: Path,
+    message_uuid: str,
+    *,
+    whole_thread: bool,
+) -> tuple[list[dict[str, str]], bool]:
+    """Return bounded user turns and clarification context for prompt synthesis."""
+
+    turns: list[dict[str, str]] = []
+    total_chars = 0
+    truncated = False
+    pending_clarification = ""
+
+    def append_turn(role: str, text: str) -> bool:
+        nonlocal total_chars, truncated
+        normalized = text.strip()
+        if not normalized:
+            return True
+        if len(turns) >= MAX_PROMPT_RECONSTRUCTION_TURNS:
+            truncated = True
+            return False
+        remaining = MAX_PROMPT_RECONSTRUCTION_CHARS - total_chars
+        allowed = min(MAX_PROMPT_RECONSTRUCTION_TURN_CHARS, remaining)
+        if allowed <= 0:
+            truncated = True
+            return False
+        if len(normalized) > allowed:
+            normalized = normalized[:allowed]
+            truncated = True
+        turns.append({"role": role, "text": normalized})
+        total_chars += len(normalized)
+        return not truncated
+
+    for event in _task_events(
+        source_path,
+        message_uuid,
+        whole_thread=whole_thread,
+    ):
+        if _is_actionable_user_event(event):
+            if pending_clarification and not append_turn("assistant", pending_clarification):
+                break
+            pending_clarification = ""
+            if not append_turn("user", _visible_message_text(event)):
+                break
+            continue
+
+        if event.get("type") == "assistant":
+            if event.get("isMeta") or event.get("isSidechain") or event.get("isCompactSummary"):
+                continue
+            question_blocks = [
+                block
+                for block in _tool_blocks(event)
+                if block.get("name") == "AskUserQuestion"
+            ]
+            if question_blocks:
+                pending_clarification = ""
+                for block in question_blocks:
+                    if not append_turn("assistant", _ask_user_question_text(block)):
+                        break
+                if truncated:
+                    break
+                continue
+            visible = _visible_message_text(event)
+            if visible.strip():
+                pending_clarification = _assistant_clarification_text(visible)
+            elif any(True for _ in _tool_blocks(event)):
+                pending_clarification = ""
+            continue
+
+        if event.get("type") == "user" and (
+            event.get("sourceToolAssistantUUID") or event.get("sourceToolUseID")
+        ):
+            answer = _ask_user_answer_text(event)
+            if answer and not append_turn("user", answer):
+                break
+
+    return turns, truncated
 
 
 def _is_actionable_user_event(event: dict[str, Any]) -> bool:
@@ -1377,6 +1539,11 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
     )
     connector_names = observations["observed_connector_names"]
     configured_connector_names = _string_list(session.get("connector_names"))
+    reconstruction_turns, reconstruction_truncated = _prompt_reconstruction_turns(
+        source_path,
+        message_uuid,
+        whole_thread=whole_thread,
+    )
     replay = {
         "session_id": session.get("session_id", selected_event.get("sessionId", source_path.stem)),
         "imported_thread_id": session.get("imported_thread_id"),
@@ -1389,6 +1556,8 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
         "project_dir": project_dir,
         "project_dirs": project_dirs,
         "preceding_context": [] if whole_thread else list(preceding_context),
+        "prompt_reconstruction_turns": reconstruction_turns,
+        "prompt_reconstruction_truncated": reconstruction_truncated,
         "claude_model": observations["claude_model"] or session.get("claude_model"),
         "observed_tools": observations["observed_tools"],
         "observed_skills": observations["observed_skills"],
@@ -1873,13 +2042,18 @@ def _historical_working_tree(
     return main_evidence
 
 
-def _git_capture(repo: Path, *arguments: str) -> tuple[bool, str]:
+def _git_capture(
+    repo: Path,
+    *arguments: str,
+    input_text: str | None = None,
+) -> tuple[bool, str]:
     try:
         completed = subprocess.run(
             ["git", "-C", str(repo), *arguments],
             check=False,
             capture_output=True,
             text=True,
+            input=input_text,
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -1890,6 +2064,58 @@ def _git_capture(repo: Path, *arguments: str) -> tuple[bool, str]:
             _redact(completed.stderr.strip() or completed.stdout.strip())[:1000],
         )
     return True, completed.stdout
+
+
+def _empty_git_tree(repo: Path) -> str | None:
+    ok, output = _git_capture(repo, "mktree", input_text="")
+    tree = output.strip()
+    return tree if ok and re.fullmatch(r"[a-fA-F0-9]{40,64}", tree) else None
+
+
+def _solution_from_empty_tree(
+    repo: Path,
+    raw_commit: str,
+    *,
+    provenance: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any] | None:
+    ok, commit_output = _git_capture(
+        repo,
+        "rev-parse",
+        "--verify",
+        f"{raw_commit}^{{commit}}",
+    )
+    commit = commit_output.strip()
+    empty_tree = _empty_git_tree(repo)
+    if (
+        not ok
+        or re.fullmatch(r"[a-fA-F0-9]{40,64}", commit) is None
+        or empty_tree is None
+    ):
+        return None
+    ok, diff = _git_capture(
+        repo,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        f"{empty_tree}..{commit}",
+    )
+    if not ok:
+        return None
+    names_ok, names = _git_capture(
+        repo,
+        "diff",
+        "--name-only",
+        "--no-ext-diff",
+        f"{empty_tree}..{commit}",
+    )
+    return {
+        "provenance": provenance,
+        "commit": commit,
+        "diff": diff,
+        "changed_files": [line for line in names.splitlines() if line] if names_ok else [],
+        "evidence": [{**evidence, "commit": commit, "empty_tree_baseline": True}],
+    }
 
 
 def inspect_baseline(replay_spec: dict[str, Any]) -> dict[str, Any]:
@@ -2314,8 +2540,23 @@ def recover_historical_solution(
     else:
         result["baseline_commit"] = None
 
-    if baseline_kind == "git_commit" and ending_commit is not None:
+    if ending_commit is not None:
         raw_ending = ending_commit.strip()
+        if baseline_kind == "empty_directory":
+            captured = _solution_from_empty_tree(
+                repo,
+                raw_ending,
+                provenance="user_reviewed_git_commit",
+                evidence={"source": "reviewed_historical_ending_commit"},
+            )
+            if captured is None:
+                result["limitations"].append(
+                    "The reviewed historical ending commit is not available in the selected repository."
+                )
+                return result
+            result.update(captured)
+            return result
+
         ok, commit_output = _git_capture(
             repo,
             "rev-parse",
@@ -2448,6 +2689,21 @@ def recover_historical_solution(
         return result
 
     if baseline_kind == "empty_directory":
+        for candidate, command, timestamp in reversed(commit_candidates):
+            captured = _solution_from_empty_tree(
+                repo,
+                candidate,
+                provenance="attributed_git_commit",
+                evidence={
+                    "source": "selected_task_git_commit_tool_result",
+                    "source_path": raw_source,
+                    "timestamp": timestamp,
+                    "command": _compact(command, limit=500),
+                },
+            )
+            if captured is not None:
+                result.update(captured)
+                return result
         if not file_operations:
             result["limitations"].append(
                 "No reconstructable structured file writes were observed for the empty-directory task."

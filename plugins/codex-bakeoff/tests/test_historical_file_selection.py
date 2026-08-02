@@ -178,6 +178,60 @@ class HistoricalFileSelectionTests(unittest.TestCase):
         )
         self.assertEqual(set(changed), {"created.txt", "kept.txt", "override.txt"})
 
+    def test_selected_git_files_overlay_non_git_beginning(self) -> None:
+        repository = self.root / "repo"
+        _repository(repository)
+        (repository / "kept.txt").write_text("committed kept\n", encoding="utf-8")
+        (repository / "override.txt").write_text("committed override\n", encoding="utf-8")
+        (repository / "deleted.txt").write_text("committed delete\n", encoding="utf-8")
+        _git(repository, "add", ".")
+        _git(repository, "commit", "--quiet", "-m", "historical result")
+        ending = _git(repository, "rev-parse", "HEAD").strip()
+        empty_tree = _git(repository, "mktree", input_text="").strip()
+        recovered = _git(
+            repository,
+            "diff",
+            "--binary",
+            f"{empty_tree}..{ending}",
+        )
+        (repository / "override.txt").write_text("selected override\n", encoding="utf-8")
+        (repository / "created.txt").write_text("selected new\n", encoding="utf-8")
+        (repository / "unselected.txt").write_text("local only\n", encoding="utf-8")
+        (repository / "deleted.txt").unlink()
+        chosen = selection.select_git(
+            repository,
+            claude_output_files=("override.txt", "created.txt", "deleted.txt"),
+            confirmed=True,
+        )
+
+        patch, changed = selection.build_git_candidate_patch(
+            repository=repository,
+            baseline_commit=None,
+            baseline_kind="empty_directory",
+            recovered_patch=recovered,
+            selection=chosen,
+        )
+        candidate = self.root / "candidate"
+        _repository(candidate)
+        _git(candidate, "commit", "--quiet", "--allow-empty", "-m", "empty")
+        _git(candidate, "apply", "--binary", "-", input_text=patch)
+
+        self.assertEqual(
+            (candidate / "kept.txt").read_text(encoding="utf-8"),
+            "committed kept\n",
+        )
+        self.assertEqual(
+            (candidate / "override.txt").read_text(encoding="utf-8"),
+            "selected override\n",
+        )
+        self.assertEqual(
+            (candidate / "created.txt").read_text(encoding="utf-8"),
+            "selected new\n",
+        )
+        self.assertFalse((candidate / "deleted.txt").exists())
+        self.assertFalse((candidate / "unselected.txt").exists())
+        self.assertEqual(set(changed), {"created.txt", "kept.txt", "override.txt"})
+
     def test_selected_git_rename_is_one_change_unit(self) -> None:
         repository = self.root / "repo"
         _repository(repository)
@@ -322,6 +376,29 @@ class HistoricalFileSelectionTests(unittest.TestCase):
             set(complete["classifications"]),
             {"created_by_claude", "exclude"},
         )
+
+    def test_non_git_empty_beginning_confirmation_is_independent(self) -> None:
+        directory = self.root / "directory"
+        directory.mkdir()
+        (directory / "created.txt").write_text("created\n", encoding="utf-8")
+
+        unconfirmed = selection.select_directory(
+            directory,
+            created_by_claude=("created.txt",),
+            confirmed=True,
+            empty_starting_directory_confirmed=False,
+        )
+        confirmed = selection.select_directory(
+            directory,
+            created_by_claude=("created.txt",),
+            confirmed=True,
+            empty_starting_directory_confirmed=True,
+        )
+
+        self.assertFalse(unconfirmed["complete"])
+        self.assertFalse(unconfirmed["empty_starting_directory_confirmed"])
+        self.assertTrue(confirmed["complete"])
+        self.assertTrue(confirmed["empty_starting_directory_confirmed"])
 
     def test_git_repository_without_commits_can_use_directory_classification(
         self,
