@@ -95,6 +95,7 @@ class McpServerTests(unittest.TestCase):
         )
         launcher = tools[0]
         self.assertIn("external browser", launcher["description"])
+        self.assertIn("codex_cli_path", launcher["inputSchema"]["properties"])
         self.assertNotIn("ui", launcher["_meta"])
         self.assertNotIn("ui/resourceUri", launcher["_meta"])
         self.assertNotIn("openai/outputTemplate", launcher["_meta"])
@@ -161,6 +162,44 @@ class McpServerTests(unittest.TestCase):
             result["structuredContent"]["origin"],
             "http://127.0.0.1:43117",
         )
+
+    def test_launcher_carries_invoking_task_codex_path_to_worker(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex = root / "codex"
+            codex.touch()
+            codex.chmod(0o700)
+            hint_path = root / "codex-cli-path.json"
+            with (
+                mock.patch.object(server, "CODEX_CLI_PATH_HINT_PATH", hint_path),
+                mock.patch.object(
+                    server,
+                    "_ensure_controller_daemon",
+                    return_value=(43117, {"version": "test-version"}),
+                ),
+                mock.patch.object(
+                    server,
+                    "_request_browser_login",
+                    return_value="http://127.0.0.1:43117/auth?token=secret",
+                ),
+                mock.patch.object(server.webbrowser, "open", return_value=True),
+            ):
+                result = server._call_tool(
+                    {
+                        "name": "open_controller",
+                        "arguments": {"codex_cli_path": str(codex)},
+                    }
+                )
+                with mock.patch.dict(os.environ, {"PATH": ""}, clear=True):
+                    worker_environment = server._worker_environment()
+
+            self.assertTrue(result["structuredContent"]["opened"])
+            self.assertEqual(worker_environment["CODEX_CLI_PATH"], str(codex.resolve()))
+            self.assertEqual(
+                json.loads(hint_path.read_text(encoding="utf-8"))["path"],
+                str(codex.resolve()),
+            )
 
     def test_port_conflict_requests_confirmation_without_stopping_process(self) -> None:
         server = load_server()

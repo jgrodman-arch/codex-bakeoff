@@ -50,6 +50,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("controller owns", flat.lower())
         self.assertIn("After the tool confirms the external browser opened, stop", flat)
         self.assertIn("stop_port_process_and_open_controller", text)
+        self.assertIn("command -v codex", text)
+        self.assertIn("codex_cli_path", text)
         self.assertIn("Pause until the user explicitly confirms", flat)
         self.assertNotIn("RUNNER", text)
         self.assertNotIn("--approve", text)

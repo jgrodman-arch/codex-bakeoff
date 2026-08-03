@@ -49,6 +49,7 @@ CONTROLLER_CACHE_ROOT = RUN_ROOT.parent
 CONTROLLER_RUNTIME_PATH = CONTROLLER_CACHE_ROOT / "controller-server.json"
 CONTROLLER_LOCK_PATH = CONTROLLER_CACHE_ROOT / "controller-server.lock"
 CONTROLLER_LOG_PATH = CONTROLLER_CACHE_ROOT / "controller-server.log"
+CODEX_CLI_PATH_HINT_PATH = CONTROLLER_CACHE_ROOT / "codex-cli-path.json"
 CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1"
 CONTROLLER_INSTANCE_STORAGE_KEY = "codex-bakeoff.controller-instance.v1"
 CONTROLLER_SESSION_HEADER = "X-Codex-Bakeoff-Session"
@@ -301,7 +302,14 @@ def tool_definitions() -> list[dict[str, Any]]:
             "open_controller",
             f"Open {APP_TITLE}",
             "Open the interactive bakeoff controller in the default external browser.",
-            _object_schema({}),
+            _object_schema(
+                {
+                    "codex_cli_path": {
+                        "type": "string",
+                        "description": "Absolute Codex executable path resolved by the invoking task.",
+                    },
+                }
+            ),
             read_only=True,
             idempotent=False,
         ),
@@ -654,6 +662,45 @@ def _spawn_controller_daemon() -> subprocess.Popen[bytes]:
         )
 
 
+def _remember_codex_cli_path_hint(value: Any) -> None:
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise ControllerError("The Codex executable path is invalid.")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise ControllerError("The Codex executable path must be absolute.")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ControllerError("The supplied Codex executable does not exist.") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ControllerError("The supplied Codex executable is not executable.")
+    CONTROLLER_CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_private_json(CODEX_CLI_PATH_HINT_PATH, {"path": str(resolved)})
+
+
+def _codex_cli_path_hint() -> str | None:
+    try:
+        payload = json.loads(CODEX_CLI_PATH_HINT_PATH.read_text(encoding="utf-8"))
+        value = payload.get("path") if isinstance(payload, Mapping) else None
+        if not isinstance(value, str):
+            return None
+        candidate = Path(value)
+        if candidate.is_absolute() and candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _worker_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    if not environment.get("CODEX_CLI_PATH"):
+        hinted = _codex_cli_path_hint()
+        if hinted is not None:
+            environment["CODEX_CLI_PATH"] = hinted
+    return environment
+
+
 def _ensure_controller_daemon(
     *,
     confirmation_token: str | None = None,
@@ -718,7 +765,10 @@ def _request_browser_login(port: int) -> str:
 def _open_external_controller(
     *,
     confirmation_token: str | None = None,
+    codex_cli_path: Any = None,
 ) -> dict[str, Any]:
+    if codex_cli_path is not None:
+        _remember_codex_cli_path_hint(codex_cli_path)
     try:
         port, health = _ensure_controller_daemon(
             confirmation_token=confirmation_token,
@@ -1232,6 +1282,7 @@ def _run_process(
     stream_log_path: Path | None = None,
     stream_log_label: str = "process",
     run_id: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     with _active_processes_lock:
         cancellation = _run_cancellations.get(run_id) if run_id is not None else None
@@ -1245,6 +1296,7 @@ def _run_process(
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
+            env=dict(env) if env is not None else None,
         )
         _active_processes.add(process)
         if cancellation is not None and run_id is not None:
@@ -1933,6 +1985,7 @@ def _run_worker(
         stream_log_path=_run_log_path(run_directory),
         stream_log_label=log_label,
         run_id=run_directory.name,
+        env=_worker_environment(),
     )
     records: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
@@ -2854,7 +2907,7 @@ def _call_tool(params: Any) -> dict[str, Any]:
         runtime_error = _python_runtime_error_result()
         if runtime_error is not None:
             return runtime_error
-        return _open_external_controller()
+        return _open_external_controller(codex_cli_path=arguments.get("codex_cli_path"))
     if name == "stop_port_process_and_open_controller":
         runtime_error = _python_runtime_error_result()
         if runtime_error is not None:
