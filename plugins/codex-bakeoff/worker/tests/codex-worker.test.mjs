@@ -277,9 +277,8 @@ test("built JSONL worker executes one SDK run and returns the observed result", 
   const serialized = JSON.stringify(messages);
   assert.doesNotMatch(serialized, /fixture-secret-command|fixture-secret-output/);
   const cliArgs = JSON.parse(await readFile(fixture.argsPath, "utf8"));
-  assert.deepEqual(cliArgs.slice(0, 3), [
+  assert.deepEqual(cliArgs.slice(0, 2), [
     "exec",
-    "--ignore-user-config",
     "--ignore-rules"
   ]);
 });

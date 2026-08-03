@@ -941,7 +941,6 @@ function startCodexCliWrapper() {
   }
   const args = [
     "exec",
-    "--ignore-user-config",
     "--ignore-rules",
     ...originalArgs.slice(1)
   ];
