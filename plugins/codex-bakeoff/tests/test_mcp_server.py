@@ -545,7 +545,6 @@ class McpServerTests(unittest.TestCase):
             "model",
             "timeoutSeconds",
             "classifications",
-            "emptyBeginningConfirmed",
             "reviewDraft",
         ):
             self.assertIn(field, snapshot)
@@ -559,7 +558,7 @@ class McpServerTests(unittest.TestCase):
         self.assertIn('id: "results"', steps)
 
         configure = controller.split("function renderConfigureStep()", 1)[1].split(
-            "function reviewItem", 1
+            "function normalizedPhases", 1
         )[0]
         self.assertIn("Original Claude thread ID", configure)
         self.assertIn('id="original-thread"', configure)
@@ -568,6 +567,16 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("1. Beginning state", configure)
         self.assertIn("2. End state", configure)
         self.assertIn("Starting commit", configure)
+        self.assertNotIn("empty-beginning-confirmation", configure)
+        self.assertNotIn("I confirmed the directory was empty", configure)
+        self.assertIn(
+            'confirm_empty_beginning: draft.beginning_kind === "non_git"',
+            controller,
+        )
+        self.assertIn(
+            "gitEnding && !draft.ending_commit.trim()",
+            configure,
+        )
         self.assertIn("Ending commit", configure)
         self.assertIn('id="review-ending-commit"', configure)
         self.assertIn("Uncommitted files from this run", configure)
@@ -579,6 +588,22 @@ class McpServerTests(unittest.TestCase):
         )
         self.assertIn('data-action="approve-configuration"', configure)
         self.assertIn("Checking configuration", configure)
+
+        diagnostics = controller.split("function inspectionDiagnostics()", 1)[1].split(
+            "function reviewDraftFromConfiguration", 1
+        )[0]
+        self.assertIn("repositoryBlockers", diagnostics)
+        self.assertIn("!repositoryBlockers.has(item)", diagnostics)
+
+        rail = controller.split("function renderRail()", 1)[1].split(
+            "function renderDiagnostics", 1
+        )[0]
+        self.assertIn('step.id === "run"', rail)
+        self.assertIn("Complete required fields before starting", rail)
+        self.assertIn('class="step-tooltip" role="tooltip"', rail)
+        self.assertIn("Reconstructing task prompt", configure)
+        self.assertIn('requestMethod === "pending"', configure)
+        self.assertNotIn('requestMethod === "pending" ? "disabled"', configure)
         self.assertNotIn("Validate configuration", controller)
         self.assertNotIn("Choose a baseline", controller)
         self.assertNotIn("Source transcript path", controller)
@@ -591,6 +616,8 @@ class McpServerTests(unittest.TestCase):
         self.assertNotIn('id="review-thread"', controller)
         self.assertNotIn('id="review-source-path"', controller)
         self.assertNotIn("function renderReviewStep", controller)
+        self.assertNotIn('id="approval-dialog"', controller)
+        self.assertNotIn('id="approval-check"', controller)
 
         prepare_run = controller.split("async function prepareRun()", 1)[1].split(
             "async function startRun", 1
@@ -599,7 +626,8 @@ class McpServerTests(unittest.TestCase):
         self.assertIn('callTool("prepare_run", configuration)', prepare_run)
         self.assertIn("reviewRevision !== state.reviewRevision", prepare_run)
         self.assertIn('state.step !== "configure"', prepare_run)
-        self.assertIn("dialog.showModal()", prepare_run)
+        self.assertIn("if (shouldStart) await startRun()", prepare_run)
+        self.assertNotIn("showModal", prepare_run)
         self.assertIn("approvedConfiguration()", controller)
 
         start_run = controller.split("async function startRun()", 1)[1].split(
@@ -614,9 +642,15 @@ class McpServerTests(unittest.TestCase):
             start_run.index("clearDraft()"),
             start_run.index('callTool("start_run"'),
         )
+        self.assertNotIn("approvalChecked", start_run)
         select_thread = controller.split("async function selectThread", 1)[1].split(
             "async function prepareRun", 1
         )[0]
+        self.assertIn("if (state.busy || state.run) return", select_thread)
+        self.assertIn(
+            'shouldSynthesize = state.promptGeneration === "pending"',
+            select_thread,
+        )
         self.assertIn("state.reviewDraft = reviewDraftFromConfiguration()", select_thread)
         self.assertLess(
             select_thread.index("state.classifications = Object.create(null)"),
@@ -625,7 +659,55 @@ class McpServerTests(unittest.TestCase):
         navigation = controller.split("function canNavigateTo", 1)[1].split(
             "function renderRail", 1
         )[0]
-        self.assertIn("if (state.busy) return false", navigation)
+        self.assertIn("if (state.busy && !state.run) return false", navigation)
+        self.assertNotIn("return id === \"run\"", navigation)
+
+        click_handler = controller.split('app.addEventListener("click"', 1)[1].split(
+            'app.addEventListener("input"', 1
+        )[0]
+        go_step = click_handler.split('if (action === "go-step")', 1)[1]
+        self.assertNotIn("pollGeneration", go_step)
+
+        thread_step = controller.split("function renderThreadStep", 1)[1].split(
+            "function capabilityRows", 1
+        )[0]
+        self.assertIn("Inspecting", thread_step)
+        self.assertIn("state.busy === \"inspection\"", thread_step)
+        self.assertIn("state.run ? \"disabled\"", thread_step)
+        self.assertIn("Start another bakeoff", thread_step)
+
+        synthesis = controller.split("async function synthesizePrompt", 1)[1].split(
+            "function resetController", 1
+        )[0]
+        self.assertIn('callTool("synthesize_request"', synthesis)
+        self.assertIn("thread_id: threadIdValue", synthesis)
+        self.assertIn("state.promptEditRevision === editRevision", synthesis)
+        self.assertIn("text(state.reviewDraft?.request) === fallbackRequest", synthesis)
+        review_problems = controller.split("function reviewProblems", 1)[1].split(
+            "function invalidateReviewPreparation", 1
+        )[0]
+        self.assertNotIn("Wait for task prompt reconstruction to finish", review_problems)
+        prepare_run = controller.split("async function prepareRun", 1)[1].split(
+            "async function startRun", 1
+        )[0]
+        self.assertIn('state.promptGeneration === "pending"', prepare_run)
+        self.assertIn("state.promptSynthesisGeneration += 1", prepare_run)
+        configure = controller.split("function renderConfigureStep", 1)[1].split(
+            "function normalizedPhases", 1
+        )[0]
+        self.assertNotIn('requestMethod === "pending" ? "disabled"', configure)
+
+        initializer = controller.split("async function initialize()", 1)[1].split(
+            "async function selectThread", 1
+        )[0]
+        self.assertIn('state.promptGeneration === "pending"', initializer)
+
+        run_step = controller.split("function renderRunStep", 1)[1].split(
+            "function reportParts", 1
+        )[0]
+        self.assertIn("const runLog = text(run.run_log)", run_step)
+        self.assertIn('id="run-log"', run_step)
+        self.assertIn("Retained", run_step)
 
     def test_controller_shows_capability_status_and_optional_guidance(self) -> None:
         controller = CONTROLLER_PATH.read_text(encoding="utf-8")
@@ -633,7 +715,7 @@ class McpServerTests(unittest.TestCase):
             "function fileMetadata", 1
         )[0]
         configure = controller.split("function renderConfigureStep", 1)[1].split(
-            "function reviewItem", 1
+            "function normalizedPhases", 1
         )[0]
 
         self.assertIn("titleCase(record.status)", capability_rows)
@@ -720,7 +802,7 @@ class McpServerTests(unittest.TestCase):
             ["thread", "baseline"],
         )
 
-    def test_inspection_synthesizes_reconstructed_request_in_read_only_workspace(self) -> None:
+    def test_inspection_returns_pending_without_running_synthesis_worker(self) -> None:
         server = load_server()
         turns = [
             {"role": "user", "text": "add hello world"},
@@ -730,123 +812,55 @@ class McpServerTests(unittest.TestCase):
             },
             {"role": "user", "text": "3"},
         ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript = root / "transcript.jsonl"
+            transcript.write_text("source transcript", encoding="utf-8")
 
-        def fake_engine(command: str, arguments=()):
-            if command == "replay":
-                return {
-                    "replay": {
-                        "imported_thread_id": "thread-1",
-                        "request": "add hello world\n\n3",
-                        "prompt_reconstruction_turns": turns,
-                        "prompt_reconstruction_truncated": False,
+            def fake_engine(command: str, arguments=()):
+                if command == "replay":
+                    return {
+                        "replay": {
+                            "imported_thread_id": "thread-1",
+                            "source_path": str(transcript),
+                            "request": "add hello world\n\n3",
+                            "prompt_reconstruction_turns": turns,
+                            "prompt_reconstruction_truncated": False,
+                        }
                     }
-                }
-            if command == "capabilities":
-                return {"items": []}
-            if command == "baseline":
-                return {}
-            if command == "models":
-                return {"options": [{"id": "gpt-5.6-sol"}, {"id": "gpt-test"}]}
-            raise AssertionError(command)
+                if command in {"capabilities", "baseline"}:
+                    return {}
+                if command == "models":
+                    return {"options": [{"id": "gpt-5.6-terra"}]}
+                raise AssertionError(command)
 
-        def fake_worker(
-            request,
-            *,
-            run_directory,
-            working_directory,
-            read_only,
-            log_label,
-        ):
-            self.assertEqual(request["model"], "gpt-5.6-sol")
-            self.assertEqual(request["expected_schema"], server.REQUEST_SYNTHESIS_SCHEMA)
-            self.assertEqual(request["timeout_seconds"], 180)
-            self.assertIn(json.dumps(turns, ensure_ascii=False), request["prompt"])
-            self.assertTrue(read_only)
-            self.assertEqual(run_directory, working_directory)
-            self.assertTrue(working_directory.is_dir())
-            self.assertEqual(log_label, "prompt-synthesis")
-            return {
-                "finalResponse": json.dumps(
-                    {"request": "Add a simple hello world program to the project."}
-                )
-            }
+            with (
+                mock.patch.object(server, "REQUEST_SYNTHESIS_CACHE_PATH", root / "cache.json"),
+                mock.patch.object(server, "_engine", side_effect=fake_engine),
+                mock.patch.object(server, "_run_worker") as worker,
+            ):
+                inspected = server._inspect_thread({"thread_id": "thread-1"})
 
-        with (
-            mock.patch.object(server, "_engine", side_effect=fake_engine),
-            mock.patch.object(server, "_run_worker", side_effect=fake_worker),
-        ):
-            inspected = server._inspect_thread({"thread_id": "thread-1"})
-
-        self.assertEqual(
-            inspected["replay"]["request"],
-            "Add a simple hello world program to the project.",
-        )
-        self.assertEqual(
-            inspected["replay"]["request_generation"],
-            {"method": "llm_synthesis", "model": "gpt-5.6-sol"},
-        )
+        worker.assert_not_called()
+        self.assertEqual(inspected["replay"]["request"], "add hello world\n\n3")
+        self.assertEqual(inspected["replay"]["request_generation"], {"method": "pending"})
         for record in (inspected["thread"], inspected["replay"]):
             self.assertNotIn("prompt_reconstruction_turns", record)
             self.assertNotIn("prompt_reconstruction_truncated", record)
 
-    def test_inspection_keeps_exact_concatenation_when_synthesis_fails(self) -> None:
+    def test_single_user_prompt_skips_synthesis(self) -> None:
         server = load_server()
-        fallback = "add hello world\n\n3"
+        direct_request = "Generate a concise morning brief."
 
         def fake_engine(command: str, arguments=()):
             if command == "replay":
                 return {
                     "replay": {
                         "imported_thread_id": "thread-1",
-                        "request": fallback,
+                        "source_path": "/tmp/transcript.jsonl",
+                        "request": direct_request,
                         "prompt_reconstruction_turns": [
-                            {"role": "user", "text": "add hello world"},
-                            {"role": "user", "text": "3"},
-                        ],
-                        "prompt_reconstruction_truncated": False,
-                    }
-                }
-            if command == "capabilities":
-                return {"items": []}
-            if command == "baseline":
-                return {}
-            if command == "models":
-                return {"options": [{"id": "gpt-5.6-sol"}]}
-            raise AssertionError(command)
-
-        outcomes = (
-            server.WorkerError("stream_error", "failed"),
-            {"finalResponse": "not json"},
-            {"finalResponse": '{"request":"   "}'},
-        )
-        for outcome in outcomes:
-            with self.subTest(outcome=outcome):
-                worker_patch = (
-                    mock.patch.object(server, "_run_worker", side_effect=outcome)
-                    if isinstance(outcome, Exception)
-                    else mock.patch.object(server, "_run_worker", return_value=outcome)
-                )
-                with mock.patch.object(server, "_engine", side_effect=fake_engine), worker_patch:
-                    inspected = server._inspect_thread({"thread_id": "thread-1"})
-
-                self.assertEqual(inspected["replay"]["request"], fallback)
-                self.assertEqual(
-                    inspected["replay"]["request_generation"],
-                    {"method": "concatenated_fallback"},
-                )
-                self.assertNotIn("prompt_reconstruction_turns", inspected["replay"])
-                self.assertNotIn("prompt_reconstruction_truncated", inspected["replay"])
-
-    def test_inspection_does_not_synthesize_without_sol(self) -> None:
-        server = load_server()
-
-        def fake_engine(command: str, arguments=()):
-            if command == "replay":
-                return {
-                    "replay": {
-                        "request": "keep this exact request",
-                        "prompt_reconstruction_turns": [
-                            {"role": "user", "text": "keep this exact request"}
+                            {"role": "user", "text": direct_request}
                         ],
                         "prompt_reconstruction_truncated": False,
                     }
@@ -858,16 +872,202 @@ class McpServerTests(unittest.TestCase):
             raise AssertionError(command)
 
         with (
-            mock.patch.object(server, "_engine", side_effect=fake_engine),
+            mock.patch.object(server, "_engine", side_effect=fake_engine) as engine,
             mock.patch.object(server, "_run_worker") as worker,
         ):
             inspected = server._inspect_thread({"thread_id": "thread-1"})
+            synthesized = server._synthesize_request_payload({"thread_id": "thread-1"})
 
+        expected = {"method": "single_user_prompt"}
+        self.assertEqual(inspected["replay"]["request"], direct_request)
+        self.assertEqual(inspected["replay"]["request_generation"], expected)
+        self.assertEqual(synthesized["request"], direct_request)
+        self.assertEqual(synthesized["request_generation"], expected)
         worker.assert_not_called()
-        self.assertEqual(inspected["replay"]["request"], "keep this exact request")
         self.assertEqual(
-            inspected["replay"]["request_generation"],
-            {"method": "concatenated_fallback"},
+            [call.args[0] for call in engine.call_args_list].count("models"),
+            1,
+        )
+
+    def test_synthesis_cache_hit_and_transcript_change_invalidation(self) -> None:
+        server = load_server()
+        fallback = "add hello world\n\n3"
+        turns = [
+            {"role": "user", "text": "add hello world"},
+            {
+                "role": "assistant",
+                "text": "1. Add docs?\n2. Add a CLI?\n3. Add a simple program?",
+            },
+            {"role": "user", "text": "3"},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript = root / "transcript.jsonl"
+            cache_path = root / "request-cache.json"
+            transcript.write_text("transcript version one", encoding="utf-8")
+            model_calls = 0
+
+            def fake_engine(command: str, arguments=()):
+                nonlocal model_calls
+                if command == "replay":
+                    return {
+                        "replay": {
+                            "imported_thread_id": "thread-1",
+                            "source_path": str(transcript),
+                            "request": fallback,
+                            "prompt_reconstruction_turns": turns,
+                            "prompt_reconstruction_truncated": False,
+                        }
+                    }
+                if command in {"capabilities", "baseline"}:
+                    return {}
+                if command == "models":
+                    model_calls += 1
+                    return {"options": [{"id": "gpt-5.6-terra"}]}
+                raise AssertionError(command)
+
+            summaries = [
+                "Add a simple hello world program.",
+                "Add a revised simple hello world program.",
+            ]
+
+            def fake_worker(
+                request,
+                *,
+                run_directory,
+                working_directory,
+                read_only,
+                log_label,
+            ):
+                call_index = fake_worker.calls
+                fake_worker.calls += 1
+                self.assertEqual(request["model"], "gpt-5.6-terra")
+                self.assertEqual(request["expected_schema"], server.REQUEST_SYNTHESIS_SCHEMA)
+                self.assertEqual(request["timeout_seconds"], 180)
+                self.assertIn(json.dumps(turns, ensure_ascii=False), request["prompt"])
+                self.assertTrue(read_only)
+                self.assertEqual(run_directory, working_directory)
+                self.assertTrue(working_directory.is_dir())
+                self.assertEqual(log_label, "prompt-synthesis")
+                return {"finalResponse": json.dumps({"request": summaries[call_index]})}
+
+            fake_worker.calls = 0
+            with (
+                mock.patch.object(server, "REQUEST_SYNTHESIS_CACHE_PATH", cache_path),
+                mock.patch.object(server, "_engine", side_effect=fake_engine),
+                mock.patch.object(server, "_run_worker", side_effect=fake_worker) as worker,
+            ):
+                first = server._call_tool(
+                    {"name": "synthesize_request", "arguments": {"thread_id": "thread-1"}}
+                )["structuredContent"]
+                inspected = server._inspect_thread({"thread_id": "thread-1"})
+                second = server._synthesize_request_payload({"thread_id": "thread-1"})
+                transcript.write_text("transcript version two", encoding="utf-8")
+                third = server._synthesize_request_payload({"thread_id": "thread-1"})
+
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(first["request"], summaries[0])
+        self.assertEqual(
+            first["request_generation"],
+            {
+                "method": "llm_synthesis",
+                "model": "gpt-5.6-terra",
+                "generated_at": first["request_generation"]["generated_at"],
+                "cached": False,
+            },
+        )
+        self.assertEqual(inspected["replay"]["request"], summaries[0])
+        self.assertTrue(inspected["replay"]["request_generation"]["cached"])
+        self.assertEqual(second["request"], summaries[0])
+        self.assertTrue(second["request_generation"]["cached"])
+        self.assertEqual(third["request"], summaries[1])
+        self.assertFalse(third["request_generation"]["cached"])
+        self.assertEqual(worker.call_count, 2)
+        self.assertEqual(model_calls, 3)
+        self.assertEqual(set(cache), {"thread-1"})
+        self.assertEqual(
+            set(cache["thread-1"]),
+            {"thread_id", "transcript_sha256", "summary", "model", "generated_at"},
+        )
+        self.assertEqual(cache["thread-1"]["summary"], summaries[1])
+
+    def test_failed_synthesis_keeps_exact_concat_and_is_not_cached(self) -> None:
+        server = load_server()
+        fallback = "add hello world\n\n3"
+        outcomes = (
+            server.WorkerError("stream_error", "failed"),
+            {"finalResponse": "not json"},
+            {"finalResponse": '{"request":"   "}'},
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                transcript = root / "transcript.jsonl"
+                cache_path = root / "request-cache.json"
+                transcript.write_text("source transcript", encoding="utf-8")
+
+                def fake_engine(command: str, arguments=()):
+                    if command == "replay":
+                        return {
+                            "replay": {
+                                "source_path": str(transcript),
+                                "request": fallback,
+                                "prompt_reconstruction_turns": [
+                                    {"role": "user", "text": "add hello world"},
+                                    {"role": "user", "text": "3"},
+                                ],
+                                "prompt_reconstruction_truncated": False,
+                            }
+                        }
+                    if command == "models":
+                        return {"options": [{"id": "gpt-5.6-terra"}]}
+                    raise AssertionError(command)
+
+                worker_patch = (
+                    mock.patch.object(server, "_run_worker", side_effect=outcome)
+                    if isinstance(outcome, Exception)
+                    else mock.patch.object(server, "_run_worker", return_value=outcome)
+                )
+                with (
+                    mock.patch.object(server, "REQUEST_SYNTHESIS_CACHE_PATH", cache_path),
+                    mock.patch.object(server, "_engine", side_effect=fake_engine),
+                    worker_patch as worker,
+                ):
+                    first = server._synthesize_request_payload({"thread_id": "thread-1"})
+                    second = server._synthesize_request_payload({"thread_id": "thread-1"})
+
+                self.assertEqual(first["request"], fallback)
+                self.assertEqual(
+                    first["request_generation"],
+                    {"method": "concatenated_fallback"},
+                )
+                self.assertEqual(second, first)
+                self.assertEqual(worker.call_count, 2)
+                self.assertFalse(cache_path.exists())
+
+    def test_inspection_runs_discovery_concurrently_with_ordered_diagnostics(self) -> None:
+        server = load_server()
+        barrier = threading.Barrier(4)
+
+        def fake_engine(command: str, arguments=()):
+            barrier.wait(timeout=2)
+            if command == "replay":
+                raise server.ControllerError("thread failed")
+            if command == "baseline":
+                raise server.ControllerError("baseline failed")
+            if command == "capabilities":
+                return {"items": []}
+            if command == "models":
+                return {"options": []}
+            raise AssertionError(command)
+
+        with mock.patch.object(server, "_engine", side_effect=fake_engine):
+            inspected = server._inspect_thread({"thread_id": "thread-1"})
+
+        self.assertEqual(
+            [item["step"] for item in inspected["diagnostics"]],
+            ["thread", "baseline"],
         )
 
     def test_prepare_maps_ui_classification_to_existing_engine_flags(self) -> None:
@@ -1123,6 +1323,7 @@ class McpServerTests(unittest.TestCase):
             self.assertFalse(first["idempotent"])
             self.assertTrue(second["idempotent"])
             self.assertEqual(first["run_id"], second["run_id"])
+            self.assertIn("[controller] run approved", first["run"]["run_log"])
 
     def test_prepare_requires_a_historical_result_digest(self) -> None:
         server = load_server()
@@ -1292,6 +1493,33 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("[implementation:stdout] worker event", content)
         self.assertIn("[implementation:stderr] worker warning", content)
         self.assertIn("[implementation] finished with exit code 0", content)
+
+    def test_get_run_returns_bounded_log_tail_from_safe_run_path(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            run_directory = run_root / "run-1"
+            run_directory.mkdir()
+            server._write_json(
+                server._state_path(run_directory),
+                {
+                    "run_id": "run-1",
+                    "status": "running",
+                    "log_path": "/tmp/untrusted-log-path",
+                },
+            )
+            log_path = server._run_log_path(run_directory)
+            log_path.write_bytes(b"old\n" + b"x" * server.MAX_RUN_LOG_BYTES + b"\nlatest\n")
+
+            with mock.patch.object(server, "RUN_ROOT", run_root):
+                result = server._call_tool(
+                    {"name": "get_run", "arguments": {"run_id": "run-1"}}
+                )
+
+        run = result["structuredContent"]["run"]
+        self.assertLessEqual(len(run["run_log"].encode("utf-8")), server.MAX_RUN_LOG_BYTES)
+        self.assertTrue(run["run_log"].endswith("\nlatest\n"))
+        self.assertNotIn("untrusted-log-path", run["run_log"])
 
     def test_get_state_exposes_local_log_paths(self) -> None:
         server = load_server()

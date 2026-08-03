@@ -367,9 +367,14 @@
       cursor: pointer;
     }
 
-    .thread:hover {
+    .thread:hover:not(:disabled) {
       border-color: var(--line-strong);
       background: var(--panel-raised);
+    }
+
+    .thread:disabled {
+      opacity: .5;
+      cursor: not-allowed;
     }
 
     .thread__title {
@@ -730,6 +735,34 @@
       cursor: not-allowed;
     }
 
+    .step-item { position: relative; }
+
+    .step-tooltip {
+      position: absolute;
+      z-index: 4;
+      top: calc(100% + 6px);
+      left: 12px;
+      display: none;
+      width: min(280px, calc(100vw - 32px));
+      padding: 10px 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-sm);
+      background: var(--panel-raised);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.4;
+      box-shadow: var(--shadow);
+    }
+
+    .step-tooltip ul {
+      margin: 6px 0 0;
+      padding-left: 18px;
+    }
+
+    .step-item:hover .step-tooltip,
+    .step-item:focus .step-tooltip,
+    .step-item:focus-within .step-tooltip { display: block; }
+
     .spinner {
       width: 14px;
       height: 14px;
@@ -790,6 +823,12 @@
       font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+
+    .run-log {
+      min-height: 180px;
+      max-height: 360px;
+      margin: 0;
     }
 
     .phase-list {
@@ -1090,11 +1129,12 @@
         model: "",
         timeoutSeconds: 1800,
         classifications: Object.create(null),
-        emptyBeginningConfirmed: false,
         reviewDraft: null,
         reviewRevision: 0,
+        promptGeneration: "",
+        promptEditRevision: 0,
+        promptSynthesisGeneration: 0,
         preparation: null,
-        approvalChecked: false,
         runId: "",
         run: null,
         report: null,
@@ -1133,16 +1173,6 @@
           return "The configuration could not be serialized.";
         }
       };
-
-      function configurationForDisplay(value) {
-        if (Array.isArray(value)) return value.map(configurationForDisplay);
-        if (!isObject(value)) return value;
-        return Object.fromEntries(
-          Object.entries(value)
-            .filter(([key]) => !["source_path", "thread_id", "imported_thread_id"].includes(key))
-            .map(([key, item]) => [key, configurationForDisplay(item)])
-        );
-      }
 
       const stringList = (value) => asArray(value)
         .map((item) => text(item).trim())
@@ -1190,7 +1220,6 @@
               ? timeoutSeconds
               : 1800,
           classifications,
-          emptyBeginningConfirmed: value.emptyBeginningConfirmed === true,
           reviewDraft: normalizeReviewDraft(value.reviewDraft),
         };
       }
@@ -1214,7 +1243,6 @@
             Object.entries(state.classifications)
               .filter(([, value]) => ["claude", "exclude"].includes(value))
           ),
-          emptyBeginningConfirmed: state.emptyBeginningConfirmed,
           reviewDraft: normalizeReviewDraft(state.reviewDraft),
         };
       }
@@ -1223,6 +1251,7 @@
         if (
           !draftPersistenceReady ||
           startPending ||
+          state.run ||
           ["run", "results"].includes(state.step)
         ) return;
         try {
@@ -1426,8 +1455,6 @@
       function initializeClassifications() {
         state.classifications = Object.create(null);
         const { selection, files, kind } = inspectionParts();
-        state.emptyBeginningConfirmed =
-          selection.empty_starting_directory_confirmed === true;
         if (kind === "git") {
           const selected = new Set(
             asArray(selection.claude_output_changes).map((item) =>
@@ -1476,7 +1503,6 @@
           state.classifications[path] =
             file.selectable === false ? "exclude" : classification;
         }
-        state.emptyBeginningConfirmed = draft.emptyBeginningConfirmed;
         state.reviewDraft = normalizeReviewDraft(draft.reviewDraft);
       }
 
@@ -1486,6 +1512,72 @@
           state.models[0]?.id ||
           ""
         );
+      }
+
+      function recordPromptGeneration(requestGeneration, request = "") {
+        if (!isObject(state.inspection)) return;
+        for (const key of ["replay", "thread"]) {
+          if (!isObject(state.inspection[key])) continue;
+          state.inspection[key] = {
+            ...state.inspection[key],
+            ...(request ? { request } : {}),
+            request_generation: requestGeneration,
+          };
+        }
+      }
+
+      async function synthesizePrompt(threadIdValue, fallbackRequest) {
+        const generation = ++state.promptSynthesisGeneration;
+        const editRevision = state.promptEditRevision;
+        state.promptGeneration = "pending";
+        recordPromptGeneration({ method: "pending" });
+        render();
+        try {
+          const payload = await callTool("synthesize_request", {
+            thread_id: threadIdValue,
+          });
+          if (
+            generation !== state.promptSynthesisGeneration ||
+            threadIdValue !== state.selectedThreadId
+          ) return;
+          const requestGeneration = isObject(payload.request_generation)
+            ? payload.request_generation
+            : {};
+          const method = text(requestGeneration.method);
+          const request = text(payload.request).trim();
+          if (method === "llm_synthesis" && request) {
+            state.promptGeneration = "llm_synthesis";
+            const canReplace = (
+              state.promptEditRevision === editRevision &&
+              text(state.reviewDraft?.request) === fallbackRequest
+            );
+            if (canReplace && state.reviewDraft) {
+              state.reviewDraft.request = request;
+              state.reviewRevision += 1;
+              state.preparation = null;
+              recordPromptGeneration(requestGeneration, request);
+            } else {
+              recordPromptGeneration(requestGeneration);
+            }
+          } else {
+            state.promptGeneration = "concatenated_fallback";
+            recordPromptGeneration({ method: "concatenated_fallback" });
+          }
+        } catch {
+          if (
+            generation !== state.promptSynthesisGeneration ||
+            threadIdValue !== state.selectedThreadId
+          ) return;
+          state.promptGeneration = "concatenated_fallback";
+          recordPromptGeneration({ method: "concatenated_fallback" });
+        } finally {
+          if (
+            generation === state.promptSynthesisGeneration &&
+            threadIdValue === state.selectedThreadId
+          ) {
+            render();
+          }
+        }
       }
 
       function resetController() {
@@ -1505,11 +1597,12 @@
         state.model = selectedModelDefault();
         state.timeoutSeconds = 1800;
         state.classifications = Object.create(null);
-        state.emptyBeginningConfirmed = false;
         state.reviewDraft = null;
         state.reviewRevision += 1;
+        state.promptGeneration = "";
+        state.promptEditRevision = 0;
+        state.promptSynthesisGeneration += 1;
         state.preparation = null;
-        state.approvalChecked = false;
         state.runId = "";
         state.run = null;
         state.report = null;
@@ -1656,13 +1749,20 @@
       function inspectionDiagnostics() {
         const inspection = isObject(state.inspection) ? state.inspection : {};
         const selection = isObject(inspection.file_selection) ? inspection.file_selection : {};
+        const repositoryBlockers = new Set(
+          asArray(inspection.repository_blockers)
+            .map((item) => text(isObject(item) ? item.message : item))
+            .filter(Boolean)
+        );
         return [
           ...asArray(inspection.diagnostics),
           ...asArray(inspection.blockers),
           ...asArray(selection.blocking_reasons),
         ]
           .map((item) => text(isObject(item) ? item.message : item))
-          .filter((item, index, values) => item && values.indexOf(item) === index);
+          .filter((item, index, values) => (
+            item && !repositoryBlockers.has(item) && values.indexOf(item) === index
+          ));
       }
 
       function reviewDraftFromConfiguration() {
@@ -1725,8 +1825,7 @@
           ending_kind: text(draft.ending_kind),
           baseline_commit: gitBeginning ? text(draft.baseline_commit).trim() : "",
           ending_commit: gitEnding ? text(draft.ending_commit).trim() : "",
-          confirm_empty_beginning:
-            draft.beginning_kind === "non_git" && state.emptyBeginningConfirmed,
+          confirm_empty_beginning: draft.beginning_kind === "non_git",
           confirm_repository_selection: Boolean(text(draft.repo).trim()),
           model: text(draft.model).trim(),
           timeout_seconds: Number(draft.timeout_seconds),
@@ -1759,9 +1858,6 @@
         if (draft.beginning_kind === "git" && !draft.baseline_commit.trim()) {
           problems.push("Enter the starting commit.");
         }
-        if (draft.beginning_kind === "non_git" && !state.emptyBeginningConfirmed) {
-          problems.push("Confirm that the beginning directory was empty.");
-        }
         if (draft.ending_kind === "git" && !draft.ending_commit.trim()) {
           problems.push("Enter the ending commit.");
         }
@@ -1783,17 +1879,13 @@
       function invalidateReviewPreparation() {
         state.reviewRevision += 1;
         state.preparation = null;
-        state.approvalChecked = false;
         state.error = "";
         state.notice = "";
-        const dialog = document.getElementById("approval-dialog");
-        if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
       }
 
       function invalidateConfigurationReview() {
         state.reviewRevision += 1;
         state.preparation = null;
-        state.approvalChecked = false;
         state.error = "";
         state.notice = "";
         saveDraft();
@@ -1828,14 +1920,6 @@
         );
       }
 
-      function evidenceConfiguration() {
-        const preparation = isObject(state.preparation) ? state.preparation : {};
-        return (
-          (isObject(preparation.configuration) && preparation.configuration) ||
-          approvedConfiguration()
-        );
-      }
-
       function runRecord(payload) {
         if (!isObject(payload)) return null;
         return isObject(payload.run) ? payload.run : payload;
@@ -1861,8 +1945,7 @@
       }
 
       function canNavigateTo(id) {
-        if (state.busy) return false;
-        if (state.run && !terminalRunStatus(state.run.status)) return id === "run";
+        if (state.busy && !state.run) return false;
         if (id === state.step) return false;
         if (id === "thread") return true;
         if (id === "configure") return Boolean(state.inspection);
@@ -1885,8 +1968,14 @@
                 );
                 const clickable = canNavigateTo(step.id);
                 const marker = completed ? "✓" : String(index + 1);
+                const missingRequirements = (
+                  step.id === "run" && state.step === "configure" && !state.run
+                ) ? reviewProblems() : [];
+                const tooltipId = `${step.id}-requirements-tooltip`;
                 return `
-                  <li>
+                  <li class="step-item" ${missingRequirements.length
+                    ? `tabindex="0" aria-describedby="${tooltipId}"`
+                    : ""}>
                     <button
                       type="button"
                       class="step-button"
@@ -1905,6 +1994,12 @@
                         )}</span>
                       </span>
                     </button>
+                    ${missingRequirements.length
+                      ? `<div id="${tooltipId}" class="step-tooltip" role="tooltip">
+                          <strong>Complete required fields before starting</strong>
+                          <ul>${missingRequirements.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+                        </div>`
+                      : ""}
                   </li>
                 `;
               }).join("")}
@@ -1987,6 +2082,25 @@
             "Choose an imported Claude thread",
             "The relevant conversation is reconstructed into one editable replay task. Claude is not rerun."
           )}
+          ${state.busy === "inspection"
+            ? `<div class="banner" role="status">
+                <span class="spinner" aria-hidden="true"></span>
+                <div class="banner__body">
+                  <strong>Inspecting ${escapeHtml(threadTitle(state.selectedThread || {}))}</strong>
+                  <p>Loading the thread, models, baseline, and capabilities…</p>
+                </div>
+              </div>`
+            : ""}
+          ${state.run
+            ? `<div class="banner banner--warning" role="status">
+                <span class="banner__mark" aria-hidden="true">i</span>
+                <div class="banner__body">
+                  <strong>A bakeoff is already ${terminalRunStatus(state.run.status) ? "recorded" : "running"}</strong>
+                  <p>Reviewing this list does not replace the current run.</p>
+                  <button type="button" class="button button--quiet" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another bakeoff</button>
+                </div>
+              </div>`
+            : ""}
           <section class="panel" aria-labelledby="threads-heading">
             <div class="panel__header">
               <div>
@@ -2031,7 +2145,7 @@
                             class="thread"
                             data-action="select-thread"
                             data-thread-id="${escapeHtml(id)}"
-                            ${!id || state.busy ? "disabled" : ""}
+                            ${!id || state.busy || state.run ? "disabled" : ""}
                           >
                             <span>
                               <span class="thread__title">${escapeHtml(threadTitle(thread))}</span>
@@ -2133,7 +2247,7 @@
                             data-file-kind="git"
                             data-path="${escapeHtml(path)}"
                             ${selected ? "checked" : ""}
-                            ${selectable && state.busy !== "prepare" ? "" : "disabled"}
+                            ${selectable && !state.busy && !state.run ? "" : "disabled"}
                           >
                           <span>Attribute to this run</span>
                         </label>
@@ -2173,7 +2287,7 @@
                               data-file-kind="non_git"
                               data-path="${escapeHtml(path)}"
                               ${selected === "claude" ? "checked" : ""}
-                              ${selectable && state.busy !== "prepare" ? "" : "disabled"}
+                              ${selectable && !state.busy && !state.run ? "" : "disabled"}
                             >
                             <span>Created by Claude</span>
                           </label>
@@ -2185,7 +2299,7 @@
                               data-file-kind="non_git"
                               data-path="${escapeHtml(path)}"
                               ${selected === "exclude" ? "checked" : ""}
-                              ${state.busy === "prepare" ? "disabled" : ""}
+                              ${state.busy || state.run ? "disabled" : ""}
                             >
                             <span>Exclude</span>
                           </label>
@@ -2206,12 +2320,13 @@
         const diagnostics = inspectionDiagnostics();
         const blockers = preparationBlockers();
         const problems = reviewProblems();
-        const approved = approvedConfiguration();
-        const summary = reviewSummary(evidenceConfiguration());
         const gitBeginning = draft.beginning_kind === "git";
         const gitEnding = draft.ending_kind === "git";
-        const selectionRefreshing = selectionNeedsRefresh();
-        const requestMethod = text(replay.request_generation?.method);
+        const configurationLocked = Boolean(state.run);
+        const selectionRefreshing = selectionNeedsRefresh() && !(
+          gitEnding && !draft.ending_commit.trim()
+        );
+        const requestMethod = state.promptGeneration || text(replay.request_generation?.method);
         const originalThreadId = text(
           replay.session_id || state.selectedThread?.session_id,
           "Unavailable"
@@ -2249,7 +2364,7 @@
               </div>
             </div>
             <div class="panel__body">
-              <fieldset class="review-fields" ${state.busy === "prepare" ? "disabled" : ""}>
+              <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
                 <div class="field-grid">
                 <div class="field">
                   <label for="original-thread">Original Claude thread ID</label>
@@ -2271,13 +2386,23 @@
                   <input id="review-message-uuid" type="text" value="${escapeHtml(draft.message_uuid)}">
                 </div>
                 <div class="field field--wide">
-                  <label for="review-request">Reconstructed task prompt ${requestMethod === "llm_synthesis"
+                  <label for="review-request">Reconstructed task prompt ${requestMethod === "pending"
+                    ? '<span class="pill"><span class="spinner" aria-hidden="true"></span>Reconstructing task prompt…</span>'
+                    : requestMethod === "llm_synthesis"
                     ? '<span class="pill">AI synthesized</span>'
+                    : requestMethod === "single_user_prompt"
+                      ? '<span class="pill">Original request</span>'
                     : requestMethod === "concatenated_fallback"
                       ? '<span class="pill pill--warning">Concatenated fallback</span>'
                       : ""}</label>
                   <textarea id="review-request">${escapeHtml(draft.request)}</textarea>
-                  <small>Built from the conversation so short replies resolve against the questions they answered. Review and edit before approval.</small>
+                  <small>${requestMethod === "pending"
+                    ? "You can edit this temporary concatenation while the conversation is reconstructed. Your edits will not be overwritten."
+                    : requestMethod === "single_user_prompt"
+                      ? "Used directly because this thread contains one user request. Review and edit before approval."
+                    : requestMethod === "concatenated_fallback"
+                      ? "Prompt synthesis was unavailable, so the exact concatenated user requests were retained. Review and edit before approval."
+                      : "Built from the conversation so short replies resolve against the questions they answered. Review and edit before approval."}</small>
                 </div>
                 <div class="field field--wide">
                   <label for="review-repo">Replay repository</label>
@@ -2301,7 +2426,7 @@
               </div>
             </div>
             <div class="panel__body">
-              <fieldset class="review-fields" ${state.busy === "prepare" ? "disabled" : ""}>
+              <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
                 <div class="field-grid">
                   <div class="field">
                     <label for="review-beginning-kind">State type</label>
@@ -2318,10 +2443,6 @@
                       </div>`
                     : `<div class="field field--wide">
                         <p>The beginning state is a blank, Non-Git directory. No commit is required.</p>
-                        <label class="choice">
-                          <input id="empty-beginning-confirmation" type="checkbox" ${state.emptyBeginningConfirmed ? "checked" : ""}>
-                          <span>I confirmed the directory was empty before the run began.</span>
-                        </label>
                       </div>`}
                 </div>
               </fieldset>
@@ -2336,7 +2457,7 @@
               </div>
             </div>
             <div class="panel__body">
-              <fieldset class="review-fields" ${state.busy === "prepare" ? "disabled" : ""}>
+              <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
                 <div class="field-grid">
                   <div class="field">
                     <label for="review-ending-kind">State type</label>
@@ -2374,7 +2495,7 @@
                 : `<span class="pill">${files.length} ${files.length === 1 ? "item" : "items"}</span>`}
             </div>
             ${selectionRefreshing
-              ? '<div class="panel__body"><p class="empty">This attribution will refresh automatically before the approval dialog opens.</p></div>'
+              ? '<div class="panel__body"><p class="empty">This attribution will refresh automatically before the run starts.</p></div>'
               : gitEnding && kind === "git"
                 ? renderGitFiles(files, selection)
                 : !gitEnding && kind === "non_git"
@@ -2413,162 +2534,25 @@
             : ""}
 
           <div class="footer-actions">
-            <span class="footer-actions__note">The exact configuration is checked before approval.</span>
-            <button type="button" class="button button--quiet" data-action="go-step" data-step="thread">Back</button>
-            <button
-              type="button"
-              class="button button--primary"
-              data-action="approve-configuration"
-              ${state.busy ? "disabled" : ""}
-            >
-              ${state.busy === "prepare" ? '<span class="spinner" aria-hidden="true"></span>Checking configuration…' : "Approve and start…"}
-            </button>
+            <span class="footer-actions__note">${configurationLocked
+              ? "This is the configuration used for the current bakeoff."
+              : "The exact configuration is checked, then the run starts immediately."}</span>
+            ${configurationLocked
+              ? `<button type="button" class="button button--primary" data-action="go-step" data-step="${state.report ? "results" : "run"}">Return to ${state.report ? "results" : "run"}</button>`
+              : `<button type="button" class="button button--quiet" data-action="go-step" data-step="thread">Back</button>
+                <button
+                  type="button"
+                  class="button button--primary"
+                  data-action="approve-configuration"
+                  ${state.busy ? "disabled" : ""}
+                >
+                  ${state.busy === "prepare"
+                    ? '<span class="spinner" aria-hidden="true"></span>Checking configuration…'
+                    : state.busy === "start"
+                      ? '<span class="spinner" aria-hidden="true"></span>Starting…'
+                      : "Approve and start"}
+                </button>`}
           </div>
-          ${preparationReady() ? renderApprovalDialog(approved, summary) : ""}
-        `;
-      }
-
-      function reviewItem(label, value, code = false) {
-        return `
-          <div class="review-item">
-            <span>${escapeHtml(label)}</span>
-            <${code ? "code" : "strong"}>${escapeHtml(value || "None")}</${code ? "code" : "strong"}>
-          </div>
-        `;
-      }
-
-      function reviewSummary(configuration) {
-        const task = isObject(configuration.task) ? configuration.task : {};
-        const baseline = isObject(configuration.baseline) ? configuration.baseline : {};
-        const beginningState = isObject(configuration.beginning_state)
-          ? configuration.beginning_state
-          : {};
-        const endingState = isObject(configuration.ending_state)
-          ? configuration.ending_state
-          : {};
-        const repositoryResolution = isObject(baseline.repository_resolution)
-          ? baseline.repository_resolution
-          : {};
-        const runtime = isObject(configuration.runtime) ? configuration.runtime : {};
-        const direct = isObject(state.preparation?.run_config)
-          ? state.preparation.run_config
-          : reviewPayload();
-        const selection = isObject(configuration.file_selection)
-          ? configuration.file_selection
-          : {};
-        const included = asArray(
-          direct.claude_output_files?.length
-            ? direct.claude_output_files
-            : direct.created_by_claude?.length
-              ? direct.created_by_claude
-              : selection.claude_output_changes?.length
-                ? selection.claude_output_changes
-                : selection.claude_output_files
-        ).map((item) => text(isObject(item) ? item.path : item)).filter(Boolean);
-        const excluded = asArray(
-          direct.excluded_files?.length
-            ? direct.excluded_files
-            : selection.unselected_changes?.length
-              ? selection.unselected_changes
-              : selection.classifications?.exclude
-        ).map((item) => text(isObject(item) ? item.path : item)).filter(Boolean);
-        const replayRepository = text(
-          task.project ||
-          repositoryResolution.effective_project_dir ||
-          baseline.attribution_root ||
-          baseline.repository ||
-          direct.repo
-        );
-        const originalThreadCwd = text(
-          task.original_project || repositoryResolution.original_project_dir
-        );
-        const beginningKind = text(
-          beginningState.kind || direct.beginning_kind || baseline.beginning_kind
-        ) || (baseline.kind === "empty_directory" ? "non_git" : "git");
-        const endingKind = text(
-          endingState.kind || direct.ending_kind || baseline.ending_kind || selection.source_kind
-        ) || beginningKind;
-        const beginningCommit = text(
-          beginningState.commit || baseline.commit || direct.baseline_commit
-        );
-        const endingCommit = text(
-          endingState.commit || baseline.ending_commit || direct.ending_commit
-        );
-        return {
-          thread: text(
-            task.original_session_id ||
-            state.inspection?.replay?.session_id ||
-            state.selectedThread?.session_id,
-            "Unavailable"
-          ),
-          replayRepository,
-          originalThreadCwd:
-            originalThreadCwd && originalThreadCwd !== replayRepository
-              ? originalThreadCwd
-              : "",
-          repositoryResolutionSource: text(repositoryResolution.source),
-          beginningState: beginningKind === "git"
-            ? `Git · ${beginningCommit || "commit required"}`
-            : "Non-Git · blank directory",
-          endingState: endingKind === "git"
-            ? `Git · ${endingCommit || "commit required"}`
-            : "Non-Git · directory",
-          model: text(configuration.model || direct.model || state.model),
-          timeout: Number(runtime.timeout_seconds ?? direct.timeout_seconds ?? state.timeoutSeconds),
-          sandbox: text(runtime.sandbox_policy?.type || runtime.sandbox_policy || "workspaceWrite"),
-          network: runtime.sandbox_policy?.networkAccess === false ? "Disabled" : "Enabled",
-          included,
-          excluded,
-        };
-      }
-
-      function renderApprovalDialog(configuration, summary) {
-        return `
-          <dialog id="approval-dialog" aria-labelledby="approval-title">
-            <div class="dialog__header">
-              <h2 id="approval-title">Approve and start one isolated Codex replay?</h2>
-              <p>Review the final guarantees, then explicitly approve this prepared configuration.</p>
-            </div>
-            <div class="dialog__body">
-              <div class="review-grid">
-                ${reviewItem("Original Claude thread ID", summary.thread, true)}
-                ${reviewItem("Model", summary.model, true)}
-                ${reviewItem("Replay repository", summary.replayRepository, true)}
-                ${summary.originalThreadCwd
-                  ? reviewItem("Original thread cwd", summary.originalThreadCwd, true)
-                  : ""}
-                ${reviewItem("Beginning state", summary.beginningState, true)}
-                ${reviewItem("End state", summary.endingState, true)}
-                ${reviewItem("Timeout", formatDuration(summary.timeout))}
-              </div>
-              <ul class="approval-promises">
-                <li>Historical Claude is not rerun.</li>
-                <li>The original checkout is not modified.</li>
-                <li>Exactly one Codex implementation is started.</li>
-                <li>Shared verification and blind review use frozen captured results.</li>
-              </ul>
-              <details>
-                <summary>Exact configuration sent on approval</summary>
-                <pre>${escapeHtml(safeJson(configurationForDisplay(configuration)))}</pre>
-              </details>
-              <label class="choice" style="margin-top:16px">
-                <input id="approval-check" type="checkbox" ${state.approvalChecked ? "checked" : ""}>
-                <span>I approve this exact configuration and one isolated implementation.</span>
-              </label>
-            </div>
-            <div class="dialog__footer">
-              <button type="button" class="button button--quiet" data-action="close-approval">Cancel</button>
-              <button
-                id="start-run"
-                type="button"
-                class="button button--primary"
-                data-action="start"
-                ${state.approvalChecked || state.busy === "start" ? "" : "disabled"}
-              >
-                ${state.busy === "start" ? '<span class="spinner" aria-hidden="true"></span>Starting…' : "Approve and start"}
-              </button>
-            </div>
-          </dialog>
         `;
       }
 
@@ -2606,6 +2590,7 @@
         const completed = successfulRunStatus(status);
         const phases = normalizedPhases(run);
         const events = asArray(run.events).filter(isObject).slice(-12).reverse();
+        const runLog = text(run.run_log);
         return `
           ${pageHeading(
             "Run in progress",
@@ -2679,13 +2664,29 @@
               </div>
             </section>
           </div>
+          <section class="panel" aria-labelledby="run-log-heading" style="margin-top:14px">
+            <div class="panel__header">
+              <div>
+                <h2 id="run-log-heading">Current run log</h2>
+                <p>${run.log_path
+                  ? `Streaming <code>${escapeHtml(run.log_path)}</code>`
+                  : "Streaming recorded controller and worker output"}</p>
+              </div>
+              <span class="pill ${completed ? "pill--good" : failed ? "pill--bad" : ""}">
+                ${terminalRunStatus(status) ? "Retained" : "Live"}
+              </span>
+            </div>
+            <div class="panel__body">
+              <pre id="run-log" class="run-log" tabindex="0" aria-live="polite">${escapeHtml(runLog || "Waiting for run output…")}</pre>
+            </div>
+          </section>
           <div class="footer-actions">
             <span class="footer-actions__note">
               ${completed ? "Loading the report…" : failed ? "Inspect the recorded error before starting a new bakeoff." : "Status refreshes automatically."}
             </span>
             ${failed
               ? `<button type="button" class="button" data-action="refresh-run" ${state.busy ? "disabled" : ""}>Refresh status</button>
-                 <button type="button" class="button button--primary" data-action="reset-controller">Choose another thread</button>`
+                 <button type="button" class="button button--primary" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another bakeoff</button>`
               : completed
                 ? `<button type="button" class="button button--primary" data-action="load-report" ${state.busy ? "disabled" : ""}>
                     ${state.busy === "report" ? '<span class="spinner" aria-hidden="true"></span>Loading…' : "Open results"}
@@ -3031,7 +3032,7 @@
             ${state.reportPaths?.report_html
               ? `<button type="button" class="button" data-action="download-report" data-format="html">Download HTML report</button>`
               : ""}
-            <button type="button" class="button button--primary" data-action="reset-controller">Start another bakeoff</button>
+            <button type="button" class="button button--primary" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another bakeoff</button>
           </div>
         `;
       }
@@ -3057,6 +3058,16 @@
       }
 
       function render({ focus = false } = {}) {
+        const previousLog = document.getElementById("run-log");
+        const logScrollTop = previousLog?.scrollTop || 0;
+        const logPinned = !previousLog || (
+          previousLog.scrollHeight - previousLog.clientHeight - previousLog.scrollTop < 32
+        );
+        const prompt = document.getElementById("review-request");
+        const promptFocused = prompt && document.activeElement === prompt;
+        const promptSelection = promptFocused
+          ? [prompt.selectionStart, prompt.selectionEnd]
+          : null;
         saveDraft();
         app.innerHTML = `
           <div class="layout">
@@ -3069,7 +3080,18 @@
             </main>
           </div>
         `;
-        if (focus) {
+        const nextLog = document.getElementById("run-log");
+        if (nextLog) {
+          nextLog.scrollTop = logPinned ? nextLog.scrollHeight : logScrollTop;
+        }
+        if (promptSelection) {
+          requestAnimationFrame(() => {
+            const nextPrompt = document.getElementById("review-request");
+            if (!nextPrompt) return;
+            nextPrompt.focus();
+            nextPrompt.setSelectionRange(...promptSelection);
+          });
+        } else if (focus) {
           requestAnimationFrame(() => document.getElementById("page-title")?.focus());
         }
       }
@@ -3096,6 +3118,7 @@
       }
 
       async function initialize() {
+        let synthesis = null;
         draftPersistenceReady = false;
         restoredDraft = loadDraft();
         state.loading = true;
@@ -3149,8 +3172,20 @@
                 ? restoredDraft.model
                 : selectedModelDefault();
               initializeClassifications();
+              const fallbackRequest = text(payload.replay?.request || payload.thread?.request);
               applyDraftToInspection(restoredDraft);
               state.reviewDraft = state.reviewDraft || reviewDraftFromConfiguration();
+              state.promptGeneration = text(
+                payload.replay?.request_generation?.method ||
+                payload.thread?.request_generation?.method,
+                "concatenated_fallback"
+              );
+              if (state.promptGeneration === "pending") {
+                synthesis = {
+                  threadId: restoredDraft.selectedThreadId,
+                  fallbackRequest,
+                };
+              }
               state.step = restoredDraft.step === "thread" ? "thread" : "configure";
             } catch (error) {
               state.inspection = {
@@ -3161,6 +3196,7 @@
                 }],
               };
               state.reviewDraft = normalizeReviewDraft(restoredDraft.reviewDraft) || reviewDraftFromConfiguration();
+              state.promptGeneration = "concatenated_fallback";
               state.step = "configure";
               state.error = "";
             }
@@ -3173,11 +3209,17 @@
           state.loading = false;
           render({ focus: true });
         }
+        if (synthesis) {
+          void synthesizePrompt(synthesis.threadId, synthesis.fallbackRequest);
+        }
       }
 
       async function selectThread(id) {
+        if (state.busy || state.run) return;
         const selected = state.threads.find((thread) => threadId(thread) === id);
         if (!selected) return;
+        let fallbackRequest = "";
+        let shouldSynthesize = false;
         state.busy = "inspection";
         state.error = "";
         state.notice = "";
@@ -3185,15 +3227,12 @@
         state.selectedThread = selected;
         state.inspection = null;
         state.classifications = Object.create(null);
-        state.emptyBeginningConfirmed = false;
         state.reviewDraft = null;
         state.reviewRevision += 1;
+        state.promptGeneration = "";
+        state.promptEditRevision = 0;
+        state.promptSynthesisGeneration += 1;
         state.preparation = null;
-        state.approvalChecked = false;
-        state.runId = "";
-        state.run = null;
-        state.report = null;
-        state.reportPaths = null;
         render();
         try {
           const payload = await callTool("inspect_thread", { thread_id: id });
@@ -3205,6 +3244,13 @@
           }
           initializeClassifications();
           state.reviewDraft = reviewDraftFromConfiguration();
+          fallbackRequest = text(payload.replay?.request || payload.thread?.request);
+          state.promptGeneration = text(
+            payload.replay?.request_generation?.method ||
+            payload.thread?.request_generation?.method,
+            "concatenated_fallback"
+          );
+          shouldSynthesize = state.promptGeneration === "pending";
           state.step = "configure";
         } catch (error) {
           state.inspection = {
@@ -3216,10 +3262,14 @@
           };
           initializeClassifications();
           state.reviewDraft = reviewDraftFromConfiguration();
+          state.promptGeneration = "concatenated_fallback";
           state.step = "configure";
         } finally {
           state.busy = "";
           render({ focus: true });
+        }
+        if (shouldSynthesize) {
+          void synthesizePrompt(id, fallbackRequest);
         }
       }
 
@@ -3231,14 +3281,18 @@
           render();
           return;
         }
+        if (state.promptGeneration === "pending") {
+          state.promptSynthesisGeneration += 1;
+          state.promptGeneration = "concatenated_fallback";
+          recordPromptGeneration({ method: "concatenated_fallback" });
+        }
         state.busy = "prepare";
         state.preparation = null;
-        state.approvalChecked = false;
         state.error = "";
         state.notice = "";
         const reviewRevision = state.reviewRevision;
         const configuration = reviewPayload();
-        let openApproval = false;
+        let shouldStart = false;
         render();
         try {
           const preparation = await callTool("prepare_run", configuration);
@@ -3249,36 +3303,26 @@
           ) return;
           state.preparation = preparation;
           applyPreparationInspection(preparation);
-          openApproval = preparationReady();
+          shouldStart = preparationReady();
         } catch (error) {
           if (reviewRevision === state.reviewRevision && state.step === "configure") {
             state.error = error instanceof Error ? error.message : String(error);
           }
         } finally {
           state.busy = "";
-          render({ focus: true });
-          if (openApproval) {
-            requestAnimationFrame(() => {
-              const dialog = document.getElementById("approval-dialog");
-              if (dialog && !dialog.open) dialog.showModal();
-            });
-          }
+          if (shouldStart) await startRun();
+          else render({ focus: true });
         }
       }
 
       async function startRun() {
-        if (!state.approvalChecked || !preparationReady()) return;
-        const dialog = document.getElementById("approval-dialog");
+        if (!preparationReady()) return;
         state.busy = "start";
         state.error = "";
         state.notice = "";
         startPending = true;
         clearDraft();
-        const startButton = document.getElementById("start-run");
-        if (startButton) {
-          startButton.disabled = true;
-          startButton.innerHTML = '<span class="spinner" aria-hidden="true"></span>Starting…';
-        }
+        render();
         try {
           const approvedRunConfiguration = approvedConfiguration();
           const payload = await callTool("start_run", {
@@ -3294,11 +3338,9 @@
           if (!run || !id) {
             throw new Error("The controller started no durable run.");
           }
-          if (dialog?.open) dialog.close();
           state.run = run;
           state.runId = id;
           state.step = "run";
-          state.approvalChecked = false;
           clearDraft();
           restoredDraft = null;
           startPending = false;
@@ -3310,10 +3352,6 @@
           state.error = error instanceof Error ? error.message : String(error);
           state.busy = "";
           render();
-          requestAnimationFrame(() => {
-            const updated = document.getElementById("approval-dialog");
-            if (updated && !updated.open) updated.showModal();
-          });
         }
       }
 
@@ -3332,7 +3370,7 @@
           render();
         }
         if (successfulRunStatus(state.run?.status)) {
-          await loadReport();
+          await loadReport({ navigate: state.step === "run" });
           return;
         }
         if (continuePolling && !terminalRunStatus(state.run?.status)) {
@@ -3353,7 +3391,7 @@
         schedulePoll();
       }
 
-      async function loadReport() {
+      async function loadReport({ navigate = true } = {}) {
         if (!state.runId || state.busy === "report") return;
         state.busy = "report";
         state.error = "";
@@ -3367,14 +3405,13 @@
             report_json: text(payload.report_json),
             report_html: text(payload.report_html),
           };
-          state.step = "results";
+          if (navigate && state.step === "run") state.step = "results";
           state.pollGeneration += 1;
         } catch (error) {
           state.error = error instanceof Error ? error.message : String(error);
-          state.step = "run";
         } finally {
           state.busy = "";
-          render({ focus: true });
+          render({ focus: navigate && state.step === "results" });
         }
       }
 
@@ -3446,23 +3483,16 @@
         if (action === "refresh-threads") loadThreads(state.query);
         if (action === "select-thread") selectThread(target.dataset.threadId || "");
         if (action === "approve-configuration") prepareRun();
-        if (action === "start") startRun();
         if (action === "refresh-run") refreshRun();
         if (action === "load-report") loadReport();
         if (action === "copy-report-path") copyReportPath();
         if (action === "download-report") downloadReport(target.dataset.format || "");
         if (action === "reset-controller") resetController();
-        if (action === "close-approval") {
-          document.getElementById("approval-dialog")?.close();
-        }
         if (action === "go-step") {
           const step = target.dataset.step;
-          if (!step || (!canNavigateTo(step) && step !== "thread" && step !== "configure")) return;
-          if (step === "thread" && state.step !== "thread") {
-            state.pollGeneration += 1;
-            state.error = "";
-            state.notice = "";
-          }
+          if (!step || !canNavigateTo(step)) return;
+          state.error = "";
+          state.notice = "";
           state.step = step;
           render({ focus: true });
         }
@@ -3482,11 +3512,6 @@
             }
           });
         }
-        if (target.id === "approval-check") {
-          state.approvalChecked = target.checked;
-          const start = document.getElementById("start-run");
-          if (start) start.disabled = !target.checked;
-        }
         const reviewFields = {
           "review-message-uuid": "message_uuid",
           "review-model": "model",
@@ -3499,6 +3524,7 @@
         const reviewKey = reviewFields[target.id];
         if (reviewKey && state.reviewDraft) {
           state.reviewDraft[reviewKey] = target.value;
+          if (reviewKey === "request") state.promptEditRevision += 1;
           if (reviewKey === "model") state.model = target.value;
           invalidateReviewPreparation();
           saveDraft();
@@ -3524,7 +3550,6 @@
         if (target.id === "review-beginning-kind" && state.reviewDraft) {
           state.reviewDraft.beginning_kind = target.value;
           if (target.value === "git") state.reviewDraft.ending_kind = "git";
-          state.emptyBeginningConfirmed = false;
           invalidateReviewPreparation();
           render();
           return;
@@ -3532,12 +3557,6 @@
         if (target.id === "review-ending-kind" && state.reviewDraft) {
           state.reviewDraft.ending_kind = target.value;
           invalidateReviewPreparation();
-          render();
-          return;
-        }
-        if (target.id === "empty-beginning-confirmation") {
-          state.emptyBeginningConfirmed = target.checked;
-          invalidateConfigurationReview();
           render();
           return;
         }
@@ -3552,12 +3571,6 @@
           invalidateConfigurationReview();
           render();
         }
-      });
-
-      document.addEventListener("keydown", (event) => {
-        if (event.key !== "Escape") return;
-        const dialog = document.getElementById("approval-dialog");
-        if (dialog?.open && state.busy !== "start") dialog.close();
       });
 
       window.addEventListener("pagehide", saveDraft);

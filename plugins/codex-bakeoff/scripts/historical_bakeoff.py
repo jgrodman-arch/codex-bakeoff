@@ -574,22 +574,44 @@ def _with_historical_ending_commit(
         "project_dir": repository,
         "project_dirs": [repository],
     }
+    ending_commit_inference_error: str | None = None
     try:
         inferred = _discovery().recover_historical_solution(
             recovery_replay,
             starting_commit if isinstance(starting_commit, str) else None,
             baseline_kind=baseline_kind,
         )
-    except Exception:
-        if not reviewed_ending_commit:
+    except Exception as error:
+        ending_commit_inference_error = _redact(error)
+        if not reviewed_ending_commit and not (
+            beginning_kind == "git"
+            and ending_kind == "git"
+            and isinstance(starting_commit, str)
+        ):
             return {
                 **result,
                 "ending_commit": None,
                 "ending_commit_confidence": "unavailable",
+                "ending_commit_inference_error": ending_commit_inference_error,
             }
         inferred = {}
 
     inferred_commit = inferred.get("commit")
+    ending_defaulted_to_beginning = bool(
+        not reviewed_ending_commit
+        and beginning_kind == "git"
+        and ending_kind == "git"
+        and isinstance(starting_commit, str)
+        and not isinstance(inferred_commit, str)
+    )
+    if ending_defaulted_to_beginning:
+        inferred = {
+            **inferred,
+            "commit": starting_commit,
+            "diff": "",
+            "changed_files": [],
+        }
+        inferred_commit = starting_commit
     reviewed_matches_inferred = (
         re.fullmatch(r"[0-9a-fA-F]{7,64}", reviewed_ending_commit) is not None
         and isinstance(inferred_commit, str)
@@ -632,6 +654,12 @@ def _with_historical_ending_commit(
             else "unavailable"
         ),
         "ending_commit_reviewed_override": reviewed_override,
+        "ending_commit_defaulted_to_beginning": ending_defaulted_to_beginning,
+        **(
+            {"ending_commit_inference_error": ending_commit_inference_error}
+            if ending_commit_inference_error is not None
+            else {}
+        ),
     }
 
 
@@ -1483,10 +1511,10 @@ def _historical_candidate(
             raise BakeoffError(
                 f"The live classified Claude files could not be captured: {_redact(error)}"
             ) from error
-    elif selection.get("source_kind") == "git" and selection.get("working_tree_state") == "dirty":
+    elif selection.get("source_kind") == "git":
         selected_changes = selection.get("claude_output_changes")
         selected_changes = selected_changes if isinstance(selected_changes, list) else []
-        if selected_changes:
+        if selection.get("working_tree_state") == "dirty" and selected_changes:
             try:
                 diff, changed = _file_selection().build_git_candidate_patch(
                     repository=repository,
@@ -1513,12 +1541,35 @@ def _historical_candidate(
                 raise BakeoffError(
                     f"The selected live Git changes could not be captured: {_redact(error)}"
                 ) from error
-        else:
+        if selection.get("working_tree_state") == "dirty":
             recovery = {
                 **recovery,
                 "file_selection": dict(selection),
             }
-    if not isinstance(diff, str) or not diff.strip():
+        selection_reviewed = selection.get("complete") is True and (
+            selection.get("working_tree_state") == "clean"
+            or selection.get("confirmed") is True
+        )
+        if selection_reviewed:
+            recovery = {
+                **recovery,
+                "attributed_dirty_file_count": len(selected_changes),
+                "no_changes_attributed": isinstance(diff, str) and not diff.strip(),
+            }
+    allow_no_change = bool(
+        selection.get("source_kind") == "git"
+        and selection.get("complete") is True
+        and (
+            selection.get("working_tree_state") == "clean"
+            or selection.get("confirmed") is True
+        )
+        and not (selection.get("claude_output_changes") or [])
+        and isinstance(baseline.get("ending_commit"), str)
+        and isinstance(recovery.get("commit"), str)
+        and recovery.get("commit") == baseline.get("ending_commit")
+        and isinstance(diff, str)
+    )
+    if not isinstance(diff, str) or (not diff.strip() and not allow_no_change):
         raise BakeoffError(
             "No attributable historical Claude patch could be captured; "
             "the comparison cannot be completed."

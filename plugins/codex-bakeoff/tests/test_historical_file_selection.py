@@ -47,6 +47,16 @@ class HistoricalFileSelectionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_oversized_inventory_reports_dirty_file_limit(self) -> None:
+        with (
+            mock.patch.object(selection, "MAX_CANDIDATE_FILES", 2),
+            self.assertRaisesRegex(
+                selection.FileSelectionError,
+                "More than 2 dirty files were found",
+            ),
+        ):
+            selection._bounded([{}, {}, {}])
+
     def test_clean_git_needs_no_file_confirmation(self) -> None:
         repository = self.root / "repo"
         _repository(repository)

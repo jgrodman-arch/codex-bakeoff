@@ -592,6 +592,181 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertEqual(candidate.diff, captured)
         self.assertEqual(recovery["changed_files"], ["changed.txt"])
 
+    def test_git_end_defaults_to_beginning_without_an_attributed_commit(self) -> None:
+        beginning = "a" * 40
+        baseline = {
+            "kind": "git_commit",
+            "repository": str(self.root),
+            "commit": beginning,
+            "beginning_kind": "git",
+            "ending_kind": "git",
+            "source_kind": "git",
+        }
+
+        with mock.patch.object(
+            bakeoff._discovery(),
+            "recover_historical_solution",
+            side_effect=RuntimeError("no attributed commit was recoverable"),
+        ):
+            reviewed = bakeoff._with_historical_ending_commit({}, baseline, "")
+
+        self.assertEqual(reviewed["ending_commit"], beginning)
+        self.assertEqual(reviewed["ending_commit_confidence"], "inferred")
+        self.assertTrue(reviewed["ending_commit_defaulted_to_beginning"])
+        self.assertFalse(reviewed["ending_commit_reviewed_override"])
+        self.assertIn(
+            "no attributed commit was recoverable",
+            reviewed["ending_commit_inference_error"],
+        )
+
+    def test_defaulted_git_end_includes_only_selected_untracked_files(self) -> None:
+        repository = self._git_repository("unchanged-head")
+        beginning = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        transcript = self.root / "unchanged-head.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "message-1",
+                    "message": {"role": "user", "content": "Add hello world"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        replay = {
+            "source_path": str(transcript),
+            "message_uuid": "message-1",
+            "task_scope": "whole_thread",
+        }
+        baseline = bakeoff._with_historical_ending_commit(
+            replay,
+            {
+                "kind": "git_commit",
+                "repository": str(repository),
+                "commit": beginning,
+                "beginning_kind": "git",
+                "ending_kind": "git",
+                "source_kind": "git",
+            },
+            "",
+        )
+        selected_paths = ("hello.py", "hello_test.py", "README.md")
+        for path in selected_paths:
+            (repository / path).write_text(f"{path}\n", encoding="utf-8")
+        selection = bakeoff._file_selection().select_git(
+            repository,
+            claude_output_files=selected_paths,
+            confirmed=True,
+        )
+
+        candidate, recovery, _ = bakeoff._historical_candidate(
+            {"replay": replay, "baseline": baseline, "file_selection": selection}
+        )
+
+        self.assertEqual(baseline["ending_commit"], beginning)
+        self.assertEqual(set(recovery["changed_files"]), set(selected_paths))
+        self.assertEqual(recovery["attributed_dirty_file_count"], 3)
+        self.assertFalse(recovery["no_changes_attributed"])
+        for path in selected_paths:
+            self.assertIn(f"b/{path}", candidate.diff)
+
+    def test_reviewed_zero_dirty_file_attribution_allows_no_change(self) -> None:
+        repository = self._git_repository("reviewed-no-change")
+        beginning = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (repository / "unrelated.txt").write_text("local only\n", encoding="utf-8")
+        selection = bakeoff._file_selection().select_git(repository, confirmed=True)
+        transcript = self.root / "reviewed-no-change.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "message-1",
+                    "message": {"role": "user", "content": "Inspect the project"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        replay = {
+            "source_path": str(transcript),
+            "message_uuid": "message-1",
+            "task_scope": "whole_thread",
+        }
+        baseline = {
+            "kind": "git_commit",
+            "repository": str(repository),
+            "commit": beginning,
+            "ending_commit": beginning,
+            "beginning_kind": "git",
+            "ending_kind": "git",
+            "source_kind": "git",
+        }
+
+        candidate, recovery, _ = bakeoff._historical_candidate(
+            {"replay": replay, "baseline": baseline, "file_selection": selection}
+        )
+
+        self.assertEqual(candidate.diff, "")
+        self.assertEqual(recovery["changed_files"], [])
+        self.assertEqual(recovery["attributed_dirty_file_count"], 0)
+        self.assertTrue(recovery["no_changes_attributed"])
+        self.assertTrue(recovery["file_selection"]["confirmed"])
+        self.assertEqual(recovery["file_selection"]["claude_output_changes"], [])
+        self.assertEqual(
+            [item["path"] for item in recovery["file_selection"]["unselected_changes"]],
+            ["unrelated.txt"],
+        )
+
+    def test_unreviewed_zero_dirty_file_attribution_remains_blocked(self) -> None:
+        repository = self._git_repository("unreviewed-no-change")
+        beginning = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (repository / "unrelated.txt").write_text("local only\n", encoding="utf-8")
+        selection = bakeoff._file_selection().select_git(repository)
+        run = {
+            "replay": {
+                "source_path": str(self.root / "rollout.jsonl"),
+                "message_uuid": "message-1",
+            },
+            "baseline": {
+                "kind": "git_commit",
+                "repository": str(repository),
+                "commit": beginning,
+                "ending_commit": beginning,
+                "beginning_kind": "git",
+                "ending_kind": "git",
+            },
+            "file_selection": selection,
+        }
+
+        with (
+            mock.patch.object(
+                bakeoff._discovery(),
+                "recover_historical_solution",
+                return_value={"commit": beginning, "diff": "", "changed_files": []},
+            ),
+            self.assertRaisesRegex(
+                bakeoff.BakeoffError,
+                "No attributable historical Claude patch could be captured",
+            ),
+        ):
+            bakeoff._historical_candidate(run)
+
     def test_unchanged_inferred_ending_commit_is_not_recorded_as_an_override(self) -> None:
         inferred_commit = "b" * 40
         baseline = {

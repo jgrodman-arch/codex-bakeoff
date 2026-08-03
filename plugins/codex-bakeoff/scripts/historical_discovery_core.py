@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 from collections import Counter, deque
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path

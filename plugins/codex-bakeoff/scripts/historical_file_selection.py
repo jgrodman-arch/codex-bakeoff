@@ -198,7 +198,7 @@ def _is_gitlink(repository: Path, relative: str) -> bool:
 def _bounded(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(entries) > MAX_CANDIDATE_FILES:
         raise FileSelectionError(
-            "The current file inventory exceeds the classification file limit."
+            f"More than {MAX_CANDIDATE_FILES:,} dirty files were found."
         )
     return entries
 

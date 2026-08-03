@@ -624,6 +624,33 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         self.assertEqual(baseline["working_tree_state"], "unknown")
         self.assertIsNone(baseline["working_tree"]["evidence"])
 
+    def test_baseline_inspection_accepts_linked_sources(self) -> None:
+        subprocess.run(
+            ["git", "init", "-q", str(self.project)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        source = self.write_transcript(
+            "linked-source",
+            [
+                self.user("u1", "change it", "2026-01-01T09:59:00Z"),
+                *self.status_events("git status", cwd=self.project),
+            ],
+        )
+
+        baseline = discovery.inspect_baseline(
+            {
+                "project_dir": str(self.project),
+                "source_path": str(source),
+                "message_uuid": "u1",
+                "task_timestamp": "2026-01-01T09:59:00Z",
+                "linked_sources": [{"source_path": str(source)}],
+            }
+        )
+
+        self.assertEqual(baseline["repository"], str(self.project.resolve()))
+
     def test_undated_status_cannot_cross_mutation_cutoff(self) -> None:
         evidence = discovery._status_evidence(
             self.status_events("git status", cwd=self.project, timestamp=None),
