@@ -443,6 +443,12 @@
       white-space: nowrap;
     }
 
+    .thread__number {
+      margin-right: 7px;
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+    }
+
     .thread__meta {
       display: flex;
       flex-wrap: wrap;
@@ -1184,9 +1190,9 @@
         ["reporting", "Finalizing report"],
       ];
 
-      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v5";
+      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v6";
       const CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1";
-      const DRAFT_VERSION = 5;
+      const DRAFT_VERSION = 6;
       const DRAFT_STEPS = new Set(["thread", "configure"]);
 
       const state = {
@@ -1200,6 +1206,7 @@
         totalThreads: 0,
         query: "",
         selectedThreadId: "",
+        selectedThreadNumber: 0,
         selectedThread: null,
         inspection: null,
         models: [],
@@ -1294,6 +1301,9 @@
           version: DRAFT_VERSION,
           step: DRAFT_STEPS.has(value.step) ? value.step : "thread",
           selectedThreadId: text(value.selectedThreadId),
+          selectedThreadNumber: Number.isInteger(value.selectedThreadNumber) && value.selectedThreadNumber > 0
+            ? value.selectedThreadNumber
+            : 0,
           model: text(value.model),
           timeoutSeconds:
             Number.isInteger(timeoutSeconds) && timeoutSeconds >= 1 && timeoutSeconds <= 14400
@@ -1323,6 +1333,7 @@
           version: DRAFT_VERSION,
           step: DRAFT_STEPS.has(state.step) ? state.step : "thread",
           selectedThreadId: state.selectedThreadId,
+          selectedThreadNumber: state.selectedThreadNumber,
           model: state.model,
           timeoutSeconds: Number(state.timeoutSeconds),
           classifications: Object.fromEntries(
@@ -1499,6 +1510,12 @@
 
       function threadTitle(thread) {
         return text(thread?.title || thread?.name || thread?.request, "Untitled Claude thread");
+      }
+
+      function threadStepEyebrow(label) {
+        return state.selectedThreadNumber > 0
+          ? `${label} · Thread #${state.selectedThreadNumber}`
+          : label;
       }
 
       function normalizeModels(values) {
@@ -1685,6 +1702,7 @@
         state.notice = "";
         state.query = "";
         state.selectedThreadId = "";
+        state.selectedThreadNumber = 0;
         state.selectedThread = null;
         state.inspection = null;
         state.model = selectedModelDefault();
@@ -2224,8 +2242,9 @@
                   </div>`
                 : threads.length
                   ? `<div class="thread-list">
-                      ${threads.map((thread) => {
+                      ${threads.map((thread, index) => {
                         const id = threadId(thread);
+                        const number = index + 1;
                         const project = text(thread.project_dir, "No project detected");
                         const complexity = Number(thread.complexity_score);
                         const calls = Number(thread.tool_call_count);
@@ -2235,10 +2254,11 @@
                             class="thread"
                             data-action="select-thread"
                             data-thread-id="${escapeHtml(id)}"
+                            data-thread-number="${number}"
                             ${!id || state.busy || state.run ? "disabled" : ""}
                           >
                             <span>
-                              <span class="thread__title">${escapeHtml(threadTitle(thread))}</span>
+                              <span class="thread__title"><span class="thread__number">#${number}</span>${escapeHtml(threadTitle(thread))}</span>
                               <span class="thread__meta">
                                 <span>${escapeHtml(formatDate(thread.created_at))}</span>
                                 <span class="thread__project" title="${escapeHtml(project)}">${escapeHtml(project)}</span>
@@ -2658,6 +2678,7 @@
       }
 
       function renderConfigurationConfirmation(draft, capabilities) {
+        const configuration = reviewPayload();
         const selection = selectionPayload();
         const outputFiles = draft.ending_kind === "git"
           ? stringList(selection.claude_output_files)
@@ -2685,6 +2706,10 @@
                 <div class="configuration-review__row"><dt>Historical output</dt><dd>${outputFiles.length ? outputFiles.map((path) => `<code>${escapeHtml(path)}</code>`).join(", ") : "No additional files selected"}</dd></div>
                 <div class="configuration-review__row"><dt>Capability parity</dt><dd>${gaps.length ? `${gaps.length} ${gaps.length === 1 ? "gap" : "gaps"}` : "All observed capabilities matched"}</dd></div>
               </dl>
+              <details open>
+                <summary>Entire configuration</summary>
+                <pre>${escapeHtml(safeJson(configuration))}</pre>
+              </details>
             </div>
           </section>`;
       }
@@ -2708,7 +2733,7 @@
         const finalStep = state.configurationStep === CONFIGURATION_STEPS.length - 1;
         return `
           ${pageHeading(
-            "Configuration",
+            threadStepEyebrow("Configuration"),
             "Prepare the historical replay",
             "Complete each step, then review the exact configuration before starting."
           )}
@@ -2783,7 +2808,7 @@
         const runLog = text(run.run_log);
         return `
           ${pageHeading(
-            "Run in progress",
+            threadStepEyebrow("Run in progress"),
             completed ? "The comparison report is ready" : failed ? "The bakeoff stopped" : "Running the isolated replay",
             completed
               ? "Implementation, verification, and review completed."
@@ -3145,7 +3170,7 @@
         return `
           <section class="result-hero" aria-labelledby="page-title">
             <div>
-              <p class="eyebrow">Comparison complete</p>
+              <p class="eyebrow">${escapeHtml(threadStepEyebrow("Comparison complete"))}</p>
               <h1 id="page-title" tabindex="-1">${escapeHtml(outcome.headline)}</h1>
               <p>${escapeHtml(outcome.detail)}</p>
             </div>
@@ -3374,6 +3399,7 @@
               (thread) => threadId(thread) === restoredDraft.selectedThreadId
             );
             state.selectedThreadId = restoredDraft.selectedThreadId;
+            state.selectedThreadNumber = restoredDraft.selectedThreadNumber;
             state.selectedThread = selected || null;
             try {
               const payload = await callTool("inspect_thread", {
@@ -3428,7 +3454,7 @@
         }
       }
 
-      async function selectThread(id) {
+      async function selectThread(id, number) {
         if (state.busy || state.run) return;
         const selected = state.threads.find((thread) => threadId(thread) === id);
         if (!selected) return;
@@ -3438,6 +3464,7 @@
         state.error = "";
         state.notice = "";
         state.selectedThreadId = id;
+        state.selectedThreadNumber = Number.isInteger(number) && number > 0 ? number : 0;
         state.selectedThread = selected;
         state.inspection = null;
         state.classifications = Object.create(null);
@@ -3792,7 +3819,9 @@
         const action = target.dataset.action;
         if (action === "retry-init") initialize();
         if (action === "refresh-threads") loadThreads(state.query);
-        if (action === "select-thread") selectThread(target.dataset.threadId || "");
+        if (action === "select-thread") {
+          selectThread(target.dataset.threadId || "", Number(target.dataset.threadNumber));
+        }
         if (action === "configuration-next") nextConfigurationStep();
         if (action === "configuration-back") previousConfigurationStep();
         if (action === "configuration-step") {

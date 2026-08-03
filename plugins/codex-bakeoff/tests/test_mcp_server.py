@@ -406,7 +406,7 @@ class McpServerTests(unittest.TestCase):
             with mock.patch.object(server, "APP_HTML", Path("/deleted/controller.html")):
                 status, _, body = request("GET", "/")
             self.assertEqual(status, 200)
-            self.assertIn(b"codex-bakeoff.controller-draft.v5", body)
+            self.assertIn(b"codex-bakeoff.controller-draft.v6", body)
             self.assertNotIn(b"window.openai", body)
 
             tool_result = {
@@ -594,7 +594,7 @@ class McpServerTests(unittest.TestCase):
         snapshot = controller.split("function draftSnapshot()", 1)[1].split(
             "function saveDraft()", 1
         )[0]
-        self.assertIn("codex-bakeoff.controller-draft.v5", controller)
+        self.assertIn("codex-bakeoff.controller-draft.v6", controller)
         self.assertIn("codex-bakeoff.controller-session.v1", controller)
         self.assertIn("X-Codex-Bakeoff-Session", controller)
         self.assertIn("localStorage.getItem(CONTROLLER_SESSION_STORAGE_KEY)", controller)
@@ -622,6 +622,7 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("serverState.controller_log_path", controller)
         for field in (
             "selectedThreadId",
+            "selectedThreadNumber",
             "model",
             "timeoutSeconds",
             "classifications",
@@ -672,6 +673,8 @@ class McpServerTests(unittest.TestCase):
         self.assertIn('finalStep ? "approve-configuration"', configure)
         self.assertIn("Checking configuration", configure)
         self.assertIn("Review and confirm", configure)
+        self.assertIn("Entire configuration", configure)
+        self.assertIn("safeJson(configuration)", configure)
         self.assertIn("Approve with gaps and start", configure)
         self.assertIn('finalStep ? "approve-configuration" : "configuration-next"', configure)
         self.assertIn('data-action="configuration-back"', configure)
@@ -763,6 +766,16 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("state.busy === \"inspection\"", thread_step)
         self.assertIn("state.run ? \"disabled\"", thread_step)
         self.assertIn("Start another bakeoff", thread_step)
+        self.assertIn('data-thread-number="${number}"', thread_step)
+        self.assertIn('class="thread__number">#${number}', thread_step)
+
+        select_thread = controller.split("async function selectThread", 1)[1].split(
+            "async function prepareRun", 1
+        )[0]
+        self.assertIn("state.selectedThreadNumber =", select_thread)
+        self.assertIn('threadStepEyebrow("Configuration")', controller)
+        self.assertIn('threadStepEyebrow("Run in progress")', controller)
+        self.assertIn('threadStepEyebrow("Comparison complete")', controller)
 
         synthesis = controller.split("async function synthesizePrompt", 1)[1].split(
             "function resetController", 1
