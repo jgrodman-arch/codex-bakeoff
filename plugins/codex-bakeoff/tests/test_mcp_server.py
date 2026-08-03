@@ -573,10 +573,10 @@ class McpServerTests(unittest.TestCase):
             'confirm_empty_beginning: draft.beginning_kind === "non_git"',
             controller,
         )
-        self.assertIn(
-            "gitEnding && !draft.ending_commit.trim()",
-            configure,
-        )
+        refresh_check = controller.split("function selectionNeedsRefresh()", 1)[1].split(
+            "function selectionPayload", 1
+        )[0]
+        self.assertNotIn("ending_commit", refresh_check)
         self.assertIn("Ending commit", configure)
         self.assertIn('id="review-ending-commit"', configure)
         self.assertIn("Uncommitted files from this run", configure)

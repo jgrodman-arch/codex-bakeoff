@@ -1641,11 +1641,6 @@
             draft.beginning_kind === "git" &&
             draft.baseline_commit.trim().toLowerCase() !==
               text(baseline.commit).trim().toLowerCase()
-          ) ||
-          (
-            draft.ending_kind === "git" &&
-            draft.ending_commit.trim().toLowerCase() !==
-              text(baseline.ending_commit).trim().toLowerCase()
           )
         );
       }
@@ -2323,9 +2318,7 @@
         const gitBeginning = draft.beginning_kind === "git";
         const gitEnding = draft.ending_kind === "git";
         const configurationLocked = Boolean(state.run);
-        const selectionRefreshing = selectionNeedsRefresh() && !(
-          gitEnding && !draft.ending_commit.trim()
-        );
+        const selectionRefreshing = selectionNeedsRefresh();
         const requestMethod = state.promptGeneration || text(replay.request_generation?.method);
         const originalThreadId = text(
           replay.session_id || state.selectedThread?.session_id,
