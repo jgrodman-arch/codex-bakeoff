@@ -3,6 +3,8 @@
 // src/codex-worker.mjs
 import { createInterface } from "node:readline";
 import { spawn as spawn2 } from "node:child_process";
+import { accessSync, constants, readdirSync, statSync as statSync2 } from "node:fs";
+import { homedir } from "node:os";
 import path3 from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -914,7 +916,7 @@ function startStdioWorker({
   };
 }
 function defaultCodexFactory() {
-  const target = process.env.CODEX_CLI_PATH?.trim() || "codex";
+  const target = resolveCodexTarget();
   const env = Object.fromEntries(
     Object.entries(process.env).filter((entry) => entry[1] !== void 0)
   );
@@ -925,6 +927,71 @@ function defaultCodexFactory() {
     codexPathOverride: fileURLToPath(import.meta.url),
     env
   });
+}
+function resolveCodexTarget({
+  env = process.env,
+  platform = process.platform,
+  applicationRoots = defaultApplicationRoots(env, platform)
+} = {}) {
+  const configured = env.CODEX_CLI_PATH?.trim();
+  if (configured) return configured;
+  const executableName = platform === "win32" ? "codex.exe" : "codex";
+  const pathMatch = findExecutableOnPath(executableName, env, platform);
+  if (pathMatch) return pathMatch;
+  if (platform === "darwin") {
+    for (const applicationRoot of applicationRoots) {
+      for (const applicationName of codexApplicationNames(applicationRoot)) {
+        const candidate = path3.join(
+          applicationRoot,
+          applicationName,
+          "Contents",
+          "Resources",
+          "codex"
+        );
+        if (isExecutableFile(candidate)) return candidate;
+      }
+    }
+  }
+  return executableName;
+}
+function defaultApplicationRoots(env, platform) {
+  if (platform !== "darwin") return [];
+  const home = env.HOME?.trim() || homedir();
+  return ["/Applications", path3.join(home, "Applications")];
+}
+function findExecutableOnPath(executableName, env, platform) {
+  const pathValue = platform === "win32" ? Object.entries(env).find(([key]) => key.toLowerCase() === "path")?.[1] : env.PATH;
+  if (!pathValue) return null;
+  for (const directory of pathValue.split(path3.delimiter)) {
+    if (!directory) continue;
+    const candidate = path3.join(directory, executableName);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return null;
+}
+function codexApplicationNames(applicationRoot) {
+  try {
+    return readdirSync(applicationRoot, { withFileTypes: true }).filter(
+      (entry) => entry.isDirectory() && /^(?:Codex|ChatGPT).*\.app$/.test(entry.name)
+    ).map((entry) => entry.name).sort((left, right) => applicationPriority(left) - applicationPriority(right));
+  } catch {
+    return [];
+  }
+}
+function applicationPriority(name) {
+  if (name === "Codex.app") return 0;
+  if (name === "ChatGPT.app") return 1;
+  if (name.startsWith("Codex")) return 2;
+  return 3;
+}
+function isExecutableFile(candidate) {
+  try {
+    if (!statSync2(candidate).isFile()) return false;
+    accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 function startCodexCliWrapper() {
   const target = process.env[CLI_WRAPPER_TARGET_ENV]?.trim();
@@ -1126,5 +1193,6 @@ if (isMainModule()) {
 export {
   executeRunRequest,
   normalizeRunRequest,
+  resolveCodexTarget,
   startStdioWorker
 };

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -8,7 +8,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   executeRunRequest,
-  normalizeRunRequest
+  normalizeRunRequest,
+  resolveCodexTarget
 } from "../src/codex-worker.mjs";
 
 const workerRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -21,6 +22,54 @@ test.after(async () => {
     temporaryRoots.map(async (root) => {
       await rm(root, { recursive: true, force: true });
     })
+  );
+});
+
+test("resolves Codex from an explicit override, PATH, or a macOS app bundle", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "codex-bakeoff-discovery-"));
+  temporaryRoots.push(root);
+  const binDirectory = path.join(root, "bin");
+  const pathCodex = path.join(binDirectory, "codex");
+  const bundledCodex = path.join(
+    root,
+    "Codex Preview.app",
+    "Contents",
+    "Resources",
+    "codex"
+  );
+  await Promise.all([
+    mkdir(binDirectory, { recursive: true }),
+    mkdir(path.dirname(bundledCodex), { recursive: true })
+  ]);
+  await Promise.all([
+    writeFile(pathCodex, ""),
+    writeFile(bundledCodex, "")
+  ]);
+  await Promise.all([chmod(pathCodex, 0o755), chmod(bundledCodex, 0o755)]);
+
+  assert.equal(
+    resolveCodexTarget({
+      env: { CODEX_CLI_PATH: "/custom/codex", PATH: binDirectory },
+      platform: "darwin",
+      applicationRoots: [root]
+    }),
+    "/custom/codex"
+  );
+  assert.equal(
+    resolveCodexTarget({
+      env: { PATH: binDirectory },
+      platform: "darwin",
+      applicationRoots: [root]
+    }),
+    pathCodex
+  );
+  assert.equal(
+    resolveCodexTarget({
+      env: { PATH: "" },
+      platform: "darwin",
+      applicationRoots: [root]
+    }),
+    bundledCodex
   );
 });
 
