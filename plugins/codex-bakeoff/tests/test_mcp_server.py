@@ -1802,7 +1802,7 @@ class McpServerTests(unittest.TestCase):
                 log_label,
             ):
                 self.assertEqual(run_directory, Path(temporary).resolve())
-                self.assertEqual(log_label, "normalization:codex")
+                self.assertEqual(log_label, "normalization:codex-for-codex")
                 self.assertEqual(list(working_directory.iterdir()), [])
                 return {"thread_id": "normalize-thread", "worktree": str(working_directory)}
 
@@ -1824,6 +1824,127 @@ class McpServerTests(unittest.TestCase):
                         }
                     ],
                     normalization=True,
+                )
+
+    def test_claude_probe_requires_an_installed_cli(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary).resolve()
+            with mock.patch.object(server, "_claude_runtime", return_value=None):
+                availability = server._probe_claude_availability(run_directory)
+
+        self.assertFalse(availability["available"])
+        self.assertEqual(availability["reason_code"], "not_installed")
+
+    def test_claude_probe_requires_a_successful_api_request(self) -> None:
+        server = load_server()
+        response = subprocess.CompletedProcess(
+            args=["claude"],
+            returncode=0,
+            stdout=json.dumps({"is_error": False, "result": "READY"}),
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary).resolve()
+            with (
+                mock.patch.object(server, "_claude_runtime", return_value="/bin/claude"),
+                mock.patch.object(server, "_run_process", return_value=response),
+            ):
+                availability = server._probe_claude_availability(run_directory)
+
+        self.assertTrue(availability["available"])
+        self.assertEqual(availability["reason_code"], "available")
+
+    def test_claude_review_uses_structured_output_and_actual_model(self) -> None:
+        server = load_server()
+        response = subprocess.CompletedProcess(
+            args=["claude"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "is_error": False,
+                    "structured_output": {"categories": {}},
+                    "session_id": "claude-session",
+                    "duration_ms": 1250,
+                    "modelUsage": {
+                        "claude-sonnet-test": {"input_tokens": 10, "output_tokens": 5}
+                    },
+                }
+            ),
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary).resolve()
+            with mock.patch.object(server, "_run_process", return_value=response):
+                result = server._run_claude_review(
+                    {
+                        "model": "sonnet",
+                        "prompt": "Review both candidates.",
+                        "expected_schema": {"type": "object"},
+                    },
+                    run_directory=run_directory,
+                    working_directory=run_directory,
+                    executable="/bin/claude",
+                    log_label="review:claude",
+                )
+
+        self.assertEqual(result["evaluator"], "claude")
+        self.assertEqual(result["model"], "claude-sonnet-test")
+        self.assertEqual(result["thread_id"], "claude-session")
+        self.assertEqual(json.loads(result["final_output"]), {"categories": {}})
+        self.assertEqual(result["usage"]["input_tokens"], 10)
+
+    def test_claude_review_never_uses_the_codex_worker(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_directory = Path(temporary).resolve()
+            reviews = run_directory / "reviews"
+            reviews.mkdir()
+            candidate_paths = []
+            for label in ("a", "b"):
+                path = reviews / f"candidate-{label}.json"
+                path.write_text(json.dumps({"label": label.upper()}), encoding="utf-8")
+                candidate_paths.append(str(path))
+            with (
+                mock.patch.object(server, "_claude_runtime", return_value="/bin/claude"),
+                mock.patch.object(
+                    server,
+                    "_run_claude_review",
+                    return_value={
+                        "status": "completed",
+                        "evaluator": "claude",
+                        "model": "claude-test",
+                        "final_output": "{}",
+                    },
+                ) as claude_review,
+                mock.patch.object(server, "_run_worker") as codex_worker,
+            ):
+                paths = server._run_review_requests(
+                    run_directory,
+                    [
+                        {
+                            "evaluator": "claude",
+                            "model": "sonnet",
+                            "prompt": f"Read {candidate_paths[0]} and {candidate_paths[1]}",
+                            "candidate_paths": candidate_paths,
+                            "expected_schema": {"type": "object"},
+                        }
+                    ],
+                )
+
+            codex_worker.assert_not_called()
+            claude_review.assert_called_once()
+            recorded = json.loads(paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(recorded["evaluator"], "claude")
+            self.assertEqual(list((run_directory / "review-workspaces").iterdir()), [])
+
+    def test_unknown_review_evaluator_is_rejected(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(server.ControllerError, "Unsupported review evaluator"):
+                server._run_review_requests(
+                    Path(temporary).resolve(),
+                    [{"evaluator": "other", "model": "test", "prompt": "Review"}],
                 )
 
     def test_materialized_git_workspace_is_isolated_at_requested_commit(self) -> None:

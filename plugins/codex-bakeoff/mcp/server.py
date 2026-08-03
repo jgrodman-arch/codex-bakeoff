@@ -67,6 +67,8 @@ MAX_REQUEST_SYNTHESIS_CACHE_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_SYNTHESIS_BYTES = 256 * 1024
 REQUEST_SYNTHESIS_MODEL = "gpt-5.6-terra"
 CONTROLLER_SMOKE_TEST_MODEL = "gpt-5.6-sol"
+CLAUDE_REVIEW_MODEL = "sonnet"
+CLAUDE_PROBE_TIMEOUT = 60
 REQUEST_SYNTHESIS_CACHE_PATH = CONTROLLER_CACHE_ROOT / "request-synthesis-cache.json"
 REQUEST_SYNTHESIS_SCHEMA = {
     "type": "object",
@@ -186,6 +188,16 @@ def _node_runtime() -> str:
         "Node.js 18 or newer could not be found. Install Node.js or set "
         "CODEX_MCP_NODE_PATH to an executable Node runtime."
     )
+
+
+def _claude_runtime() -> str | None:
+    executable = shutil.which("claude")
+    if executable is None:
+        return None
+    candidate = Path(executable).resolve()
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        return None
+    return str(candidate)
 
 
 def _utc_now() -> str:
@@ -2040,6 +2052,208 @@ def _run_worker(
     }
 
 
+def _claude_command(
+    executable: str,
+    *,
+    model: str,
+    schema: Mapping[str, Any] | None = None,
+    tools: str = "",
+) -> list[str]:
+    command = [
+        executable,
+        "--print",
+        "--output-format",
+        "json",
+        "--model",
+        model,
+        "--safe-mode",
+        "--no-session-persistence",
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        tools,
+    ]
+    if tools:
+        command.extend(("--allowedTools", tools))
+    if schema is not None:
+        command.extend(
+            ("--json-schema", json.dumps(dict(schema), ensure_ascii=False, separators=(",", ":")))
+        )
+    return command
+
+
+def _parse_claude_envelope(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise ControllerError("The Claude CLI returned invalid JSON.") from error
+    if not isinstance(payload, Mapping):
+        raise ControllerError("The Claude CLI returned an invalid response.")
+    if completed.returncode != 0 or payload.get("is_error") is True:
+        raise ControllerError("The Claude CLI request failed.")
+    return dict(payload)
+
+
+def _claude_final_output(payload: Mapping[str, Any]) -> str:
+    structured = payload.get("structured_output")
+    if structured is not None:
+        return json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
+    result = payload.get("result")
+    if not isinstance(result, str) or not result.strip():
+        raise ControllerError("The Claude CLI returned no final response.")
+    return result
+
+
+def _claude_model_and_usage(
+    payload: Mapping[str, Any],
+    requested_model: str,
+) -> tuple[str, dict[str, Any]]:
+    usage = payload.get("usage")
+    normalized_usage = dict(usage) if isinstance(usage, Mapping) else {}
+    model_usage = payload.get("modelUsage")
+    if isinstance(model_usage, Mapping):
+        models = [str(model) for model in model_usage if str(model)]
+        if len(models) == 1:
+            model = models[0]
+            model_record = model_usage.get(model)
+            if not normalized_usage and isinstance(model_record, Mapping):
+                fields = {
+                    "input_tokens": ("input_tokens", "inputTokens"),
+                    "output_tokens": ("output_tokens", "outputTokens"),
+                    "cache_read_input_tokens": (
+                        "cache_read_input_tokens",
+                        "cacheReadInputTokens",
+                    ),
+                    "cache_creation_input_tokens": (
+                        "cache_creation_input_tokens",
+                        "cacheCreationInputTokens",
+                    ),
+                }
+                normalized_usage = {
+                    target: next(
+                        (model_record[source] for source in sources if source in model_record),
+                        0,
+                    )
+                    for target, sources in fields.items()
+                }
+            return model, normalized_usage
+    return requested_model, normalized_usage
+
+
+def _probe_claude_availability(run_directory: Path) -> dict[str, Any]:
+    executable = _claude_runtime()
+    if executable is None:
+        return {
+            "id": "claude",
+            "provider": "claude",
+            "model": CLAUDE_REVIEW_MODEL,
+            "available": False,
+            "reason_code": "not_installed",
+            "reason": "Claude CLI is not installed or executable.",
+        }
+    with tempfile.TemporaryDirectory(prefix="claude-probe-", dir=run_directory) as temporary:
+        try:
+            completed = _run_process(
+                _claude_command(executable, model=CLAUDE_REVIEW_MODEL),
+                cwd=Path(temporary),
+                timeout=CLAUDE_PROBE_TIMEOUT,
+                input_text="Reply with exactly READY. Do not use tools.",
+                stream_log_path=_run_log_path(run_directory),
+                stream_log_label="review-probe:claude",
+                run_id=run_directory.name,
+                env=dict(os.environ),
+            )
+            payload = _parse_claude_envelope(completed)
+            _claude_final_output(payload)
+        except subprocess.TimeoutExpired:
+            return {
+                "id": "claude",
+                "provider": "claude",
+                "model": CLAUDE_REVIEW_MODEL,
+                "available": False,
+                "executable": executable,
+                "reason_code": "probe_timed_out",
+                "reason": "Claude CLI API probe timed out.",
+            }
+        except ControllerError:
+            return {
+                "id": "claude",
+                "provider": "claude",
+                "model": CLAUDE_REVIEW_MODEL,
+                "available": False,
+                "executable": executable,
+                "reason_code": "api_unreachable",
+                "reason": "Claude CLI could not complete an API request.",
+            }
+    return {
+        "id": "claude",
+        "provider": "claude",
+        "model": CLAUDE_REVIEW_MODEL,
+        "available": True,
+        "executable": executable,
+        "reason_code": "available",
+        "reason": "Claude CLI completed an API request.",
+    }
+
+
+def _run_claude_review(
+    request: Mapping[str, Any],
+    *,
+    run_directory: Path,
+    working_directory: Path,
+    executable: str,
+    log_label: str,
+) -> dict[str, Any]:
+    model = request.get("model")
+    prompt = request.get("prompt")
+    schema = request.get("expected_schema")
+    if not isinstance(model, str) or not model:
+        raise ControllerError("The Claude review request has no model.")
+    if not isinstance(prompt, str) or not prompt:
+        raise ControllerError("The Claude review request has no prompt.")
+    if not isinstance(schema, Mapping):
+        raise ControllerError("The Claude review request has no output schema.")
+    timeout = _request_timeout_seconds(request, default=600)
+    started = time.monotonic()
+    try:
+        completed = _run_process(
+            _claude_command(executable, model=model, schema=schema, tools="Read"),
+            cwd=working_directory,
+            timeout=timeout,
+            input_text=prompt,
+            stream_log_path=_run_log_path(run_directory),
+            stream_log_label=log_label,
+            run_id=run_directory.name,
+            env=dict(os.environ),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ControllerError("The Claude reviewer timed out.") from error
+    payload = _parse_claude_envelope(completed)
+    final_output = _claude_final_output(payload)
+    actual_model, usage = _claude_model_and_usage(payload, model)
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        session_id = f"claude-{secrets.token_hex(8)}"
+    duration_ms = payload.get("duration_ms")
+    elapsed = (
+        float(duration_ms) / 1000
+        if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool)
+        else time.monotonic() - started
+    )
+    return {
+        "status": "completed",
+        "thread_id": session_id,
+        "worktree": str(working_directory),
+        "requested_worktree": str(working_directory),
+        "model": actual_model,
+        "elapsed_seconds": round(max(elapsed, 0.0), 6),
+        "usage": usage,
+        "final_output": final_output,
+        "final_response": final_output,
+        "evaluator": "claude",
+    }
+
+
 def _run_controller_smoke_test() -> None:
     try:
         with tempfile.TemporaryDirectory(prefix="codex-bakeoff-smoke-") as temporary:
@@ -2402,6 +2616,8 @@ def _run_review_requests(
         evaluator = raw.get("normalization_for") if normalization else raw.get("evaluator")
         if not isinstance(evaluator, str) or not evaluator:
             raise ControllerError("A review request has no evaluator.")
+        if not normalization and evaluator not in {"codex", "claude"}:
+            raise ControllerError(f"Unsupported review evaluator: {evaluator}")
         request = dict(raw)
         with tempfile.TemporaryDirectory(
             prefix="normalization-" if normalization else "review-",
@@ -2435,25 +2651,53 @@ def _run_review_requests(
                     isolated_paths.append(str(destination))
                 request["prompt"] = prompt
                 request["candidate_paths"] = isolated_paths
-            worker = _run_worker(
-                request,
-                run_directory=run_directory,
-                working_directory=workspace,
-                read_only=True,
-                log_label=f"{'normalization' if normalization else 'review'}:{evaluator}",
+            log_label = (
+                f"normalization:codex-for-{evaluator}"
+                if normalization
+                else f"review:{evaluator}"
             )
-            collected = _collect_result(
-                run_directory,
-                worker,
-                evaluator=None if normalization else evaluator,
-                normalization_for=evaluator if normalization else None,
-                timeout=_long_command_timeout(raw, default=600),
-            )
-        key = "native_result_path"
-        path = collected.get(key)
-        if not isinstance(path, str):
-            raise ControllerError("A reviewer result was not recorded.")
-        results.append(Path(path).resolve())
+            if normalization or evaluator == "codex":
+                worker = _run_worker(
+                    request,
+                    run_directory=run_directory,
+                    working_directory=workspace,
+                    read_only=True,
+                    log_label=log_label,
+                )
+                collected = _collect_result(
+                    run_directory,
+                    worker,
+                    evaluator=None if normalization else evaluator,
+                    normalization_for=evaluator if normalization else None,
+                    timeout=_long_command_timeout(raw, default=600),
+                )
+                path = collected.get("native_result_path")
+                if not isinstance(path, str):
+                    raise ControllerError("A reviewer result was not recorded.")
+                results.append(Path(path).resolve())
+                continue
+
+            executable = _claude_runtime()
+            try:
+                if executable is None:
+                    raise ControllerError("The Claude CLI became unavailable after its probe.")
+                result = _run_claude_review(
+                    request,
+                    run_directory=run_directory,
+                    working_directory=workspace,
+                    executable=executable,
+                    log_label=log_label,
+                )
+            except ControllerError as error:
+                result = {
+                    "status": "failed",
+                    "evaluator": "claude",
+                    "model": str(request.get("model") or CLAUDE_REVIEW_MODEL),
+                    "error": str(error)[:2_000],
+                }
+            path = run_directory / "reviews" / f"claude-{secrets.token_hex(8)}.json"
+            _write_json(path, result)
+            results.append(path.resolve())
     return results
 
 
@@ -2502,15 +2746,47 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             timeout=long_timeout,
             run_directory=run_directory,
         )
+        claude_availability = _probe_claude_availability(run_directory)
+        evaluator_availability = [
+            {
+                "id": "codex",
+                "provider": "codex",
+                "model": str(task_request.get("model") or CONTROLLER_SMOKE_TEST_MODEL),
+                "available": True,
+                "reason_code": "available",
+                "reason": "Native Codex review is available through the app.",
+            },
+            claude_availability,
+        ]
+        selected_evaluators = ["codex"]
+        if claude_availability.get("available") is True:
+            selected_evaluators.append("claude")
         _update_state(
             run_directory,
             phase="reviewing",
-            summary="Running the available blinded Codex review.",
-            details={"verification_status": verification.get("status")},
+            summary=f"Running blinded review with {', '.join(selected_evaluators)}.",
+            details={
+                "verification_status": verification.get("status"),
+                "selected_evaluators": selected_evaluators,
+                "evaluator_availability": evaluator_availability,
+            },
         )
+        evaluation_arguments = [
+            "--run-dir",
+            str(run_directory),
+            *[
+                argument
+                for evaluator in selected_evaluators
+                for argument in ("--evaluator", evaluator)
+            ],
+            "--claude-model",
+            CLAUDE_REVIEW_MODEL,
+            "--evaluator-availability-json",
+            json.dumps(evaluator_availability, ensure_ascii=False),
+        ]
         evaluation = _engine(
             "evaluate",
-            ["--run-dir", str(run_directory), "--evaluator", "codex"],
+            evaluation_arguments,
             timeout=long_timeout,
             run_directory=run_directory,
         )

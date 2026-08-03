@@ -14,12 +14,11 @@ import subprocess
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 MODEL_PRICING_PATH = PLUGIN_ROOT / "assets" / "model-pricing.json"
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
-DEFAULT_DENIED_HOSTS = ("api.anthropic.com", "claude.ai")
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 REVIEW_CATEGORIES = (
     "task_completion",
@@ -616,18 +615,8 @@ def aggregate_reviews(reviews: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {"reviews": normalized, "totals": totals}
 
 
-def _host_is_denied(host: str, denied_hosts: Iterable[str]) -> bool:
-    normalized = host.casefold().strip(".")
-    return any(
-        normalized == denied.casefold().strip(".")
-        or normalized.endswith(f".{denied.casefold().strip('.')}")
-        for denied in denied_hosts
-    )
-
-
 def check_evaluator_availability(
     *,
-    denied_hosts: Iterable[str] = DEFAULT_DENIED_HOSTS,
     codex_model: str = "gpt-5.6-sol",
 ) -> list[dict[str, Any]]:
     available = [
@@ -639,18 +628,13 @@ def check_evaluator_availability(
             "reason": "Native Codex review is available through the app.",
         }
     ]
-    claude_denied = any(_host_is_denied(host, denied_hosts) for host in ("api.anthropic.com",))
     available.append(
         {
             "id": "claude",
             "provider": "claude",
-            "model": "claude",
-            "available": not claude_denied,
-            "reason": (
-                "The Anthropic endpoint is blocked by the active network policy."
-                if claude_denied
-                else "Claude review is available."
-            ),
+            "model": "sonnet",
+            "available": False,
+            "reason": "Claude requires a live controller runtime probe.",
         }
     )
     return available
@@ -1152,6 +1136,17 @@ def render_report_html(report: Mapping[str, Any]) -> str:
                 f"<td>{esc(rendered_outcome)}</td>"
                 f"<td>{esc(explanation)}</td></tr>"
             )
+    for availability in sequence(evaluation.get("evaluator_availability")):
+        if not isinstance(availability, Mapping) or availability.get("available") is True:
+            continue
+        evaluation_rows.append(
+            "<tr>"
+            f"<td>{esc(availability.get('id') or 'Unknown')}</td>"
+            f"<td><code>{esc(availability.get('model') or 'Unknown')}</code></td>"
+            '<td>Availability</td><td>Skipped</td>'
+            f"<td>{esc(availability.get('reason') or 'The evaluator was unavailable.')}</td>"
+            "</tr>"
+        )
     if not evaluation_rows:
         evaluation_rows.append(
             '<tr><td colspan="5" class="muted">No head-to-head evaluations are available.</td></tr>'

@@ -13,7 +13,7 @@ import secrets
 import stat
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1851,13 +1851,30 @@ def _command_verify(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _available_evaluators(model: str) -> list[dict[str, Any]]:
-    denied = os.environ.get("CODEX_BAKEOFF_DENIED_HOSTS", "api.anthropic.com,claude.ai")
-    entries = _execution().check_evaluator_availability(
-        denied_hosts=[item.strip() for item in denied.split(",") if item.strip()],
-        codex_model=model,
-    )
-    return [item for item in entries if item.get("available") is True]
+def _selected_evaluators(
+    codex_model: str,
+    requested: Sequence[str] | None,
+    *,
+    claude_model: str,
+) -> list[dict[str, Any]]:
+    selected = list(requested or ("codex",))
+    evaluators = {
+        "codex": {"id": "codex", "provider": "codex", "model": codex_model},
+        "claude": {"id": "claude", "provider": "claude", "model": claude_model},
+    }
+    return [evaluators[evaluator] for evaluator in selected]
+
+
+def _evaluator_availability(raw: str | None) -> list[dict[str, Any]]:
+    if not raw:
+        return []
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise BakeoffError("Evaluator availability is not valid JSON.") from error
+    if not isinstance(loaded, list) or not all(isinstance(item, Mapping) for item in loaded):
+        raise BakeoffError("Evaluator availability must be a JSON list of objects.")
+    return [dict(item) for item in loaded]
 
 
 def _command_reviewers(args: argparse.Namespace) -> dict[str, Any]:
@@ -1888,10 +1905,12 @@ def _command_evaluate(args: argparse.Namespace) -> dict[str, Any]:
         _write_report(run_directory, report)
         return {"status": "unavailable", "task_requests": []}
     run = _load_json(run_directory / "run.json", label="the bakeoff run")
-    evaluators = _available_evaluators(str(run.get("model") or "gpt-5.6-sol"))
-    if args.evaluator:
-        allowed = set(args.evaluator)
-        evaluators = [item for item in evaluators if item.get("id") in allowed]
+    evaluators = _selected_evaluators(
+        str(run.get("model") or "gpt-5.6-sol"),
+        args.evaluator,
+        claude_model=args.claude_model,
+    )
+    availability = _evaluator_availability(args.evaluator_availability_json)
     requests = _execution().prepare_review(
         run_directory=run_directory,
         original_request=str(report.get("original_request") or ""),
@@ -1900,7 +1919,11 @@ def _command_evaluate(args: argparse.Namespace) -> dict[str, Any]:
     )
     _write_json(
         run_directory / "review.json",
-        {"status": "awaiting_native_tasks", "task_requests": requests},
+        {
+            "status": "awaiting_native_tasks",
+            "task_requests": requests,
+            "evaluator_availability": availability,
+        },
     )
     return {
         "status": "native_task_required" if requests else "unavailable",
@@ -1927,6 +1950,13 @@ def _command_collect_native_results(args: argparse.Namespace) -> dict[str, Any]:
 def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     run_directory = _run_directory(args.run_dir)
     report = _load_json(run_directory / "report.json", label="the bakeoff report")
+    run = _load_json(run_directory / "run.json", label="the bakeoff run")
+    review_path = run_directory / "review.json"
+    review_state = (
+        _load_json(review_path, label="the review state") if review_path.is_file() else {}
+    )
+    availability = review_state.get("evaluator_availability")
+    availability = availability if isinstance(availability, list) else []
     combined = _load_json(
         args.native_results.expanduser().resolve(),
         label="the native reviewer results",
@@ -1953,6 +1983,16 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             continue
         evaluator = str(result.get("evaluator") or "")
         model = str(result.get("model") or "")
+        if result.get("status") not in {None, "completed"}:
+            reviews.append(
+                {
+                    "evaluator": evaluator,
+                    "model": model,
+                    "status": "failed",
+                    "error": _redact(result.get("error") or "The reviewer failed."),
+                }
+            )
+            continue
         raw_ballot = str(result.get("final_output") or "")
         try:
             ballot = _execution().parse_review_ballot(raw_ballot)
@@ -1962,7 +2002,10 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 normalization_requests.append(
                     _execution().prepare_review_normalization(
                         evaluator=evaluator,
-                        model=model,
+                        model=str(
+                            run.get("model")
+                            or (model if evaluator == "codex" else "gpt-5.6-sol")
+                        ),
                         raw_ballot=raw_ballot,
                     )
                 )
@@ -2047,6 +2090,7 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             "reviews": reviews,
             "totals": {"A": 0, "B": 0},
             "task_requests": normalization_requests,
+            "evaluator_availability": availability,
         }
         report["evaluation"] = pending
         _write_report(run_directory, report)
@@ -2071,7 +2115,14 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     )
     aggregate["status"] = "completed" if valid else "unavailable"
     aggregate["candidate_mapping"] = {"A": "claude", "B": "codex"}
+    aggregate["reviews"] = reviews
     aggregate["all_results"] = reviews
+    aggregate["evaluator_availability"] = availability
+    aggregate["limitations"] = [
+        str(item.get("reason") or "Claude evaluator unavailable.")
+        for item in availability
+        if item.get("id") == "claude" and item.get("available") is not True
+    ]
     report["evaluation"] = aggregate
     _write_report(run_directory, report)
     _write_json(run_directory / "review.json", aggregate)
@@ -2298,6 +2349,8 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("--run-dir", type=Path, required=True)
     evaluate.add_argument("--evaluator", action="append", choices=("codex", "claude"))
+    evaluate.add_argument("--claude-model", default="sonnet")
+    evaluate.add_argument("--evaluator-availability-json")
     _add_json(evaluate)
 
     collect_reviews = commands.add_parser("collect-native-results")

@@ -2035,6 +2035,41 @@ class LeanBakeoffTests(unittest.TestCase):
             "awaiting_native_task",
         )
 
+    def test_invalid_claude_ballot_is_normalized_by_the_codex_model(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        bakeoff._write_json(run_directory / "run.json", {"model": "gpt-normalizer"})
+        bakeoff._write_json(
+            run_directory / "report.json",
+            {"status": "completed", "original_request": "Build the thing"},
+        )
+        native_results = run_directory / "reviews" / "results.json"
+        bakeoff._write_json(
+            native_results,
+            {
+                "results": [
+                    {
+                        "status": "completed",
+                        "evaluator": "claude",
+                        "model": "claude-sonnet-test",
+                        "final_output": _review_ballot(field="choice"),
+                    }
+                ]
+            },
+        )
+
+        result = bakeoff._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=None,
+            )
+        )
+
+        request = result["task_requests"][0]
+        self.assertEqual(request["normalization_for"], "claude")
+        self.assertEqual(request["model"], "gpt-normalizer")
+
     def test_normalized_review_is_validated_scored_and_recorded(self) -> None:
         run_directory = self.root / "run"
         run_directory.mkdir()
@@ -2135,6 +2170,57 @@ class LeanBakeoffTests(unittest.TestCase):
             result["evaluation"]["all_results"][0]["normalization"]["status"],
             "failed",
         )
+
+    def test_failed_claude_review_preserves_the_codex_ballot(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        bakeoff._write_json(run_directory / "run.json", {"model": "gpt-test"})
+        bakeoff._write_json(
+            run_directory / "report.json",
+            {"status": "completed", "original_request": "Build the thing"},
+        )
+        bakeoff._write_json(
+            run_directory / "review.json",
+            {
+                "evaluator_availability": [
+                    {"id": "codex", "available": True},
+                    {"id": "claude", "available": True},
+                ]
+            },
+        )
+        native_results = run_directory / "reviews" / "results.json"
+        bakeoff._write_json(
+            native_results,
+            {
+                "results": [
+                    {
+                        "status": "completed",
+                        "evaluator": "codex",
+                        "model": "gpt-test",
+                        "final_output": _review_ballot(),
+                    },
+                    {
+                        "status": "failed",
+                        "evaluator": "claude",
+                        "model": "sonnet",
+                        "error": "Claude reviewer failed.",
+                    },
+                ]
+            },
+        )
+
+        result = bakeoff._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=None,
+            )
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["evaluation"]["totals"], {"A": 1, "B": 2})
+        self.assertEqual(result["evaluation"]["reviews"][1]["evaluator"], "claude")
+        self.assertEqual(result["evaluation"]["reviews"][1]["status"], "failed")
 
     def test_legacy_classified_result_must_come_from_registered_project(self) -> None:
         expected = self.root / "registered"

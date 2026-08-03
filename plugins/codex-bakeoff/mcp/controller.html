@@ -3073,6 +3073,15 @@
         for (const review of asArray(evaluation.reviews)) {
           if (!isObject(review)) continue;
           const categories = isObject(review.ballot?.categories) ? review.ballot.categories : {};
+          if (!Object.keys(categories).length && review.status === "failed") {
+            rows.push({
+              evaluator: text(review.evaluator, "Unknown"),
+              model: text(review.model, "Unknown"),
+              category: "Review",
+              outcome: "Failed",
+              explanation: text(review.error, "The reviewer failed."),
+            });
+          }
           for (const [category, raw] of Object.entries(categories)) {
             const decision = isObject(raw) ? raw : {};
             rows.push({
@@ -3083,6 +3092,16 @@
               explanation: expandCandidateLabels(decision.explanation),
             });
           }
+        }
+        for (const availability of asArray(evaluation.evaluator_availability)) {
+          if (!isObject(availability) || availability.available === true) continue;
+          rows.push({
+            evaluator: text(availability.id, "Unknown"),
+            model: text(availability.model, "Unknown"),
+            category: "Availability",
+            outcome: "Skipped",
+            explanation: text(availability.reason, "The evaluator was unavailable."),
+          });
         }
         if (!rows.length) return `<p class="empty">No validated blind review ballot is available.</p>`;
         return `
