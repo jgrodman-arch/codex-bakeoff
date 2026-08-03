@@ -90,6 +90,16 @@
       padding: 24px;
     }
 
+    .plugin-version {
+      position: fixed;
+      top: 12px;
+      right: 16px;
+      z-index: 10;
+      color: var(--faint);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+
     .layout {
       display: grid;
       grid-template-columns: 218px minmax(0, 1fr);
@@ -1210,6 +1220,7 @@
         reportPaths: null,
         runRoot: "",
         controllerLogPath: "",
+        pluginVersion: "",
         pollGeneration: 0,
       };
 
@@ -3269,6 +3280,9 @@
           : null;
         saveDraft();
         app.innerHTML = `
+          ${state.pluginVersion
+            ? `<div class="plugin-version">v${escapeHtml(state.pluginVersion)}</div>`
+            : ""}
           <div class="layout">
             ${renderRail()}
             <main class="workspace" aria-labelledby="page-title">
@@ -3333,6 +3347,7 @@
           const serverState = isObject(statePayload.state) ? statePayload.state : statePayload;
           state.runRoot = text(serverState.run_root);
           state.controllerLogPath = text(serverState.controller_log_path);
+          state.pluginVersion = text(serverState.plugin_version);
           state.models = normalizeModels(serverState.models);
           state.model = state.models.some((model) => model.id === restoredDraft?.model)
             ? restoredDraft.model
