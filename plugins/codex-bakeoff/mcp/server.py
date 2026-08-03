@@ -82,6 +82,7 @@ HTTP_TOOL_NAMES = frozenset(
         "synthesize_request",
         "prepare_run",
         "start_run",
+        "cancel_run",
         "get_run",
         "get_report",
     }
@@ -101,6 +102,8 @@ _jobs: dict[str, threading.Thread] = {}
 _jobs_lock = threading.RLock()
 _prepared_runs: dict[str, dict[str, Any]] = {}
 _active_processes: set[subprocess.Popen[str]] = set()
+_run_processes: dict[str, set[subprocess.Popen[str]]] = {}
+_run_cancellations: dict[str, threading.Event] = {}
 _active_processes_lock = threading.RLock()
 _pending_port_conflicts: dict[str, dict[str, Any]] = {}
 _pending_port_conflicts_lock = threading.Lock()
@@ -111,6 +114,10 @@ _shutdown = threading.Event()
 
 class ControllerError(ValueError):
     """A safe user-facing controller error."""
+
+
+class RunCancelled(RuntimeError):
+    """An active bakeoff was cancelled by the user."""
 
 
 class WorkerError(ControllerError):
@@ -1224,18 +1231,24 @@ def _run_process(
     input_text: str | None = None,
     stream_log_path: Path | None = None,
     stream_log_label: str = "process",
+    run_id: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        list(command),
-        cwd=cwd,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
     with _active_processes_lock:
+        cancellation = _run_cancellations.get(run_id) if run_id is not None else None
+        if cancellation is not None and cancellation.is_set():
+            raise RunCancelled("The bakeoff was cancelled.")
+        process = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         _active_processes.add(process)
+        if cancellation is not None and run_id is not None:
+            _run_processes.setdefault(run_id, set()).add(process)
     if stream_log_path is not None:
         _append_run_log(stream_log_path, stream_log_label, "started")
         stdout_chunks: list[str] = []
@@ -1290,8 +1303,16 @@ def _run_process(
         finally:
             with _active_processes_lock:
                 _active_processes.discard(process)
+                if run_id is not None:
+                    processes = _run_processes.get(run_id)
+                    if processes is not None:
+                        processes.discard(process)
+                        if not processes:
+                            _run_processes.pop(run_id, None)
         stdout_thread.join()
         stderr_thread.join()
+        if cancellation is not None and cancellation.is_set():
+            raise RunCancelled("The bakeoff was cancelled.")
         _append_run_log(
             stream_log_path,
             stream_log_label,
@@ -1317,6 +1338,14 @@ def _run_process(
     finally:
         with _active_processes_lock:
             _active_processes.discard(process)
+            if run_id is not None:
+                processes = _run_processes.get(run_id)
+                if processes is not None:
+                    processes.discard(process)
+                    if not processes:
+                        _run_processes.pop(run_id, None)
+    if cancellation is not None and cancellation.is_set():
+        raise RunCancelled("The bakeoff was cancelled.")
     return subprocess.CompletedProcess(
         args=list(command),
         returncode=process.returncode,
@@ -1349,6 +1378,7 @@ def _engine(
             cwd=PLUGIN_ROOT,
             timeout=bounded_timeout,
             input_text=input_text,
+            run_id=run_directory.name if run_directory is not None else None,
         )
     except subprocess.TimeoutExpired:
         if log_path is not None:
@@ -1678,6 +1708,8 @@ def _update_state(
     path = _state_path(run_directory)
     with _jobs_lock:
         state = _read_json(path)
+        if state.get("status") == "cancelled" and status != "cancelled":
+            raise RunCancelled("The bakeoff was cancelled.")
         if phase is not None:
             previous = str(state.get("phase") or "")
             rows = state.get("phases")
@@ -1750,6 +1782,7 @@ def _subprocess(
             command,
             cwd=cwd,
             timeout=timeout,
+            run_id=run_directory.name if run_directory is not None else None,
         )
     except subprocess.TimeoutExpired:
         if log_path is not None:
@@ -1899,6 +1932,7 @@ def _run_worker(
         timeout=timeout,
         stream_log_path=_run_log_path(run_directory),
         stream_log_label=log_label,
+        run_id=run_directory.name,
     )
     records: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
@@ -2493,6 +2527,8 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
                 },
             },
         )
+    except RunCancelled:
+        pass
     except Exception as error:  # noqa: BLE001 - the durable state must record every failure.
         try:
             _update_state(
@@ -2509,6 +2545,9 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
     finally:
         with _jobs_lock:
             _jobs.pop(run_directory.name, None)
+        with _active_processes_lock:
+            _run_processes.pop(run_directory.name, None)
+            _run_cancellations.pop(run_directory.name, None)
 
 
 def _persisted_run_for_token(
@@ -2641,9 +2680,47 @@ def _start_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
         if run_directory.name in _jobs:
             raise ControllerError("This bakeoff run is already active.")
         _jobs[run_directory.name] = thread
+    with _active_processes_lock:
+        _run_cancellations[run_directory.name] = threading.Event()
     thread.start()
     return {
         "run_id": run_directory.name,
+        "run": _run_snapshot(run_directory, state),
+        "idempotent": False,
+    }
+
+
+def _cancel_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    run_id = arguments.get("run_id")
+    if not isinstance(run_id, str):
+        raise ControllerError("run_id is required.")
+    run_directory = _safe_run_directory(run_id)
+    state = _read_json(_state_path(run_directory))
+    if state.get("status") in {"completed", "failed", "cancelled"}:
+        return {
+            "run_id": run_id,
+            "run": _run_snapshot(run_directory, state),
+            "idempotent": True,
+        }
+    state = _update_state(
+        run_directory,
+        status="cancelled",
+        summary="The run was cancelled by the user.",
+        details={
+            "error": "Cancelled by user.",
+            "cancelled": True,
+            "cancellation_reason": "user_requested",
+        },
+    )
+    with _active_processes_lock:
+        cancellation = _run_cancellations.get(run_id)
+        if cancellation is not None:
+            cancellation.set()
+        processes = list(_run_processes.get(run_id, ()))
+    for process in processes:
+        _terminate_process_group(process)
+    return {
+        "run_id": run_id,
         "run": _run_snapshot(run_directory, state),
         "idempotent": False,
     }
@@ -2854,6 +2931,8 @@ def _call_tool(params: Any) -> dict[str, Any]:
         return _text_result("Bakeoff configuration prepared.", _prepare_payload(arguments))
     if name == "start_run":
         return _text_result("The approved bakeoff started.", _start_run(arguments))
+    if name == "cancel_run":
+        return _text_result("The bakeoff was cancelled.", _cancel_run(arguments))
     if name == "get_run":
         run_id = arguments.get("run_id")
         if not isinstance(run_id, str):

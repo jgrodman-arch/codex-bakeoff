@@ -708,6 +708,13 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("const runLog = text(run.run_log)", run_step)
         self.assertIn('id="run-log"', run_step)
         self.assertIn("Retained", run_step)
+        self.assertIn('data-action="cancel-run"', run_step)
+        self.assertIn("Cancel run", run_step)
+        cancel_run = controller.split("async function cancelRun", 1)[1].split(
+            "function schedulePoll", 1
+        )[0]
+        self.assertIn('callTool("cancel_run"', cancel_run)
+        self.assertIn("state.pollGeneration += 1", cancel_run)
 
     def test_controller_shows_capability_status_and_optional_guidance(self) -> None:
         controller = CONTROLLER_PATH.read_text(encoding="utf-8")
@@ -1520,6 +1527,39 @@ class McpServerTests(unittest.TestCase):
         self.assertLessEqual(len(run["run_log"].encode("utf-8")), server.MAX_RUN_LOG_BYTES)
         self.assertTrue(run["run_log"].endswith("\nlatest\n"))
         self.assertNotIn("untrusted-log-path", run["run_log"])
+
+    def test_cancel_run_stops_only_its_process_and_records_terminal_state(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            run_directory = run_root / "run-1"
+            run_directory.mkdir()
+            state = server._initial_state(run_directory)
+            server._write_json(server._state_path(run_directory), state)
+            process = mock.Mock()
+            cancellation = threading.Event()
+            server._run_cancellations["run-1"] = cancellation
+            server._run_processes["run-1"] = {process}
+
+            with (
+                mock.patch.object(server, "RUN_ROOT", run_root),
+                mock.patch.object(server, "_terminate_process_group") as terminate,
+            ):
+                cancelled = server._cancel_run({"run_id": "run-1"})
+                repeated = server._cancel_run({"run_id": "run-1"})
+
+            persisted = server._read_json(server._state_path(run_directory))
+            with self.assertRaises(server.RunCancelled):
+                server._update_state(run_directory, phase="implementing")
+
+        self.assertEqual(cancelled["run"]["status"], "cancelled")
+        self.assertFalse(cancelled["idempotent"])
+        self.assertTrue(repeated["idempotent"])
+        self.assertTrue(cancellation.is_set())
+        terminate.assert_called_once_with(process)
+        self.assertEqual(persisted["status"], "cancelled")
+        self.assertEqual(persisted["cancellation_reason"], "user_requested")
+        self.assertEqual(persisted["error"], "Cancelled by user.")
 
     def test_get_state_exposes_local_log_paths(self) -> None:
         server = load_server()

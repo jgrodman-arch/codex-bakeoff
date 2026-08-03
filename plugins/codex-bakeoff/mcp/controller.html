@@ -730,6 +730,12 @@
 
     .button--quiet { background: transparent; }
 
+    .button--danger {
+      border-color: var(--bad);
+      background: var(--bad-soft);
+      color: var(--bad);
+    }
+
     .button:disabled {
       opacity: .46;
       cursor: not-allowed;
@@ -2685,6 +2691,7 @@
                     ${state.busy === "report" ? '<span class="spinner" aria-hidden="true"></span>Loading…' : "Open results"}
                   </button>`
                 : `<button type="button" class="button" data-action="refresh-run" ${state.busy ? "disabled" : ""}>Refresh now</button>`
+                  + `<button type="button" class="button button--danger" data-action="cancel-run" ${state.busy ? "disabled" : ""}>${state.busy === "cancel" ? '<span class="spinner" aria-hidden="true"></span>Cancelling…' : "Cancel run"}</button>`
             }
           </div>
         `;
@@ -3371,6 +3378,24 @@
         }
       }
 
+      async function cancelRun() {
+        if (!state.runId || terminalRunStatus(state.run?.status) || state.busy) return;
+        state.pollGeneration += 1;
+        state.busy = "cancel";
+        state.error = "";
+        render();
+        try {
+          const payload = await callTool("cancel_run", { run_id: state.runId });
+          const run = runRecord(payload);
+          if (run) state.run = run;
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+        } finally {
+          state.busy = "";
+          render({ focus: true });
+        }
+      }
+
       function schedulePoll() {
         const generation = state.pollGeneration;
         window.setTimeout(() => {
@@ -3477,6 +3502,7 @@
         if (action === "select-thread") selectThread(target.dataset.threadId || "");
         if (action === "approve-configuration") prepareRun();
         if (action === "refresh-run") refreshRun();
+        if (action === "cancel-run") cancelRun();
         if (action === "load-report") loadReport();
         if (action === "copy-report-path") copyReportPath();
         if (action === "download-report") downloadReport(target.dataset.format || "");
