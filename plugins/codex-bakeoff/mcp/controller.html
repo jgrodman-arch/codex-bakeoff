@@ -1220,6 +1220,8 @@
         promptGeneration: "",
         promptEditRevision: 0,
         promptSynthesisGeneration: 0,
+        workingDirectoryEditRevision: 0,
+        workingDirectoryGeneration: 0,
         preparation: null,
         runId: "",
         run: null,
@@ -1690,6 +1692,32 @@
         }
       }
 
+      async function inferWorkingDirectory(threadIdValue) {
+        const generation = ++state.workingDirectoryGeneration;
+        const editRevision = state.workingDirectoryEditRevision;
+        try {
+          const payload = await callTool("infer_working_directory", {
+            thread_id: threadIdValue,
+          });
+          if (
+            generation !== state.workingDirectoryGeneration ||
+            threadIdValue !== state.selectedThreadId ||
+            editRevision !== state.workingDirectoryEditRevision ||
+            !state.reviewDraft
+          ) return;
+          const workingDirectory = text(payload.working_directory).trim();
+          if (state.reviewDraft.repo !== workingDirectory) {
+            state.reviewDraft.repo = workingDirectory;
+            state.reviewRevision += 1;
+            state.preparation = null;
+            saveDraft();
+            render();
+          }
+        } catch {
+          // Keep the recorded cwd already present in the draft.
+        }
+      }
+
       function resetController() {
         clearDraft();
         restoredDraft = null;
@@ -1715,6 +1743,8 @@
         state.promptGeneration = "";
         state.promptEditRevision = 0;
         state.promptSynthesisGeneration += 1;
+        state.workingDirectoryEditRevision = 0;
+        state.workingDirectoryGeneration += 1;
         state.preparation = null;
         state.runId = "";
         state.run = null;
@@ -1834,10 +1864,6 @@
           if (typeof replay?.request === "string") {
             state.reviewDraft.request = replay.request;
           }
-          const repository = text(
-            baseline?.attribution_root || baseline?.repository || replay?.project_dir
-          );
-          if (repository) state.reviewDraft.repo = repository;
           if (typeof baseline?.commit === "string") {
             state.reviewDraft.baseline_commit = baseline.commit;
           }
@@ -1903,12 +1929,9 @@
           request: failedSteps.has("thread")
             ? ""
             : replay.request || state.selectedThread?.request,
-          repo: baselineUnresolved
-            ? ""
-            : baseline.attribution_root ||
-              baseline.repository ||
-              replay.project_dir ||
-              state.selectedThread?.project_dir,
+          repo:
+            replay.project_dir ||
+            state.selectedThread?.project_dir,
           beginning_kind: beginningKind,
           ending_kind: beginningKind === "git" ? "git" : endingKind,
           baseline_commit: baselineUnresolved ? "" : baseline.commit,
@@ -2537,7 +2560,7 @@
                   <small>Review and edit the reconstructed task before approval.</small>
                 </div>
                 <div class="field field--wide">
-                  <label for="review-repo">Replay repository</label>
+                  <label for="review-repo">Replay working directory</label>
                   <input id="review-repo" type="text" value="${escapeHtml(draft.repo)}" placeholder="/absolute/path/to/project">
                 </div>
                 <div class="field">
@@ -2562,7 +2585,7 @@
             <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
               <div class="field-grid">
                 <div class="field field--wide">
-                  <label for="beginning-repo">Replay repository</label>
+                  <label for="beginning-repo">Replay working directory</label>
                   <input id="beginning-repo" type="text" value="${escapeHtml(draft.repo)}" readonly>
                   <small>Configured in Replay details.</small>
                 </div>
@@ -2596,7 +2619,7 @@
             <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
               <div class="field-grid">
                 <div class="field field--wide">
-                  <label for="ending-repo">Replay repository</label>
+                  <label for="ending-repo">Replay working directory</label>
                   <input id="ending-repo" type="text" value="${escapeHtml(draft.repo)}" readonly>
                   <small>Configured in Replay details.</small>
                 </div>
@@ -3452,6 +3475,9 @@
         if (synthesis) {
           void synthesizePrompt(synthesis.threadId, synthesis.fallbackRequest);
         }
+        if (state.selectedThreadId && !text(state.reviewDraft?.repo)) {
+          void inferWorkingDirectory(state.selectedThreadId);
+        }
       }
 
       async function selectThread(id, number) {
@@ -3475,6 +3501,8 @@
         state.promptGeneration = "";
         state.promptEditRevision = 0;
         state.promptSynthesisGeneration += 1;
+        state.workingDirectoryEditRevision = 0;
+        state.workingDirectoryGeneration += 1;
         state.preparation = null;
         render();
         try {
@@ -3514,6 +3542,7 @@
         if (shouldSynthesize) {
           void synthesizePrompt(id, fallbackRequest);
         }
+        void inferWorkingDirectory(id);
       }
 
       function setConfigurationStep(index) {
@@ -3874,6 +3903,7 @@
         if (reviewKey && state.reviewDraft) {
           state.reviewDraft[reviewKey] = target.value;
           if (reviewKey === "request") state.promptEditRevision += 1;
+          if (reviewKey === "repo") state.workingDirectoryEditRevision += 1;
           if (reviewKey === "model") state.model = target.value;
           invalidateReviewPreparation();
           saveDraft();

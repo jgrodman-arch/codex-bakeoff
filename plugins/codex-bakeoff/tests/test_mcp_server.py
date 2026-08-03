@@ -784,6 +784,14 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("thread_id: threadIdValue", synthesis)
         self.assertIn("state.promptEditRevision === editRevision", synthesis)
         self.assertIn("text(state.reviewDraft?.request) === fallbackRequest", synthesis)
+        working_directory = controller.split(
+            "async function inferWorkingDirectory", 1
+        )[1].split("function resetController", 1)[0]
+        self.assertIn('callTool("infer_working_directory"', working_directory)
+        self.assertIn("editRevision !== state.workingDirectoryEditRevision", working_directory)
+        self.assertIn("state.reviewDraft.repo = workingDirectory", working_directory)
+        self.assertIn("Replay working directory", configure)
+        self.assertNotIn("Replay repository", configure)
         review_problems = controller.split("function reviewProblems", 1)[1].split(
             "function invalidateReviewPreparation", 1
         )[0]
@@ -956,6 +964,87 @@ class McpServerTests(unittest.TestCase):
         for record in (inspected["thread"], inspected["replay"]):
             self.assertNotIn("prompt_reconstruction_turns", record)
             self.assertNotIn("prompt_reconstruction_truncated", record)
+
+    def test_working_directory_inference_prefers_existing_codex_result(self) -> None:
+        server = load_server()
+        turns = [{"role": "user", "text": "Work in the nested project."}]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recorded = root / "recorded"
+            inferred = root / "inferred"
+            recorded.mkdir()
+            inferred.mkdir()
+
+            def fake_engine(command: str, arguments=()):
+                if command == "replay":
+                    return {
+                        "replay": {
+                            "project_dir": str(recorded),
+                            "project_dirs": [str(recorded), str(inferred)],
+                            "historical_changed_files": [str(inferred / "file.py")],
+                            "prompt_reconstruction_turns": turns,
+                            "prompt_reconstruction_truncated": False,
+                        }
+                    }
+                if command == "models":
+                    return {"options": [{"id": server.REQUEST_SYNTHESIS_MODEL}]}
+                raise AssertionError(command)
+
+            def fake_worker(request, **kwargs):
+                self.assertEqual(request["expected_schema"], server.WORKING_DIRECTORY_SCHEMA)
+                self.assertIn(json.dumps(turns, ensure_ascii=False), request["prompt"])
+                self.assertEqual(kwargs["log_label"], "working-directory-inference")
+                return {
+                    "finalResponse": json.dumps(
+                        {"working_directory": str(inferred)}
+                    )
+                }
+
+            with (
+                mock.patch.object(server, "_engine", side_effect=fake_engine),
+                mock.patch.object(server, "_run_worker", side_effect=fake_worker),
+            ):
+                result = server._working_directory_payload({"thread_id": "thread-1"})
+
+        self.assertEqual(result["working_directory"], str(inferred.resolve()))
+        self.assertEqual(result["source"], "codex")
+
+    def test_working_directory_inference_falls_back_to_existing_cwd(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            recorded = Path(temporary).resolve()
+
+            def fake_engine(command: str, arguments=()):
+                if command == "replay":
+                    return {
+                        "replay": {
+                            "project_dir": str(recorded),
+                            "prompt_reconstruction_turns": [
+                                {"role": "user", "text": "Update the project."}
+                            ],
+                            "prompt_reconstruction_truncated": False,
+                        }
+                    }
+                if command == "models":
+                    return {"options": [{"id": server.REQUEST_SYNTHESIS_MODEL}]}
+                raise AssertionError(command)
+
+            with (
+                mock.patch.object(server, "_engine", side_effect=fake_engine),
+                mock.patch.object(
+                    server,
+                    "_run_worker",
+                    return_value={
+                        "finalResponse": json.dumps(
+                            {"working_directory": "/path/that/does/not/exist"}
+                        )
+                    },
+                ),
+            ):
+                result = server._working_directory_payload({"thread_id": "thread-1"})
+
+        self.assertEqual(result["working_directory"], str(recorded))
+        self.assertEqual(result["source"], "cwd")
 
     def test_single_user_prompt_skips_synthesis(self) -> None:
         server = load_server()
