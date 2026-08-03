@@ -160,6 +160,69 @@ class LeanBakeoffTests(unittest.TestCase):
         fallback = bakeoff.discover_codex_models(self.root / "models.json")
         self.assertTrue(fallback["options"][0]["recommended"])
 
+    def test_app_server_model_discovery_uses_model_list_and_paginates(self) -> None:
+        pages = (
+            {
+                "data": [
+                    {
+                        "model": "gpt-test",
+                        "displayName": "GPT Test",
+                        "description": "First model",
+                        "isDefault": True,
+                    }
+                ],
+                "nextCursor": "next-page",
+            },
+            {
+                "data": [
+                    {
+                        "model": "gpt-second",
+                        "displayName": "GPT Second",
+                        "description": "Second model",
+                        "isDefault": False,
+                    }
+                ],
+                "nextCursor": None,
+            },
+        )
+        with mock.patch.object(bakeoff, "_app_server_model_page", side_effect=pages) as page:
+            catalog = bakeoff.discover_codex_models()
+
+        self.assertEqual(page.call_args_list, [mock.call(None), mock.call("next-page")])
+        self.assertEqual(catalog["source"], "codex app-server model/list")
+        self.assertEqual(
+            [item["id"] for item in catalog["options"]],
+            ["gpt-test", "gpt-second"],
+        )
+        self.assertTrue(catalog["options"][0]["recommended"])
+
+    def test_app_server_model_page_sends_initialized_visible_model_request(self) -> None:
+        process = mock.Mock()
+        process.stdin = mock.Mock()
+        process.poll.return_value = None
+        with (
+            mock.patch.object(bakeoff, "_codex_cli", return_value="/tmp/codex"),
+            mock.patch.object(bakeoff.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(
+                bakeoff,
+                "_read_app_server_response",
+                side_effect=[{}, {"data": [], "nextCursor": None}],
+            ),
+        ):
+            page = bakeoff._app_server_model_page(None)
+
+        payload = b"".join(call.args[0] for call in process.stdin.write.call_args_list)
+        requests = [json.loads(line) for line in payload.splitlines()]
+        self.assertEqual(popen.call_args.args[0], ["/tmp/codex", "app-server"])
+        self.assertEqual(requests[0]["method"], "initialize")
+        self.assertEqual(requests[1], {"method": "initialized"})
+        self.assertEqual(requests[2]["method"], "model/list")
+        self.assertEqual(
+            requests[2]["params"],
+            {"cursor": None, "limit": 100, "includeHidden": False},
+        )
+        self.assertEqual(page, {"data": [], "nextCursor": None})
+
     def _git_repository(self, name: str) -> Path:
         repository = self.root / name
         repository.mkdir()

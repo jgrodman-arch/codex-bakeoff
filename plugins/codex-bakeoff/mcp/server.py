@@ -1445,6 +1445,7 @@ def _engine(
             timeout=bounded_timeout,
             input_text=input_text,
             run_id=run_directory.name if run_directory is not None else None,
+            env=_worker_environment(),
         )
     except subprocess.TimeoutExpired:
         if log_path is not None:

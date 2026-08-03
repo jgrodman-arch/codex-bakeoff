@@ -10,9 +10,12 @@ import json
 import os
 import re
 import secrets
+import select
+import shutil
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +26,8 @@ PLUGIN_ROOT = SCRIPT_ROOT.parent
 DEFAULT_LEDGER = Path.home() / ".codex" / "external_agent_session_imports.json"
 DEFAULT_MODEL_CACHE = Path.home() / ".codex" / "models_cache.json"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+MODEL_LIST_PAGE_SIZE = 100
+MODEL_LIST_TIMEOUT_SECONDS = 15
 DEFAULT_RUN_ROOT = Path.home() / ".cache" / "codex-bakeoff" / "runs"
 PRICING_PATH = PLUGIN_ROOT / "assets" / "model-pricing.json"
 MAX_TIMEOUT_SECONDS = 14_400
@@ -164,8 +169,8 @@ def _positive_int(raw: str) -> int:
     return value
 
 
-def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, Any]:
-    path = Path(model_cache or DEFAULT_MODEL_CACHE).expanduser()
+def _cached_codex_models(model_cache: str | Path) -> dict[str, Any]:
+    path = Path(model_cache).expanduser()
     try:
         payload = _load_json(path, label="the local Codex model catalog")
     except BakeoffError as error:
@@ -214,10 +219,172 @@ def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, An
     }
 
 
+def _codex_cli() -> str:
+    configured = os.environ.get("CODEX_CLI_PATH")
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    discovered = shutil.which("codex")
+    if discovered:
+        return discovered
+    raise BakeoffError("The Codex executable is unavailable.")
+
+
+def _read_app_server_response(
+    process: subprocess.Popen[bytes], request_id: str
+) -> dict[str, Any]:
+    if process.stdout is None:
+        raise BakeoffError("Codex model discovery has no response stream.")
+    deadline = time.monotonic() + MODEL_LIST_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BakeoffError("Codex model discovery timed out.")
+        ready, _, _ = select.select([process.stdout], [], [], remaining)
+        if not ready:
+            raise BakeoffError("Codex model discovery timed out.")
+        line = process.stdout.readline()
+        if not line:
+            raise BakeoffError("Codex app-server closed before model discovery completed.")
+        try:
+            response = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(response, Mapping) or response.get("id") != request_id:
+            continue
+        error = response.get("error")
+        if isinstance(error, Mapping):
+            message = error.get("message")
+            raise BakeoffError(
+                f"Codex model discovery failed: {_redact(message or 'app-server error')}"
+            )
+        result = response.get("result")
+        if isinstance(result, Mapping):
+            return dict(result)
+
+
+def _write_app_server_message(
+    process: subprocess.Popen[bytes], message: Mapping[str, Any]
+) -> None:
+    if process.stdin is None:
+        raise BakeoffError("Codex model discovery has no request stream.")
+    process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+    process.stdin.flush()
+
+
+def _app_server_model_page(cursor: str | None) -> dict[str, Any]:
+    try:
+        process = subprocess.Popen(
+            [_codex_cli(), "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise BakeoffError(f"Codex model discovery failed: {_redact(error)}") from error
+    try:
+        _write_app_server_message(
+            process,
+            {
+                "id": "initialize",
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "codex-bakeoff",
+                        "title": "Codex Bakeoff",
+                        "version": "1.0.28",
+                    },
+                    "capabilities": None,
+                },
+            },
+        )
+        _read_app_server_response(process, "initialize")
+        _write_app_server_message(process, {"method": "initialized"})
+        _write_app_server_message(
+            process,
+            {
+                "id": "models",
+                "method": "model/list",
+                "params": {
+                    "cursor": cursor,
+                    "limit": MODEL_LIST_PAGE_SIZE,
+                    "includeHidden": False,
+                },
+            },
+        )
+        return _read_app_server_response(process, "models")
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def _app_server_codex_models() -> dict[str, Any]:
+    options: list[dict[str, Any]] = []
+    seen_models: set[str] = set()
+    seen_cursors: set[str] = set()
+    cursor: str | None = None
+    while True:
+        page = _app_server_model_page(cursor)
+        raw_models = page.get("data")
+        if not isinstance(raw_models, list):
+            raise BakeoffError("Codex model discovery returned no model list.")
+        for item in raw_models:
+            if not isinstance(item, Mapping):
+                continue
+            model = item.get("model") or item.get("id")
+            if not isinstance(model, str) or not model or model in seen_models:
+                continue
+            seen_models.add(model)
+            options.append(
+                {
+                    "id": model,
+                    "label": str(item.get("displayName") or model),
+                    "description": str(item.get("description") or ""),
+                    "recommended": item.get("isDefault") is True,
+                }
+            )
+        next_cursor = page.get("nextCursor")
+        if not isinstance(next_cursor, str) or not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            raise BakeoffError("Codex model discovery returned a repeated cursor.")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    if options and not any(item["recommended"] for item in options):
+        options[0]["recommended"] = True
+    return {
+        "status": "available" if options else "unavailable",
+        "source": "codex app-server model/list",
+        "options": options,
+        "limitations": ([] if options else ["Codex app-server returned no available models."]),
+    }
+
+
+def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, Any]:
+    if model_cache is not None:
+        return _cached_codex_models(model_cache)
+    try:
+        return _app_server_codex_models()
+    except BakeoffError as error:
+        fallback = _cached_codex_models(DEFAULT_MODEL_CACHE)
+        fallback["limitations"] = [str(error), *fallback["limitations"]]
+        return fallback
+
+
 def _selected_model(model: str | None, model_cache: Path | None) -> str:
     if not isinstance(model, str) or not model.strip() or "\x00" in model:
         raise BakeoffError("Choose a Codex model before starting the comparison.")
     selected = model.strip()
+    if model_cache is None:
+        return selected
     catalog = discover_codex_models(model_cache)
     choices = {item["id"] for item in catalog["options"]}
     if catalog.get("status") != "available" or not choices:
@@ -2267,7 +2434,7 @@ def _add_preparation(parser: argparse.ArgumentParser) -> None:
         help="Read the manually reviewed replay request from standard input.",
     )
     parser.add_argument("--model", required=True)
-    parser.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
+    parser.add_argument("--model-cache", type=Path)
     parser.add_argument("--timeout-seconds", type=_positive_int, default=1800)
 
 
@@ -2295,11 +2462,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json(baseline)
 
     models = commands.add_parser("models")
-    models.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
+    models.add_argument("--model-cache", type=Path)
     _add_json(models)
 
     reviewers = commands.add_parser("reviewers")
-    reviewers.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
+    reviewers.add_argument("--model-cache", type=Path)
     _add_json(reviewers)
 
     prepare = commands.add_parser("prepare")
