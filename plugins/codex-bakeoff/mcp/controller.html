@@ -308,6 +308,54 @@
 
     .panel__body--flush { padding: 0; }
 
+    .configuration-steps {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 6px;
+      margin: 0 0 14px;
+      padding: 0;
+      list-style: none;
+    }
+
+    .configuration-step {
+      width: 100%;
+      min-height: 52px;
+      padding: 8px;
+      border: 0;
+      border-bottom: 2px solid var(--line);
+      background: transparent;
+      color: var(--faint);
+      text-align: left;
+      cursor: default;
+    }
+
+    .configuration-step:not(:disabled) { cursor: pointer; }
+    .configuration-step:not(:disabled):hover { color: var(--text); }
+    .configuration-step[aria-current="step"] {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+
+    .configuration-step small { display: block; margin-bottom: 2px; }
+
+    .configuration-review {
+      display: grid;
+      gap: 0;
+      margin: 0;
+    }
+
+    .configuration-review__row {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      gap: 16px;
+      padding: 13px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .configuration-review__row:last-child { border-bottom: 0; }
+    .configuration-review dt { color: var(--muted); }
+    .configuration-review dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+
     .search {
       position: relative;
       margin-bottom: 14px;
@@ -1082,6 +1130,10 @@
       .metric { grid-template-columns: 1fr; gap: 2px; }
       .metric dd { text-align: left; }
       .result-hero { grid-template-columns: 1fr; }
+      .configuration-steps { grid-template-columns: 1fr; gap: 0; }
+      .configuration-step { display: none; }
+      .configuration-step[aria-current="step"] { display: block; }
+      .configuration-review__row { grid-template-columns: 1fr; gap: 3px; }
       .footer-actions { flex-wrap: wrap; }
       .footer-actions__note { width: 100%; margin: 0; }
     }
@@ -1103,6 +1155,15 @@
         { id: "results", name: "Results", short: "Comparison report" },
       ];
 
+      const CONFIGURATION_STEPS = [
+        { id: "replay", name: "Replay details" },
+        { id: "beginning", name: "Beginning state" },
+        { id: "end", name: "End state" },
+        { id: "output", name: "Historical output" },
+        { id: "capabilities", name: "Capability parity" },
+        { id: "confirm", name: "Review & confirm" },
+      ];
+
       const DEFAULT_PHASES = [
         ["preparing", "Preparing configuration"],
         ["creating_workspace", "Creating isolated workspace"],
@@ -1113,9 +1174,9 @@
         ["reporting", "Finalizing report"],
       ];
 
-      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v4";
+      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v5";
       const CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1";
-      const DRAFT_VERSION = 4;
+      const DRAFT_VERSION = 5;
       const DRAFT_STEPS = new Set(["thread", "configure"]);
 
       const state = {
@@ -1136,6 +1197,8 @@
         timeoutSeconds: 1800,
         classifications: Object.create(null),
         reviewDraft: null,
+        configurationStep: 0,
+        configurationMaxStep: 0,
         reviewRevision: 0,
         promptGeneration: "",
         promptEditRevision: 0,
@@ -1227,6 +1290,12 @@
               : 1800,
           classifications,
           reviewDraft: normalizeReviewDraft(value.reviewDraft),
+          configurationStep: Number.isInteger(value.configurationStep)
+            ? Math.min(Math.max(value.configurationStep, 0), CONFIGURATION_STEPS.length - 1)
+            : 0,
+          configurationMaxStep: Number.isInteger(value.configurationMaxStep)
+            ? Math.min(Math.max(value.configurationMaxStep, 0), CONFIGURATION_STEPS.length - 1)
+            : 0,
         };
       }
 
@@ -1250,6 +1319,8 @@
               .filter(([, value]) => ["claude", "exclude"].includes(value))
           ),
           reviewDraft: normalizeReviewDraft(state.reviewDraft),
+          configurationStep: state.configurationStep,
+          configurationMaxStep: state.configurationMaxStep,
         };
       }
 
@@ -1497,6 +1568,11 @@
         if (!isObject(draft)) return;
         if (draft.model) state.model = draft.model;
         state.timeoutSeconds = draft.timeoutSeconds;
+        state.configurationStep = draft.configurationStep;
+        state.configurationMaxStep = Math.max(
+          draft.configurationStep,
+          draft.configurationMaxStep
+        );
         const { files } = inspectionParts();
         const fileByPath = new Map(
           files
@@ -1604,6 +1680,8 @@
         state.timeoutSeconds = 1800;
         state.classifications = Object.create(null);
         state.reviewDraft = null;
+        state.configurationStep = 0;
+        state.configurationMaxStep = 0;
         state.reviewRevision += 1;
         state.promptGeneration = "";
         state.promptEditRevision = 0;
@@ -2315,56 +2393,88 @@
         `;
       }
 
-      function renderConfigureStep() {
-        const draft = normalizeReviewDraft(state.reviewDraft) || reviewDraftFromConfiguration();
-        const { selection, capabilities, replay, files, kind } = inspectionParts();
-        const diagnostics = inspectionDiagnostics();
-        const blockers = preparationBlockers();
-        const problems = reviewProblems();
-        const gitBeginning = draft.beginning_kind === "git";
-        const gitEnding = draft.ending_kind === "git";
-        const configurationLocked = Boolean(state.run);
-        const selectionRefreshing = selectionNeedsRefresh();
+      function capabilityGaps(capabilities) {
+        return asArray(capabilities.items).filter((item) => {
+          const status = text(item?.status || item?.parity).toLowerCase();
+          return /missing|not_available|unsupported|failed/.test(status);
+        });
+      }
+
+      function configurationStepProblems(index) {
+        const draft = normalizeReviewDraft(state.reviewDraft);
+        if (!draft) return ["Open a configuration draft."];
+        const problems = [];
+        if (index === 0) {
+          if (!draft.thread_id.trim()) problems.push("Choose the Claude task again.");
+          if (!draft.source_path.trim()) problems.push("The selected Claude task has no source transcript.");
+          if (!draft.message_uuid.trim()) problems.push("Enter the message ID within the original thread.");
+          if (!draft.request.trim()) problems.push("Enter the reconstructed task prompt.");
+          if (!draft.repo.trim()) problems.push("Enter the replay repository.");
+          if (!draft.model.trim()) problems.push("Enter a Codex model.");
+          const timeout = Number(draft.timeout_seconds);
+          if (!Number.isInteger(timeout) || timeout < 1 || timeout > 14400) {
+            problems.push("Set a timeout from 1 through 14,400 seconds.");
+          }
+        }
+        if (index === 1) {
+          if (!draft.beginning_kind) problems.push("Choose the beginning state.");
+          if (draft.beginning_kind === "git" && !draft.baseline_commit.trim()) {
+            problems.push("Enter the starting commit.");
+          }
+        }
+        if (index === 2) {
+          if (!draft.ending_kind) problems.push("Choose the end state.");
+          if (draft.beginning_kind === "git" && draft.ending_kind === "non_git") {
+            problems.push("A Git beginning state requires a Git end state.");
+          }
+          if (draft.ending_kind === "git" && !draft.ending_commit.trim()) {
+            problems.push("Enter the ending commit.");
+          }
+        }
+        if (
+          index === 3 &&
+          draft.ending_kind === "non_git" &&
+          !selectionNeedsRefresh() &&
+          selectionPayload().confirm_file_selection !== true
+        ) {
+          problems.push("Classify every file in the Non-Git end state.");
+        }
+        return problems;
+      }
+
+      function renderConfigurationProgress() {
+        return `<ol class="configuration-steps" aria-label="Configuration progress">
+          ${CONFIGURATION_STEPS.map((step, index) => `
+            <li>
+              <button
+                type="button"
+                class="configuration-step"
+                data-action="configuration-step"
+                data-configuration-step="${index}"
+                ${index === state.configurationStep ? 'aria-current="step"' : ""}
+                ${index <= state.configurationMaxStep && !state.busy ? "" : "disabled"}
+              >
+                <small>${index + 1} of ${CONFIGURATION_STEPS.length}</small>
+                ${escapeHtml(step.name)}
+              </button>
+            </li>`).join("")}
+        </ol>`;
+      }
+
+      function renderReplayConfiguration(draft, replay, configurationLocked) {
         const requestMethod = state.promptGeneration || text(replay.request_generation?.method);
         const originalThreadId = text(
           replay.session_id || state.selectedThread?.session_id,
           "Unavailable"
         );
-        return `
-          ${pageHeading(
-            "Configuration",
-            "Complete the run configuration",
-            "Review the task, define the beginning and end states, then approve one isolated replay."
-          )}
-          ${diagnostics.length
-            ? `<div class="banner banner--warning" role="status">
-                <span class="banner__mark" aria-hidden="true">i</span>
-                <div class="banner__body">
-                  <strong>Some values could not be discovered</strong>
-                  <p>Complete the affected fields below.</p>
-                  <ul>${diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
-                </div>
-              </div>`
-            : ""}
-          ${blockers.length
-            ? `<div class="banner banner--warning" role="status">
-                <span class="banner__mark" aria-hidden="true">!</span>
-                <div class="banner__body">
-                  <strong>The configuration still needs attention</strong>
-                  <ul>${blockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
-                </div>
-              </div>`
-            : ""}
-          <section class="panel" aria-labelledby="configuration-heading">
-            <div class="panel__header">
-              <div>
-                <h2 id="configuration-heading">Replay details</h2>
-                <p>Review the discovered task and runtime values.</p>
-              </div>
-            </div>
-            <div class="panel__body">
-              <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
-                <div class="field-grid">
+        return `<section class="panel" aria-labelledby="configuration-heading">
+          <div class="panel__header"><div>
+            <h2 id="configuration-heading">Replay details</h2>
+            <p>Review the task and choose how Codex should run it.</p>
+          </div></div>
+          <div class="panel__body">
+            <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
+              <div class="field-grid">
                 <div class="field">
                   <label for="original-thread">Original Claude thread ID</label>
                   <input id="original-thread" type="text" value="${escapeHtml(originalThreadId)}" readonly>
@@ -2373,9 +2483,7 @@
                 <div class="field">
                   <label for="review-model">Codex model</label>
                   ${state.models.length
-                    ? `<select id="review-model">
-                        ${state.models.map((model) => `<option value="${escapeHtml(model.id)}" ${draft.model === model.id ? "selected" : ""}>${escapeHtml(model.label === model.id ? model.id : `${model.label} (${model.id})`)}</option>`).join("")}
-                      </select>
+                    ? `<select id="review-model">${state.models.map((model) => `<option value="${escapeHtml(model.id)}" ${draft.model === model.id ? "selected" : ""}>${escapeHtml(model.label === model.id ? model.id : `${model.label} (${model.id})`)}</option>`).join("")}</select>
                       <small>All locally available Codex models in one list.</small>`
                     : `<input id="review-model" type="text" value="${escapeHtml(draft.model)}">
                       <small>Model discovery failed; enter an available Codex model.</small>`}
@@ -2388,20 +2496,14 @@
                   <label for="review-request">Reconstructed task prompt ${requestMethod === "pending"
                     ? '<span class="pill"><span class="spinner" aria-hidden="true"></span>Reconstructing task prompt…</span>'
                     : requestMethod === "llm_synthesis"
-                    ? '<span class="pill">AI synthesized</span>'
-                    : requestMethod === "single_user_prompt"
-                      ? '<span class="pill">Original request</span>'
-                    : requestMethod === "concatenated_fallback"
-                      ? '<span class="pill pill--warning">Concatenated fallback</span>'
-                      : ""}</label>
+                      ? '<span class="pill">AI synthesized</span>'
+                      : requestMethod === "single_user_prompt"
+                        ? '<span class="pill">Original request</span>'
+                        : requestMethod === "concatenated_fallback"
+                          ? '<span class="pill pill--warning">Concatenated fallback</span>'
+                          : ""}</label>
                   <textarea id="review-request">${escapeHtml(draft.request)}</textarea>
-                  <small>${requestMethod === "pending"
-                    ? "You can edit this temporary concatenation while the conversation is reconstructed. Your edits will not be overwritten."
-                    : requestMethod === "single_user_prompt"
-                      ? "Used directly because this thread contains one user request. Review and edit before approval."
-                    : requestMethod === "concatenated_fallback"
-                      ? "Prompt synthesis was unavailable, so the exact concatenated user requests were retained. Review and edit before approval."
-                      : "Built from the conversation so short replies resolve against the questions they answered. Review and edit before approval."}</small>
+                  <small>Review and edit the reconstructed task before approval.</small>
                 </div>
                 <div class="field field--wide">
                   <label for="review-repo">Replay repository</label>
@@ -2412,147 +2514,225 @@
                   <input id="review-timeout" type="number" min="1" max="14400" step="1" value="${escapeHtml(draft.timeout_seconds)}">
                   <small>Maximum 4 hours.</small>
                 </div>
-                </div>
-              </fieldset>
-            </div>
-          </section>
+              </div>
+            </fieldset>
+          </div>
+        </section>`;
+      }
 
-          <section class="panel" aria-labelledby="beginning-state-heading">
-            <div class="panel__header">
-              <div>
-                <h2 id="beginning-state-heading">1. Beginning state</h2>
-                <p>The isolated replay starts from this state.</p>
-              </div>
-            </div>
-            <div class="panel__body">
-              <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
-                <div class="field-grid">
-                  <div class="field">
-                    <label for="review-beginning-kind">State type</label>
-                    <select id="review-beginning-kind">
-                      <option value="git" ${gitBeginning ? "selected" : ""}>Git</option>
-                      <option value="non_git" ${gitBeginning ? "" : "selected"}>Non-Git</option>
-                    </select>
-                  </div>
-                  ${gitBeginning
-                    ? `<div class="field">
-                        <label for="review-baseline-commit">Starting commit</label>
-                        <input id="review-baseline-commit" type="text" value="${escapeHtml(draft.baseline_commit)}">
-                        <small>Inferred starting state; editable.</small>
-                      </div>`
-                    : `<div class="field field--wide">
-                        <p>The beginning state is a blank, Non-Git directory. No commit is required.</p>
-                      </div>`}
+      function renderBeginningConfiguration(draft, configurationLocked) {
+        const gitBeginning = draft.beginning_kind === "git";
+        return `<section class="panel" aria-labelledby="beginning-state-heading">
+          <div class="panel__header"><div>
+            <h2 id="beginning-state-heading">Beginning state</h2>
+            <p>The isolated replay starts from this state.</p>
+          </div></div>
+          <div class="panel__body">
+            <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
+              <div class="field-grid">
+                <div class="field field--wide">
+                  <label for="beginning-repo">Replay repository</label>
+                  <input id="beginning-repo" type="text" value="${escapeHtml(draft.repo)}" readonly>
+                  <small>Configured in Replay details.</small>
                 </div>
-              </fieldset>
-            </div>
-          </section>
+                <div class="field">
+                  <label for="review-beginning-kind">State type</label>
+                  <select id="review-beginning-kind">
+                    <option value="git" ${gitBeginning ? "selected" : ""}>Git</option>
+                    <option value="non_git" ${gitBeginning ? "" : "selected"}>Non-Git</option>
+                  </select>
+                </div>
+                ${gitBeginning
+                  ? `<div class="field"><label for="review-baseline-commit">Starting commit</label>
+                      <input id="review-baseline-commit" type="text" value="${escapeHtml(draft.baseline_commit)}">
+                      <small>Inferred starting state; editable.</small></div>`
+                  : '<div class="field field--wide"><p>The beginning state is a blank, Non-Git directory. No commit is required.</p></div>'}
+              </div>
+            </fieldset>
+          </div>
+        </section>`;
+      }
 
-          <section class="panel" aria-labelledby="end-state-heading">
-            <div class="panel__header">
-              <div>
-                <h2 id="end-state-heading">2. End state</h2>
-                <p>The historical result is reconstructed from this state.</p>
-              </div>
-            </div>
-            <div class="panel__body">
-              <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
-                <div class="field-grid">
-                  <div class="field">
-                    <label for="review-ending-kind">State type</label>
-                    <select id="review-ending-kind">
-                      <option value="git" ${gitEnding ? "selected" : ""}>Git</option>
-                      <option value="non_git" ${gitEnding ? "" : "selected"} ${gitBeginning ? "disabled" : ""}>Non-Git</option>
-                    </select>
-                    ${gitBeginning ? "<small>A Git beginning requires a Git end state.</small>" : ""}
-                  </div>
-                  ${gitEnding
-                    ? `<div class="field">
-                        <label for="review-ending-commit">Ending commit</label>
-                        <input id="review-ending-commit" type="text" value="${escapeHtml(draft.ending_commit)}">
-                        <small>Inferred Claude completion state; editable.</small>
-                      </div>`
-                    : `<div class="field field--wide"><p>The run ends as a directory that is still outside Git.</p></div>`}
+      function renderEndConfiguration(draft, configurationLocked) {
+        const gitBeginning = draft.beginning_kind === "git";
+        const gitEnding = draft.ending_kind === "git";
+        return `<section class="panel" aria-labelledby="end-state-heading">
+          <div class="panel__header"><div>
+            <h2 id="end-state-heading">End state</h2>
+            <p>The historical result is reconstructed from this state.</p>
+          </div></div>
+          <div class="panel__body">
+            <fieldset class="review-fields" ${state.busy || configurationLocked ? "disabled" : ""}>
+              <div class="field-grid">
+                <div class="field field--wide">
+                  <label for="ending-repo">Replay repository</label>
+                  <input id="ending-repo" type="text" value="${escapeHtml(draft.repo)}" readonly>
+                  <small>Configured in Replay details.</small>
                 </div>
-              </fieldset>
-            </div>
-            <div class="panel__header">
-              <div>
-                <h3 id="files-heading">${selectionRefreshing
-                  ? "End-state file attribution"
-                  : gitEnding
-                    ? "Uncommitted files from this run"
-                    : "Files in the ending directory"}</h3>
-                <p>${selectionRefreshing
-                  ? "The selected repository and state will be checked automatically."
-                  : gitEnding
-                    ? "Optionally attribute current working-tree changes in addition to the ending commit."
-                    : "Classify files created by the run; exclude local or generated files."}</p>
+                <div class="field">
+                  <label for="review-ending-kind">State type</label>
+                  <select id="review-ending-kind">
+                    <option value="git" ${gitEnding ? "selected" : ""}>Git</option>
+                    <option value="non_git" ${gitEnding ? "" : "selected"} ${gitBeginning ? "disabled" : ""}>Non-Git</option>
+                  </select>
+                  ${gitBeginning ? "<small>A Git beginning requires a Git end state.</small>" : ""}
+                </div>
+                ${gitEnding
+                  ? `<div class="field"><label for="review-ending-commit">Ending commit</label>
+                      <input id="review-ending-commit" type="text" value="${escapeHtml(draft.ending_commit)}">
+                      <small>Inferred Claude completion state; editable.</small></div>`
+                  : '<div class="field field--wide"><p>The run ends as a directory that is still outside Git.</p></div>'}
               </div>
-              ${selectionRefreshing
-                ? '<span class="pill pill--warning">Refresh required</span>'
-                : `<span class="pill">${files.length} ${files.length === 1 ? "item" : "items"}</span>`}
-            </div>
-            ${selectionRefreshing
-              ? '<div class="panel__body"><p class="empty">This attribution will refresh automatically before the run starts.</p></div>'
+            </fieldset>
+          </div>
+        </section>`;
+      }
+
+      function renderHistoricalOutput(draft, selection, files, kind) {
+        const gitEnding = draft.ending_kind === "git";
+        const clean = files.length === 0;
+        return `${!clean
+          ? `<div class="banner banner--warning" role="status">
+              <span class="banner__mark" aria-hidden="true">!</span>
+              <div class="banner__body">
+                <strong>We found ${files.length} ${gitEnding ? "uncommitted" : "current"} ${files.length === 1 ? "file" : "files"} in this repository.</strong>
+                <p>${gitEnding
+                  ? "Select any files produced by the historical Claude run. Unchecked files will be ignored."
+                  : "Classify every file as historical Claude output or excluded local content."}</p>
+              </div>
+            </div>`
+          : ""}
+          <section class="panel" aria-labelledby="files-heading">
+            <div class="panel__header"><div>
+              <h2 id="files-heading">Historical output</h2>
+              <p>${gitEnding
+                ? "Optionally include working-tree changes in addition to the ending commit."
+                : "Identify the files created by the historical run."}</p>
+            </div><span class="pill">${files.length} ${files.length === 1 ? "item" : "items"}</span></div>
+            ${selectionNeedsRefresh()
+              ? '<div class="panel__body"><p class="empty">Return to End state and continue to refresh these files.</p></div>'
               : gitEnding && kind === "git"
                 ? renderGitFiles(files, selection)
                 : !gitEnding && kind === "non_git"
                   ? renderNonGitFiles(files)
-                  : `<div class="panel__body"><p class="empty">The end-state files will refresh when this configuration is checked.</p></div>`}
-          </section>
+                  : '<div class="panel__body"><p class="empty">No end-state files were found.</p></div>'}
+          </section>`;
+      }
 
-          <section class="panel" aria-labelledby="capability-heading">
-            <div class="panel__header">
-              <div>
-                <h2 id="capability-heading">Capability parity</h2>
-                <p>Observed Claude capabilities and Codex equivalents for this replay.</p>
+      function renderCapabilityConfiguration(capabilities) {
+        const gaps = capabilityGaps(capabilities);
+        return `${gaps.length
+          ? `<div class="banner banner--warning" role="status">
+              <span class="banner__mark" aria-hidden="true">!</span>
+              <div class="banner__body">
+                <strong>${gaps.length} capability ${gaps.length === 1 ? "gap" : "gaps"} may affect comparison fairness</strong>
+                <p>You can continue, but review the guidance before approval.</p>
               </div>
-            </div>
+            </div>`
+          : ""}
+          <section class="panel" aria-labelledby="capability-heading">
+            <div class="panel__header"><div>
+              <h2 id="capability-heading">Capability parity</h2>
+              <p>Observed Claude capabilities and Codex equivalents for this replay.</p>
+            </div></div>
             <div class="panel__body">
               <ul class="capability-list">${capabilityRows(capabilities)}</ul>
               ${asArray(capabilities.resolution_actions).length
-                ? `<details>
-                    <summary>Guidance</summary>
-                    <ul class="plain-list">
-                      ${asArray(capabilities.resolution_actions).map((item) => `<li>${escapeHtml(isObject(item) ? item.remediation_action || item.title : item)}</li>`).join("")}
-                    </ul>
-                  </details>`
+                ? `<details><summary>Guidance</summary><ul class="plain-list">
+                    ${asArray(capabilities.resolution_actions).map((item) => `<li>${escapeHtml(isObject(item) ? item.remediation_action || item.title : item)}</li>`).join("")}
+                  </ul></details>`
                 : ""}
             </div>
-          </section>
+          </section>`;
+      }
 
-          ${problems.length
-            ? `<div class="banner banner--warning" role="status" style="margin-top:14px">
-                <span class="banner__mark" aria-hidden="true">i</span>
-                <div class="banner__body">
-                  <strong>Required before approval</strong>
-                  <ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul>
-                </div>
-              </div>`
+      function renderConfigurationConfirmation(draft, capabilities) {
+        const selection = selectionPayload();
+        const outputFiles = draft.ending_kind === "git"
+          ? stringList(selection.claude_output_files)
+          : stringList(selection.created_by_claude);
+        const gaps = capabilityGaps(capabilities);
+        return `${gaps.length
+          ? `<div class="banner banner--warning" role="status">
+              <span class="banner__mark" aria-hidden="true">!</span>
+              <div class="banner__body">
+                <strong>${gaps.length} capability ${gaps.length === 1 ? "gap" : "gaps"} will be recorded</strong>
+                <p>The run can proceed, but the comparison may not have complete capability parity.</p>
+              </div>
+            </div>`
+          : ""}
+          <section class="panel" aria-labelledby="confirmation-heading">
+            <div class="panel__header"><div>
+              <h2 id="confirmation-heading">Review and confirm</h2>
+              <p>Configuration is complete. Review it once more before starting the replay.</p>
+            </div></div>
+            <div class="panel__body">
+              <dl class="configuration-review">
+                <div class="configuration-review__row"><dt>Replay</dt><dd><strong>${escapeHtml(draft.model)}</strong><br><small>${escapeHtml(draft.repo)} · ${escapeHtml(draft.timeout_seconds)} second timeout</small></dd></div>
+                <div class="configuration-review__row"><dt>Beginning state</dt><dd>${draft.beginning_kind === "git" ? `Git at <code>${escapeHtml(draft.baseline_commit)}</code>` : "Blank Non-Git directory"}</dd></div>
+                <div class="configuration-review__row"><dt>End state</dt><dd>${draft.ending_kind === "git" ? `Git at <code>${escapeHtml(draft.ending_commit)}</code>` : "Non-Git directory"}</dd></div>
+                <div class="configuration-review__row"><dt>Historical output</dt><dd>${outputFiles.length ? outputFiles.map((path) => `<code>${escapeHtml(path)}</code>`).join(", ") : "No additional files selected"}</dd></div>
+                <div class="configuration-review__row"><dt>Capability parity</dt><dd>${gaps.length ? `${gaps.length} ${gaps.length === 1 ? "gap" : "gaps"}` : "All observed capabilities matched"}</dd></div>
+              </dl>
+            </div>
+          </section>`;
+      }
+
+      function renderConfigureStep() {
+        const draft = normalizeReviewDraft(state.reviewDraft) || reviewDraftFromConfiguration();
+        const { selection, capabilities, replay, files, kind } = inspectionParts();
+        const diagnostics = inspectionDiagnostics();
+        const blockers = preparationBlockers();
+        const problems = configurationStepProblems(state.configurationStep);
+        const configurationLocked = Boolean(state.run);
+        const screens = [
+          () => renderReplayConfiguration(draft, replay, configurationLocked),
+          () => renderBeginningConfiguration(draft, configurationLocked),
+          () => renderEndConfiguration(draft, configurationLocked),
+          () => renderHistoricalOutput(draft, selection, files, kind),
+          () => renderCapabilityConfiguration(capabilities),
+          () => renderConfigurationConfirmation(draft, capabilities),
+        ];
+        const gaps = capabilityGaps(capabilities);
+        const finalStep = state.configurationStep === CONFIGURATION_STEPS.length - 1;
+        return `
+          ${pageHeading(
+            "Configuration",
+            "Prepare the historical replay",
+            "Complete each step, then review the exact configuration before starting."
+          )}
+          ${renderConfigurationProgress()}
+          ${diagnostics.length && state.configurationStep === 0
+            ? `<div class="banner banner--warning" role="status"><span class="banner__mark" aria-hidden="true">i</span><div class="banner__body"><strong>Some values could not be discovered</strong><ul>${diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div></div>`
             : ""}
-
+          ${blockers.length && finalStep
+            ? `<div class="banner banner--warning" role="status"><span class="banner__mark" aria-hidden="true">!</span><div class="banner__body"><strong>The configuration still needs attention</strong><ul>${blockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div></div>`
+            : ""}
+          ${screens[state.configurationStep]()}
+          ${problems.length
+            ? `<div class="banner banner--warning" role="status" style="margin-top:14px"><span class="banner__mark" aria-hidden="true">i</span><div class="banner__body"><strong>Required to continue</strong><ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul></div></div>`
+            : ""}
           <div class="footer-actions">
             <span class="footer-actions__note">${configurationLocked
               ? "This is the configuration used for the current bakeoff."
-              : "The exact configuration is checked, then the run starts immediately."}</span>
+              : finalStep
+                ? "Approval locks this configuration and starts one isolated replay."
+                : `${state.configurationStep + 1} of ${CONFIGURATION_STEPS.length}`}</span>
             ${configurationLocked
               ? `<button type="button" class="button button--primary" data-action="go-step" data-step="${state.report ? "results" : "run"}">Return to ${state.report ? "results" : "run"}</button>`
-              : `<button type="button" class="button button--quiet" data-action="go-step" data-step="thread">Back</button>
-                <button
-                  type="button"
-                  class="button button--primary"
-                  data-action="approve-configuration"
-                  ${state.busy ? "disabled" : ""}
-                >
-                  ${state.busy === "prepare"
-                    ? '<span class="spinner" aria-hidden="true"></span>Checking configuration…'
-                    : state.busy === "start"
-                      ? '<span class="spinner" aria-hidden="true"></span>Starting…'
-                      : "Approve and start"}
+              : `<button type="button" class="button button--quiet" data-action="configuration-back" ${state.busy ? "disabled" : ""}>Back</button>
+                <button type="button" class="button button--primary" data-action="${finalStep ? "approve-configuration" : "configuration-next"}" ${state.busy ? "disabled" : ""}>
+                  ${state.busy === "attribution"
+                    ? '<span class="spinner" aria-hidden="true"></span>Checking repository…'
+                    : state.busy === "prepare"
+                      ? '<span class="spinner" aria-hidden="true"></span>Checking configuration…'
+                      : state.busy === "start"
+                        ? '<span class="spinner" aria-hidden="true"></span>Starting…'
+                        : finalStep
+                          ? gaps.length ? "Approve with gaps and start" : "Approve and start"
+                          : "Next"}
                 </button>`}
-          </div>
-        `;
+          </div>`;
       }
 
       function normalizedPhases(run) {
@@ -3228,6 +3408,8 @@
         state.inspection = null;
         state.classifications = Object.create(null);
         state.reviewDraft = null;
+        state.configurationStep = 0;
+        state.configurationMaxStep = 0;
         state.reviewRevision += 1;
         state.promptGeneration = "";
         state.promptEditRevision = 0;
@@ -3273,12 +3455,89 @@
         }
       }
 
+      function setConfigurationStep(index) {
+        const next = Math.min(Math.max(index, 0), CONFIGURATION_STEPS.length - 1);
+        state.configurationStep = next;
+        state.configurationMaxStep = Math.max(state.configurationMaxStep, next);
+        state.error = "";
+        state.notice = "";
+        saveDraft();
+        render({ focus: true });
+      }
+
+      async function refreshAttributionAndContinue() {
+        state.busy = "attribution";
+        state.preparation = null;
+        state.error = "";
+        state.notice = "";
+        const reviewRevision = state.reviewRevision;
+        render();
+        try {
+          const preparation = await callTool("prepare_run", reviewPayload());
+          if (
+            reviewRevision !== state.reviewRevision ||
+            state.step !== "configure" ||
+            !state.reviewDraft
+          ) return;
+          applyPreparationInspection(preparation);
+          state.preparation = null;
+          state.configurationStep = 3;
+          state.configurationMaxStep = Math.max(state.configurationMaxStep, 3);
+          saveDraft();
+        } catch (error) {
+          if (reviewRevision === state.reviewRevision && state.step === "configure") {
+            state.error = error instanceof Error ? error.message : String(error);
+          }
+        } finally {
+          state.busy = "";
+          render({ focus: true });
+        }
+      }
+
+      async function nextConfigurationStep() {
+        const problems = configurationStepProblems(state.configurationStep);
+        if (problems.length) {
+          state.error = "";
+          state.notice = "";
+          render({ focus: true });
+          return;
+        }
+        if (state.configurationStep === 2 && selectionNeedsRefresh()) {
+          await refreshAttributionAndContinue();
+          return;
+        }
+        setConfigurationStep(state.configurationStep + 1);
+      }
+
+      function previousConfigurationStep() {
+        if (state.configurationStep === 0) {
+          state.step = "thread";
+          state.error = "";
+          state.notice = "";
+          saveDraft();
+          render({ focus: true });
+          return;
+        }
+        setConfigurationStep(state.configurationStep - 1);
+      }
+
       async function prepareRun() {
+        if (selectionNeedsRefresh()) {
+          state.configurationStep = 2;
+          state.error = "";
+          state.notice = "";
+          render({ focus: true });
+          return;
+        }
         const problems = reviewProblems();
         if (problems.length) {
           state.error = "";
           state.notice = "";
-          render();
+          const invalidStep = [0, 1, 2, 3].find(
+            (index) => configurationStepProblems(index).length
+          );
+          if (invalidStep !== undefined) state.configurationStep = invalidStep;
+          render({ focus: true });
           return;
         }
         if (state.promptGeneration === "pending") {
@@ -3500,6 +3759,14 @@
         if (action === "retry-init") initialize();
         if (action === "refresh-threads") loadThreads(state.query);
         if (action === "select-thread") selectThread(target.dataset.threadId || "");
+        if (action === "configuration-next") nextConfigurationStep();
+        if (action === "configuration-back") previousConfigurationStep();
+        if (action === "configuration-step") {
+          const index = Number(target.dataset.configurationStep);
+          if (Number.isInteger(index) && index <= state.configurationMaxStep) {
+            setConfigurationStep(index);
+          }
+        }
         if (action === "approve-configuration") prepareRun();
         if (action === "refresh-run") refreshRun();
         if (action === "cancel-run") cancelRun();

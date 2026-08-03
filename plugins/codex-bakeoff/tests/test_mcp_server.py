@@ -365,7 +365,7 @@ class McpServerTests(unittest.TestCase):
             with mock.patch.object(server, "APP_HTML", Path("/deleted/controller.html")):
                 status, _, body = request("GET", "/")
             self.assertEqual(status, 200)
-            self.assertIn(b"codex-bakeoff.controller-draft.v4", body)
+            self.assertIn(b"codex-bakeoff.controller-draft.v5", body)
             self.assertNotIn(b"window.openai", body)
 
             tool_result = {
@@ -553,7 +553,7 @@ class McpServerTests(unittest.TestCase):
         snapshot = controller.split("function draftSnapshot()", 1)[1].split(
             "function saveDraft()", 1
         )[0]
-        self.assertIn("codex-bakeoff.controller-draft.v4", controller)
+        self.assertIn("codex-bakeoff.controller-draft.v5", controller)
         self.assertIn("codex-bakeoff.controller-session.v1", controller)
         self.assertIn("X-Codex-Bakeoff-Session", controller)
         self.assertIn("localStorage.getItem(CONTROLLER_SESSION_STORAGE_KEY)", controller)
@@ -585,6 +585,8 @@ class McpServerTests(unittest.TestCase):
             "timeoutSeconds",
             "classifications",
             "reviewDraft",
+            "configurationStep",
+            "configurationMaxStep",
         ):
             self.assertIn(field, snapshot)
         for transient in ("preparation", "approvalChecked", "runId", "report"):
@@ -596,15 +598,15 @@ class McpServerTests(unittest.TestCase):
         self.assertIn('id: "run"', steps)
         self.assertIn('id: "results"', steps)
 
-        configure = controller.split("function renderConfigureStep()", 1)[1].split(
+        configure = controller.split("function renderReplayConfiguration", 1)[1].split(
             "function normalizedPhases", 1
         )[0]
         self.assertIn("Original Claude thread ID", configure)
         self.assertIn('id="original-thread"', configure)
         self.assertIn("readonly", configure)
         self.assertIn("Message ID within the original thread", configure)
-        self.assertIn("1. Beginning state", configure)
-        self.assertIn("2. End state", configure)
+        self.assertIn("Beginning state", configure)
+        self.assertIn("End state", configure)
         self.assertIn("Starting commit", configure)
         self.assertNotIn("empty-beginning-confirmation", configure)
         self.assertNotIn("I confirmed the directory was empty", configure)
@@ -618,15 +620,21 @@ class McpServerTests(unittest.TestCase):
         self.assertNotIn("ending_commit", refresh_check)
         self.assertIn("Ending commit", configure)
         self.assertIn('id="review-ending-commit"', configure)
-        self.assertIn("Uncommitted files from this run", configure)
+        self.assertIn("Historical output", configure)
+        self.assertIn("Unchecked files will be ignored", configure)
         self.assertIn("Reconstructed task prompt", configure)
         self.assertIn("All locally available Codex models in one list", configure)
         self.assertNotIn(
             "I reviewed every current Git change and this attribution is complete",
             controller,
         )
-        self.assertIn('data-action="approve-configuration"', configure)
+        self.assertIn('finalStep ? "approve-configuration"', configure)
         self.assertIn("Checking configuration", configure)
+        self.assertIn("Review and confirm", configure)
+        self.assertIn("Approve with gaps and start", configure)
+        self.assertIn('finalStep ? "approve-configuration" : "configuration-next"', configure)
+        self.assertIn('data-action="configuration-back"', configure)
+        self.assertIn("refreshAttributionAndContinue", controller)
 
         diagnostics = controller.split("function inspectionDiagnostics()", 1)[1].split(
             "function reviewDraftFromConfiguration", 1
@@ -731,7 +739,7 @@ class McpServerTests(unittest.TestCase):
         )[0]
         self.assertIn('state.promptGeneration === "pending"', prepare_run)
         self.assertIn("state.promptSynthesisGeneration += 1", prepare_run)
-        configure = controller.split("function renderConfigureStep", 1)[1].split(
+        configure = controller.split("function renderReplayConfiguration", 1)[1].split(
             "function normalizedPhases", 1
         )[0]
         self.assertNotIn('requestMethod === "pending" ? "disabled"', configure)
@@ -760,8 +768,8 @@ class McpServerTests(unittest.TestCase):
         capability_rows = controller.split("function capabilityRows", 1)[1].split(
             "function fileMetadata", 1
         )[0]
-        configure = controller.split("function renderConfigureStep", 1)[1].split(
-            "function normalizedPhases", 1
+        configure = controller.split("function renderCapabilityConfiguration", 1)[1].split(
+            "function renderConfigurationConfirmation", 1
         )[0]
 
         self.assertIn("titleCase(record.status)", capability_rows)
@@ -769,6 +777,7 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("not_available", capability_rows)
         self.assertIn('id="capability-heading"', configure)
         self.assertIn("item.remediation_action", configure)
+        self.assertIn("may affect comparison fairness", configure)
 
     def test_controller_report_restores_comparisons_and_token_breakdown(self) -> None:
         controller = CONTROLLER_PATH.read_text(encoding="utf-8")
