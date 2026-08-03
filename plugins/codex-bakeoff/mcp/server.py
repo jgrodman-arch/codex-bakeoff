@@ -66,6 +66,7 @@ MAX_RUN_LOG_BYTES = 128 * 1024
 MAX_REQUEST_SYNTHESIS_CACHE_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_SYNTHESIS_BYTES = 256 * 1024
 REQUEST_SYNTHESIS_MODEL = "gpt-5.6-terra"
+CONTROLLER_SMOKE_TEST_MODEL = "gpt-5.6-sol"
 REQUEST_SYNTHESIS_CACHE_PATH = CONTROLLER_CACHE_ROOT / "request-synthesis-cache.json"
 REQUEST_SYNTHESIS_SCHEMA = {
     "type": "object",
@@ -769,6 +770,7 @@ def _open_external_controller(
 ) -> dict[str, Any]:
     if codex_cli_path is not None:
         _remember_codex_cli_path_hint(codex_cli_path)
+    _run_controller_smoke_test()
     try:
         port, health = _ensure_controller_daemon(
             confirmation_token=confirmation_token,
@@ -2036,6 +2038,25 @@ def _run_worker(
         "worktree": str(working_directory),
         "events": records[-100:],
     }
+
+
+def _run_controller_smoke_test() -> None:
+    try:
+        with tempfile.TemporaryDirectory(prefix="codex-bakeoff-smoke-") as temporary:
+            workspace = Path(temporary).resolve()
+            _run_worker(
+                {
+                    "model": CONTROLLER_SMOKE_TEST_MODEL,
+                    "prompt": "Reply with exactly READY. Do not use tools.",
+                    "timeout_seconds": 60,
+                },
+                run_directory=workspace,
+                working_directory=workspace,
+                read_only=True,
+                log_label="smoke-test",
+            )
+    except ControllerError as error:
+        raise ControllerError(f"Codex smoke test failed: {error}") from error
 
 
 def _request_synthesis_available(

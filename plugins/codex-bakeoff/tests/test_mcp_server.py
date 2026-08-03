@@ -148,6 +148,7 @@ class McpServerTests(unittest.TestCase):
                 "_request_browser_login",
                 return_value="http://127.0.0.1:43117/auth?token=secret",
             ),
+            mock.patch.object(server, "_run_controller_smoke_test"),
             mock.patch.object(server.webbrowser, "open", return_value=True) as browser_open,
         ):
             result = server._call_tool({"name": "open_controller", "arguments": {}})
@@ -183,6 +184,7 @@ class McpServerTests(unittest.TestCase):
                     "_request_browser_login",
                     return_value="http://127.0.0.1:43117/auth?token=secret",
                 ),
+                mock.patch.object(server, "_run_controller_smoke_test"),
                 mock.patch.object(server.webbrowser, "open", return_value=True),
             ):
                 result = server._call_tool(
@@ -210,6 +212,7 @@ class McpServerTests(unittest.TestCase):
                 "_ensure_controller_daemon",
                 side_effect=conflict,
             ),
+            mock.patch.object(server, "_run_controller_smoke_test"),
             mock.patch.object(server.os, "kill") as kill,
         ):
             result = server._call_tool({"name": "open_controller", "arguments": {}})
@@ -237,6 +240,7 @@ class McpServerTests(unittest.TestCase):
                 "_request_browser_login",
                 return_value="http://127.0.0.1:43117/auth?token=secret",
             ),
+            mock.patch.object(server, "_run_controller_smoke_test"),
             mock.patch.object(server.webbrowser, "open", return_value=True),
         ):
             result = server._call_tool(
@@ -251,6 +255,43 @@ class McpServerTests(unittest.TestCase):
 
         ensure.assert_called_once_with(confirmation_token=token)
         self.assertTrue(result["structuredContent"]["opened"])
+
+    def test_smoke_test_runs_worker_before_browser_opens(self) -> None:
+        server = load_server()
+        with (
+            mock.patch.object(
+                server,
+                "_run_worker",
+                return_value={"thread_id": "smoke-thread"},
+            ) as worker,
+            mock.patch.object(server, "_ensure_controller_daemon") as ensure,
+            mock.patch.object(server.webbrowser, "open") as browser_open,
+        ):
+            server._run_controller_smoke_test()
+
+        ensure.assert_not_called()
+        browser_open.assert_not_called()
+        request = worker.call_args.args[0]
+        self.assertEqual(request["model"], "gpt-5.6-sol")
+        self.assertEqual(request["timeout_seconds"], 60)
+        self.assertEqual(worker.call_args.kwargs["read_only"], True)
+
+    def test_smoke_test_failure_keeps_controller_and_browser_closed(self) -> None:
+        server = load_server()
+        with (
+            mock.patch.object(
+                server,
+                "_run_controller_smoke_test",
+                side_effect=server.ControllerError("Codex smoke test failed: unavailable"),
+            ),
+            mock.patch.object(server, "_ensure_controller_daemon") as ensure,
+            mock.patch.object(server.webbrowser, "open") as browser_open,
+            self.assertRaisesRegex(server.ControllerError, "smoke test failed"),
+        ):
+            server._open_external_controller()
+
+        ensure.assert_not_called()
+        browser_open.assert_not_called()
 
     def test_stop_tool_requires_explicit_confirmation(self) -> None:
         server = load_server()
