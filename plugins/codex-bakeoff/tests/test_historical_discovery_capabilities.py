@@ -23,7 +23,15 @@ class LeanCapabilityTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.codex_home = Path(self.temporary.name) / "codex"
         self.codex_home.mkdir()
-        self.patch = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home)})
+        self.claude_home = Path(self.temporary.name) / "claude"
+        self.claude_home.mkdir()
+        self.patch = mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_HOME": str(self.codex_home),
+                "CLAUDE_CONFIG_DIR": str(self.claude_home),
+            },
+        )
         self.patch.start()
 
     def tearDown(self) -> None:
@@ -109,9 +117,50 @@ class LeanCapabilityTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["status"], "available_and_ready")
         self.assertNotIn("tree_sha256", result["items"][0])
 
-    def test_missing_skill_has_one_import_action(self) -> None:
-        result = capabilities.inspect_capabilities({"observed_skills": ["missing-skill"]})
+    def test_artifact_design_without_importable_source_has_no_import_action(self) -> None:
+        result = capabilities.inspect_capabilities({"observed_skills": ["artifact-design"]})
         self.assertEqual(result["items"][0]["status"], "not_available")
+        self.assertEqual(
+            result["items"][0]["resolution"],
+            "claude_managed_or_source_unavailable",
+        )
+        self.assertEqual(
+            result["items"][0]["reason"],
+            "Claude-managed or source unavailable.",
+        )
+        self.assertIsNone(result["items"][0]["guidance"])
+        self.assertEqual(result["resolution_actions"], [])
+
+    def test_artifact_design_uses_installed_codex_skill_equivalents(self) -> None:
+        for name in ("sites-building", "visualize"):
+            skill = self.codex_home / "skills" / name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+
+        result = capabilities.inspect_capabilities({"observed_skills": ["artifact-design"]})
+
+        item = result["items"][0]
+        self.assertEqual(item["status"], "codex_native_equivalent")
+        self.assertEqual(
+            item["equivalent"],
+            "sites:sites-building + visualize:visualize",
+        )
+        self.assertEqual(result["resolution_actions"], [])
+
+    def test_importable_claude_skill_has_one_import_action(self) -> None:
+        skill = self.claude_home / "skills" / "claude-only-test-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: claude-only-test-skill\n---\n",
+            encoding="utf-8",
+        )
+
+        result = capabilities.inspect_capabilities(
+            {"observed_skills": ["claude-only-test-skill"]}
+        )
+
+        self.assertEqual(result["items"][0]["status"], "not_available")
+        self.assertEqual(result["items"][0]["claude_source_status"], "importable")
         self.assertEqual(
             result["items"][0]["guidance"],
             "Go to Settings > Import to review and import this Claude skill.",

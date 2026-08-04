@@ -1190,9 +1190,9 @@
         ["reporting", "Finalizing report"],
       ];
 
-      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v6";
+      const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v7";
       const CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1";
-      const DRAFT_VERSION = 6;
+      const DRAFT_VERSION = 7;
       const DRAFT_STEPS = new Set(["thread", "configure"]);
 
       const state = {
@@ -1222,6 +1222,7 @@
         promptSynthesisGeneration: 0,
         workingDirectoryEditRevision: 0,
         workingDirectoryGeneration: 0,
+        workingDirectoryLoading: false,
         preparation: null,
         runId: "",
         run: null,
@@ -1331,6 +1332,8 @@
       }
 
       function draftSnapshot() {
+        const reviewDraft = normalizeReviewDraft(state.reviewDraft);
+        if (reviewDraft) delete reviewDraft.request;
         return {
           version: DRAFT_VERSION,
           step: DRAFT_STEPS.has(state.step) ? state.step : "thread",
@@ -1342,7 +1345,7 @@
             Object.entries(state.classifications)
               .filter(([, value]) => ["claude", "exclude"].includes(value))
           ),
-          reviewDraft: normalizeReviewDraft(state.reviewDraft),
+          reviewDraft,
           configurationStep: state.configurationStep,
           configurationMaxStep: state.configurationMaxStep,
         };
@@ -1616,6 +1619,10 @@
             file.selectable === false ? "exclude" : classification;
         }
         state.reviewDraft = normalizeReviewDraft(draft.reviewDraft);
+        if (state.reviewDraft) {
+          const { replay } = inspectionParts();
+          state.reviewDraft.request = text(replay.request);
+        }
       }
 
       function selectedModelDefault() {
@@ -1695,6 +1702,10 @@
       async function inferWorkingDirectory(threadIdValue) {
         const generation = ++state.workingDirectoryGeneration;
         const editRevision = state.workingDirectoryEditRevision;
+        if (!state.workingDirectoryLoading) {
+          state.workingDirectoryLoading = true;
+          render();
+        }
         try {
           const payload = await callTool("infer_working_directory", {
             thread_id: threadIdValue,
@@ -1715,6 +1726,14 @@
           }
         } catch {
           // Keep the recorded cwd already present in the draft.
+        } finally {
+          if (
+            generation === state.workingDirectoryGeneration &&
+            threadIdValue === state.selectedThreadId
+          ) {
+            state.workingDirectoryLoading = false;
+            render();
+          }
         }
       }
 
@@ -1745,6 +1764,7 @@
         state.promptSynthesisGeneration += 1;
         state.workingDirectoryEditRevision = 0;
         state.workingDirectoryGeneration += 1;
+        state.workingDirectoryLoading = false;
         state.preparation = null;
         state.runId = "";
         state.run = null;
@@ -2329,7 +2349,7 @@
             <li class="capability ${tone ? `capability--${tone}` : ""}">
               <span class="capability__dot" aria-hidden="true"></span>
               <span>
-                ${escapeHtml(record.name || record.capability || record.tool || "Observed capability")}
+                ${escapeHtml(record.title || record.name || record.capability || record.tool || "Observed capability")}
                 ${record.reason || record.status
                   ? `<small>${escapeHtml(record.reason || titleCase(record.status))}</small>`
                   : ""}
@@ -2517,6 +2537,8 @@
 
       function renderReplayConfiguration(draft, replay, configurationLocked) {
         const requestMethod = state.promptGeneration || text(replay.request_generation?.method);
+        const promptLoading = requestMethod === "pending";
+        const workingDirectoryLoading = state.workingDirectoryLoading;
         const originalThreadId = text(
           replay.session_id || state.selectedThread?.session_id,
           "Unavailable"
@@ -2547,7 +2569,7 @@
                   <input id="review-message-uuid" type="text" value="${escapeHtml(draft.message_uuid)}">
                 </div>
                 <div class="field field--wide">
-                  <label for="review-request">Reconstructed task prompt ${requestMethod === "pending"
+                  <label for="review-request">Reconstructed task prompt ${promptLoading
                     ? '<span class="pill"><span class="spinner" aria-hidden="true"></span>Reconstructing task prompt…</span>'
                     : requestMethod === "llm_synthesis"
                       ? '<span class="pill">AI synthesized</span>'
@@ -2556,12 +2578,14 @@
                         : requestMethod === "concatenated_fallback"
                           ? '<span class="pill pill--warning">Concatenated fallback</span>'
                           : ""}</label>
-                  <textarea id="review-request">${escapeHtml(draft.request)}</textarea>
+                  <textarea id="review-request" ${promptLoading ? 'placeholder="Reconstructing task prompt…" disabled' : ""}>${promptLoading ? "" : escapeHtml(draft.request)}</textarea>
                   <small>Review and edit the reconstructed task before approval.</small>
                 </div>
                 <div class="field field--wide">
-                  <label for="review-repo">Replay working directory</label>
-                  <input id="review-repo" type="text" value="${escapeHtml(draft.repo)}" placeholder="/absolute/path/to/project">
+                  <label for="review-repo">Replay working directory ${workingDirectoryLoading
+                    ? '<span class="pill"><span class="spinner" aria-hidden="true"></span>Inferring working directory…</span>'
+                    : ""}</label>
+                  <input id="review-repo" type="text" value="${workingDirectoryLoading ? "" : escapeHtml(draft.repo)}" placeholder="${workingDirectoryLoading ? "Inferring working directory…" : "/absolute/path/to/project"}" ${workingDirectoryLoading ? "disabled" : ""}>
                 </div>
                 <div class="field">
                   <label for="review-timeout">Timeout in seconds</label>
@@ -2760,17 +2784,6 @@
             "Prepare the historical replay",
             "Complete each step, then review the exact configuration before starting."
           )}
-          ${renderConfigurationProgress()}
-          ${diagnostics.length && state.configurationStep === 0
-            ? `<div class="banner banner--warning" role="status"><span class="banner__mark" aria-hidden="true">i</span><div class="banner__body"><strong>Some values could not be discovered</strong><ul>${diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div></div>`
-            : ""}
-          ${blockers.length && finalStep
-            ? `<div class="banner banner--warning" role="status"><span class="banner__mark" aria-hidden="true">!</span><div class="banner__body"><strong>The configuration still needs attention</strong><ul>${blockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div></div>`
-            : ""}
-          ${screens[state.configurationStep]()}
-          ${problems.length
-            ? `<div class="banner banner--warning" role="status" style="margin-top:14px"><span class="banner__mark" aria-hidden="true">i</span><div class="banner__body"><strong>Required to continue</strong><ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul></div></div>`
-            : ""}
           <div class="footer-actions">
             <span class="footer-actions__note">${configurationLocked
               ? "This is the configuration used for the current bakeoff."
@@ -2791,7 +2804,19 @@
                           ? gaps.length ? "Approve with gaps and start" : "Approve and start"
                           : "Next"}
                 </button>`}
-          </div>`;
+          </div>
+          ${renderConfigurationProgress()}
+          ${diagnostics.length && state.configurationStep === 0
+            ? `<div class="banner banner--warning" role="status"><span class="banner__mark" aria-hidden="true">i</span><div class="banner__body"><strong>Some values could not be discovered</strong><ul>${diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div></div>`
+            : ""}
+          ${blockers.length && finalStep
+            ? `<div class="banner banner--warning" role="status"><span class="banner__mark" aria-hidden="true">!</span><div class="banner__body"><strong>The configuration still needs attention</strong><ul>${blockers.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div></div>`
+            : ""}
+          ${screens[state.configurationStep]()}
+          ${problems.length
+            ? `<div class="banner banner--warning" role="status" style="margin-top:14px"><span class="banner__mark" aria-hidden="true">i</span><div class="banner__body"><strong>Required to continue</strong><ul>${problems.map((problem) => `<li>${escapeHtml(problem)}</li>`).join("")}</ul></div></div>`
+            : ""}
+          `;
       }
 
       function normalizedPhases(run) {
@@ -3459,6 +3484,7 @@
                 }],
               };
               state.reviewDraft = normalizeReviewDraft(restoredDraft.reviewDraft) || reviewDraftFromConfiguration();
+              state.reviewDraft.request = "";
               state.promptGeneration = "concatenated_fallback";
               state.step = "configure";
               state.error = "";
@@ -3503,6 +3529,7 @@
         state.promptSynthesisGeneration += 1;
         state.workingDirectoryEditRevision = 0;
         state.workingDirectoryGeneration += 1;
+        state.workingDirectoryLoading = false;
         state.preparation = null;
         render();
         try {
@@ -3522,6 +3549,7 @@
             "concatenated_fallback"
           );
           shouldSynthesize = state.promptGeneration === "pending";
+          state.workingDirectoryLoading = true;
           state.step = "configure";
         } catch (error) {
           state.inspection = {
@@ -3534,6 +3562,7 @@
           initializeClassifications();
           state.reviewDraft = reviewDraftFromConfiguration();
           state.promptGeneration = "concatenated_fallback";
+          state.workingDirectoryLoading = true;
           state.step = "configure";
         } finally {
           state.busy = "";

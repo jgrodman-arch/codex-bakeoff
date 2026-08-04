@@ -63,14 +63,11 @@ MAX_PREPARE_TOKENS = 256
 MAX_COMMAND_TIMEOUT = 14_700
 IMPLEMENTATION_RETRY_LIMIT = 3
 MAX_RUN_LOG_BYTES = 128 * 1024
-MAX_REQUEST_SYNTHESIS_CACHE_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_SYNTHESIS_BYTES = 256 * 1024
 REQUEST_SYNTHESIS_MODEL = "gpt-5.6-terra"
-REQUEST_SYNTHESIS_CACHE_VERSION = 2
 CONTROLLER_SMOKE_TEST_MODEL = "gpt-5.6-sol"
 CLAUDE_REVIEW_MODEL = "sonnet"
 CLAUDE_PROBE_TIMEOUT = 60
-REQUEST_SYNTHESIS_CACHE_PATH = CONTROLLER_CACHE_ROOT / "request-synthesis-cache.json"
 REQUEST_SYNTHESIS_SCHEMA = {
     "type": "object",
     "properties": {"request": {"type": "string"}},
@@ -120,7 +117,6 @@ _active_processes_lock = threading.RLock()
 _pending_port_conflicts: dict[str, dict[str, Any]] = {}
 _pending_port_conflicts_lock = threading.Lock()
 _run_log_lock = threading.Lock()
-_request_synthesis_cache_lock = threading.Lock()
 _shutdown = threading.Event()
 
 
@@ -2335,82 +2331,6 @@ def _single_user_prompt(replay: Mapping[str, Any]) -> str | None:
     return prompts[0] if len(prompts) == 1 else None
 
 
-def _transcript_sha256(replay: Mapping[str, Any]) -> str:
-    raw_source = replay.get("source_path")
-    if not isinstance(raw_source, str) or not raw_source.strip():
-        raise ControllerError("The source transcript is unavailable.")
-    digest = hashlib.sha256()
-    try:
-        source_path = Path(raw_source).expanduser().resolve()
-        with source_path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-    except (OSError, RuntimeError) as error:
-        raise ControllerError("The source transcript is unavailable.") from error
-    return digest.hexdigest()
-
-
-def _read_request_synthesis_cache_unlocked() -> dict[str, Any]:
-    try:
-        if REQUEST_SYNTHESIS_CACHE_PATH.stat().st_size > MAX_REQUEST_SYNTHESIS_CACHE_BYTES:
-            return {}
-        payload = json.loads(REQUEST_SYNTHESIS_CACHE_PATH.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    return dict(payload) if isinstance(payload, Mapping) else {}
-
-
-def _cached_request_synthesis(
-    thread_id: str,
-    transcript_sha256: str,
-) -> dict[str, str] | None:
-    with _request_synthesis_cache_lock:
-        entry = _read_request_synthesis_cache_unlocked().get(thread_id)
-    if not isinstance(entry, Mapping) or set(entry) != {
-        "cache_version",
-        "thread_id",
-        "transcript_sha256",
-        "summary",
-        "model",
-        "generated_at",
-    }:
-        return None
-    summary = entry.get("summary")
-    if (
-        entry.get("cache_version") != REQUEST_SYNTHESIS_CACHE_VERSION
-        or entry.get("thread_id") != thread_id
-        or entry.get("transcript_sha256") != transcript_sha256
-        or entry.get("model") != REQUEST_SYNTHESIS_MODEL
-        or not isinstance(entry.get("generated_at"), str)
-        or not entry.get("generated_at", "").strip()
-        or not isinstance(summary, str)
-        or not summary.strip()
-        or len(summary.encode("utf-8")) > MAX_REQUEST_SYNTHESIS_BYTES
-    ):
-        return None
-    return {key: str(value) for key, value in entry.items()}
-
-
-def _cache_request_synthesis(
-    thread_id: str,
-    transcript_sha256: str,
-    summary: str,
-    generated_at: str,
-) -> None:
-    entry = {
-        "cache_version": REQUEST_SYNTHESIS_CACHE_VERSION,
-        "thread_id": thread_id,
-        "transcript_sha256": transcript_sha256,
-        "summary": summary,
-        "model": REQUEST_SYNTHESIS_MODEL,
-        "generated_at": generated_at,
-    }
-    with _request_synthesis_cache_lock:
-        cache = _read_request_synthesis_cache_unlocked()
-        cache[thread_id] = entry
-        _write_private_json(REQUEST_SYNTHESIS_CACHE_PATH, cache)
-
-
 def _synthesize_request(
     replay: Mapping[str, Any],
     model_options: Sequence[Any],
@@ -2465,7 +2385,6 @@ def _synthesized_request_result(
     request: str,
     *,
     generated_at: str,
-    cached: bool,
 ) -> dict[str, Any]:
     return {
         "thread_id": thread_id,
@@ -2474,7 +2393,6 @@ def _synthesized_request_result(
             "method": "llm_synthesis",
             "model": REQUEST_SYNTHESIS_MODEL,
             "generated_at": generated_at,
-            "cached": cached,
         },
     }
 
@@ -2511,18 +2429,6 @@ def _synthesize_request_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
     if not _request_synthesis_context_available(replay):
         return _concatenated_request_result(thread_id, fallback_request)
     try:
-        transcript_sha256 = _transcript_sha256(replay)
-    except ControllerError:
-        return _concatenated_request_result(thread_id, fallback_request)
-    cached = _cached_request_synthesis(thread_id, transcript_sha256)
-    if cached is not None:
-        return _synthesized_request_result(
-            thread_id,
-            cached["summary"],
-            generated_at=cached["generated_at"],
-            cached=True,
-        )
-    try:
         models_payload = _engine("models")
     except Exception:  # noqa: BLE001 - exact concatenation remains usable.
         return _concatenated_request_result(thread_id, fallback_request)
@@ -2534,20 +2440,10 @@ def _synthesize_request_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - exact concatenation is the safe fallback.
         return _concatenated_request_result(thread_id, fallback_request)
     generated_at = _utc_now()
-    try:
-        _cache_request_synthesis(
-            thread_id,
-            transcript_sha256,
-            request,
-            generated_at,
-        )
-    except OSError:
-        pass
     return _synthesized_request_result(
         thread_id,
         request,
         generated_at=generated_at,
-        cached=False,
     )
 
 
@@ -3257,26 +3153,7 @@ def _inspect_thread(arguments: Mapping[str, Any]) -> dict[str, Any]:
     if direct_request is not None:
         thread_record["request"] = direct_request
         thread_record["request_generation"] = {"method": "single_user_prompt"}
-    cached = None
-    if direct_request is None and (
-        _request_synthesis_context_available(raw_thread_record)
-        and REQUEST_SYNTHESIS_CACHE_PATH.is_file()
-    ):
-        try:
-            transcript_sha256 = _transcript_sha256(raw_thread_record)
-        except ControllerError:
-            pass
-        else:
-            cached = _cached_request_synthesis(thread_id, transcript_sha256)
-    if cached is not None:
-        thread_record["request"] = cached["summary"]
-        thread_record["request_generation"] = {
-            "method": "llm_synthesis",
-            "model": REQUEST_SYNTHESIS_MODEL,
-            "generated_at": cached["generated_at"],
-            "cached": True,
-        }
-    elif direct_request is None and _request_synthesis_available(
+    if direct_request is None and _request_synthesis_available(
         raw_thread_record,
         model_options,
     ):

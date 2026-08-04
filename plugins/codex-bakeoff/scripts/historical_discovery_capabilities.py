@@ -28,6 +28,12 @@ NATIVE_TOOLS = {
     "AskUserQuestion": "Codex user-input request",
     "ToolSearch": "Codex tool discovery",
 }
+NATIVE_SKILL_EQUIVALENTS = {
+    "artifact-design": (
+        ("sites-building", "sites:sites-building"),
+        ("visualize", "visualize:visualize"),
+    ),
+}
 CODEX_BROWSER_SKILL = "control-in-app-browser"
 OFFICIAL_MARKETPLACES = {
     "openai-bundled",
@@ -220,6 +226,53 @@ def _local_skills(plugins: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, A
     return result
 
 
+def _configured_claude_home() -> Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (
+        Path(configured).expanduser().resolve()
+        if configured
+        else (Path.home() / ".claude").resolve()
+    )
+
+
+def _claude_skill_source(
+    replay_spec: Mapping[str, Any],
+    name: str,
+) -> dict[str, str] | None:
+    """Return a real local Claude skill source that Settings can import."""
+
+    identity = _identity(name)
+    roots: list[tuple[str, Path]] = [
+        ("user_skill", _configured_claude_home() / "skills"),
+    ]
+    for field in ("project_dir", "original_project_dir"):
+        value = replay_spec.get(field)
+        if isinstance(value, str) and value.strip():
+            roots.append(("project_skill", Path(value).expanduser() / ".claude" / "skills"))
+    for value in replay_spec.get("project_dirs") or []:
+        if isinstance(value, str) and value.strip():
+            roots.append(("project_skill", Path(value).expanduser() / ".claude" / "skills"))
+
+    seen: set[Path] = set()
+    for kind, root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            skill_files = sorted(resolved.glob("*/SKILL.md"))
+        except OSError:
+            continue
+        for skill_file in skill_files:
+            if _identity(skill_file.parent.name) == identity and skill_file.is_file():
+                return {"kind": kind, "path": str(skill_file.parent.resolve())}
+
+    return None
+
+
 def _configured_connectors(config: Mapping[str, Any]) -> set[str]:
     raw = config.get("mcp_servers")
     if not isinstance(raw, Mapping):
@@ -361,7 +414,8 @@ def inspect_capabilities(
     for raw_name in sorted(set(replay_spec.get("observed_skills") or [])):
         name = str(raw_name)
         capability_id = f"skill:{name}"
-        match = skills.get(_identity(name))
+        identity = _identity(name)
+        match = skills.get(identity)
         if match:
             add(
                 capability_id=capability_id,
@@ -371,6 +425,43 @@ def inspect_capabilities(
                 resolution="local_equivalent",
                 description="An exact local Codex skill is available.",
                 details={"local_match": match},
+            )
+            continue
+        equivalent_specs = NATIVE_SKILL_EQUIVALENTS.get(identity, ())
+        equivalent_matches = [
+            (display_name, skills.get(local_name))
+            for local_name, display_name in equivalent_specs
+        ]
+        if equivalent_matches and all(match is not None for _, match in equivalent_matches):
+            equivalent = " + ".join(display_name for display_name, _ in equivalent_matches)
+            add(
+                capability_id=capability_id,
+                kind="skill",
+                name=name,
+                status="codex_native_equivalent",
+                resolution="local_equivalent",
+                description="Installed Codex skills provide a functional equivalent.",
+                equivalent=equivalent,
+                details={
+                    "local_matches": [match for _, match in equivalent_matches],
+                },
+            )
+            continue
+        claude_source = _claude_skill_source(replay_spec, name)
+        if claude_source is None:
+            add(
+                capability_id=capability_id,
+                kind="skill",
+                name=name,
+                status="not_available",
+                resolution="claude_managed_or_source_unavailable",
+                description=(
+                    "No exact local Codex skill or importable local Claude skill source is available."
+                ),
+                details={
+                    "reason": "Claude-managed or source unavailable.",
+                    "claude_source_status": "unavailable",
+                },
             )
             continue
         action_id = f"import:claude-skill:{_identity(name)}"
@@ -387,8 +478,12 @@ def inspect_capabilities(
             name=name,
             status="not_available",
             resolution="ported_from_claude",
-            description="No exact local Codex skill is available.",
+            description="No exact local Codex skill is available; an importable Claude source exists.",
             action=action,
+            details={
+                "claude_source_status": "importable",
+                "claude_source": claude_source,
+            },
         )
 
     installed_by_name: dict[str, list[dict[str, Any]]] = {}
@@ -559,6 +654,7 @@ def inspect_capabilities(
         },
         "limitations": [
             "Capability matching uses exact local names and current configuration.",
+            "Skill import guidance requires an importable local Claude skill source.",
             "Configured connectors still require one observed successful operation.",
         ],
     }

@@ -497,7 +497,7 @@ class McpServerTests(unittest.TestCase):
             with mock.patch.object(server, "APP_HTML", Path("/deleted/controller.html")):
                 status, _, body = request("GET", "/")
             self.assertEqual(status, 200)
-            self.assertIn(b"codex-bakeoff.controller-draft.v6", body)
+            self.assertIn(b"codex-bakeoff.controller-draft.v7", body)
             self.assertNotIn(b"window.openai", body)
 
             tool_result = {
@@ -685,7 +685,7 @@ class McpServerTests(unittest.TestCase):
         snapshot = controller.split("function draftSnapshot()", 1)[1].split(
             "function saveDraft()", 1
         )[0]
-        self.assertIn("codex-bakeoff.controller-draft.v6", controller)
+        self.assertIn("codex-bakeoff.controller-draft.v7", controller)
         self.assertIn("codex-bakeoff.controller-session.v1", controller)
         self.assertIn("X-Codex-Bakeoff-Session", controller)
         self.assertIn("localStorage.getItem(CONTROLLER_SESSION_STORAGE_KEY)", controller)
@@ -724,6 +724,7 @@ class McpServerTests(unittest.TestCase):
             self.assertIn(field, snapshot)
         for transient in ("preparation", "approvalChecked", "runId", "report"):
             self.assertNotIn(transient, snapshot)
+        self.assertIn("delete reviewDraft.request", controller)
 
         steps = controller.split("const STEPS = [", 1)[1].split("];", 1)[0]
         self.assertIn('id: "configure"', steps)
@@ -834,6 +835,12 @@ class McpServerTests(unittest.TestCase):
             select_thread,
         )
         self.assertIn("state.reviewDraft = reviewDraftFromConfiguration()", select_thread)
+        self.assertIn("state.workingDirectoryLoading = true", select_thread)
+        self.assertIn("void inferWorkingDirectory(id)", select_thread)
+        self.assertLess(
+            select_thread.index('state.busy = ""'),
+            select_thread.index("void inferWorkingDirectory(id)"),
+        )
         self.assertLess(
             select_thread.index("state.classifications = Object.create(null)"),
             select_thread.index("render();"),
@@ -881,7 +888,11 @@ class McpServerTests(unittest.TestCase):
         self.assertIn('callTool("infer_working_directory"', working_directory)
         self.assertIn("editRevision !== state.workingDirectoryEditRevision", working_directory)
         self.assertIn("state.reviewDraft.repo = workingDirectory", working_directory)
+        self.assertIn("state.workingDirectoryLoading = false", working_directory)
         self.assertIn("Replay working directory", configure)
+        self.assertIn("Inferring working directory…", configure)
+        self.assertIn("Reconstructing task prompt…", configure)
+        self.assertIn("promptLoading ? \"\" : escapeHtml(draft.request)", configure)
         self.assertNotIn("Replay repository", configure)
         review_problems = controller.split("function reviewProblems", 1)[1].split(
             "function invalidateReviewPreparation", 1
@@ -926,6 +937,7 @@ class McpServerTests(unittest.TestCase):
         )[0]
 
         self.assertIn("titleCase(record.status)", capability_rows)
+        self.assertIn("record.title || record.name", capability_rows)
         self.assertIn("record.guidance", capability_rows)
         self.assertIn("not_available", capability_rows)
         self.assertIn('id="capability-heading"', configure)
@@ -1043,7 +1055,6 @@ class McpServerTests(unittest.TestCase):
                 raise AssertionError(command)
 
             with (
-                mock.patch.object(server, "REQUEST_SYNTHESIS_CACHE_PATH", root / "cache.json"),
                 mock.patch.object(server, "_engine", side_effect=fake_engine),
                 mock.patch.object(server, "_run_worker") as worker,
             ):
@@ -1178,7 +1189,7 @@ class McpServerTests(unittest.TestCase):
             1,
         )
 
-    def test_synthesis_cache_hit_and_transcript_change_invalidation(self) -> None:
+    def test_synthesis_runs_fresh_each_time(self) -> None:
         server = load_server()
         fallback = "add hello world\n\n3"
         turns = [
@@ -1192,7 +1203,6 @@ class McpServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             transcript = root / "transcript.jsonl"
-            cache_path = root / "request-cache.json"
             transcript.write_text("transcript version one", encoding="utf-8")
             model_calls = 0
 
@@ -1218,6 +1228,7 @@ class McpServerTests(unittest.TestCase):
             summaries = [
                 "Add a simple hello world program.",
                 "Add a revised simple hello world program.",
+                "Add a newly reconstructed simple hello world program.",
             ]
 
             def fake_worker(
@@ -1242,7 +1253,6 @@ class McpServerTests(unittest.TestCase):
 
             fake_worker.calls = 0
             with (
-                mock.patch.object(server, "REQUEST_SYNTHESIS_CACHE_PATH", cache_path),
                 mock.patch.object(server, "_engine", side_effect=fake_engine),
                 mock.patch.object(server, "_run_worker", side_effect=fake_worker) as worker,
             ):
@@ -1254,8 +1264,6 @@ class McpServerTests(unittest.TestCase):
                 transcript.write_text("transcript version two", encoding="utf-8")
                 third = server._synthesize_request_payload({"thread_id": "thread-1"})
 
-            cache = json.loads(cache_path.read_text(encoding="utf-8"))
-
         self.assertEqual(first["request"], summaries[0])
         self.assertEqual(
             first["request_generation"],
@@ -1263,36 +1271,16 @@ class McpServerTests(unittest.TestCase):
                 "method": "llm_synthesis",
                 "model": "gpt-5.6-terra",
                 "generated_at": first["request_generation"]["generated_at"],
-                "cached": False,
             },
         )
-        self.assertEqual(inspected["replay"]["request"], summaries[0])
-        self.assertTrue(inspected["replay"]["request_generation"]["cached"])
-        self.assertEqual(second["request"], summaries[0])
-        self.assertTrue(second["request_generation"]["cached"])
-        self.assertEqual(third["request"], summaries[1])
-        self.assertFalse(third["request_generation"]["cached"])
-        self.assertEqual(worker.call_count, 2)
-        self.assertEqual(model_calls, 3)
-        self.assertEqual(set(cache), {"thread-1"})
-        self.assertEqual(
-            set(cache["thread-1"]),
-            {
-                "cache_version",
-                "thread_id",
-                "transcript_sha256",
-                "summary",
-                "model",
-                "generated_at",
-            },
-        )
-        self.assertEqual(
-            cache["thread-1"]["cache_version"],
-            server.REQUEST_SYNTHESIS_CACHE_VERSION,
-        )
-        self.assertEqual(cache["thread-1"]["summary"], summaries[1])
+        self.assertEqual(inspected["replay"]["request"], fallback)
+        self.assertEqual(inspected["replay"]["request_generation"], {"method": "pending"})
+        self.assertEqual(second["request"], summaries[1])
+        self.assertEqual(third["request"], summaries[2])
+        self.assertEqual(worker.call_count, 3)
+        self.assertEqual(model_calls, 4)
 
-    def test_failed_synthesis_keeps_exact_concat_and_is_not_cached(self) -> None:
+    def test_failed_synthesis_keeps_exact_concat(self) -> None:
         server = load_server()
         fallback = "add hello world\n\n3"
         outcomes = (
@@ -1304,7 +1292,6 @@ class McpServerTests(unittest.TestCase):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 transcript = root / "transcript.jsonl"
-                cache_path = root / "request-cache.json"
                 transcript.write_text("source transcript", encoding="utf-8")
 
                 def fake_engine(command: str, arguments=()):
@@ -1330,7 +1317,6 @@ class McpServerTests(unittest.TestCase):
                     else mock.patch.object(server, "_run_worker", return_value=outcome)
                 )
                 with (
-                    mock.patch.object(server, "REQUEST_SYNTHESIS_CACHE_PATH", cache_path),
                     mock.patch.object(server, "_engine", side_effect=fake_engine),
                     worker_patch as worker,
                 ):
@@ -1344,7 +1330,6 @@ class McpServerTests(unittest.TestCase):
                 )
                 self.assertEqual(second, first)
                 self.assertEqual(worker.call_count, 2)
-                self.assertFalse(cache_path.exists())
 
     def test_inspection_runs_discovery_concurrently_with_ordered_diagnostics(self) -> None:
         server = load_server()

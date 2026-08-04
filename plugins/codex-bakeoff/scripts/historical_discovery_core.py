@@ -70,36 +70,6 @@ OFFICIAL_INSTALL_MARKETPLACES = {
     "openai-curated": frozenset({"openai-curated", "openai-curated-remote"}),
     "openai-primary-runtime": frozenset({"openai-primary-runtime"}),
 }
-ANTHROPIC_FIRST_PARTY_SKILLS = frozenset(
-    {
-        "algorithmic-art",
-        "artifact-design",
-        "brand-guidelines",
-        "canvas-design",
-        "doc-coauthoring",
-        "docx",
-        "frontend-design",
-        "internal-comms",
-        "mcp-builder",
-        "pdf",
-        "pptx",
-        "skill-creator",
-        "slack-gif-creator",
-        "theme-factory",
-        "web-artifacts-builder",
-        "webapp-testing",
-        "xlsx",
-    }
-)
-ANTHROPIC_FIRST_PARTY_NAMESPACES = frozenset(
-    {
-        "anthropic",
-        "anthropic-skills",
-        "claude",
-        "claude-code",
-        "claude-plugins-official",
-    }
-)
 SKILL_RESOLUTION_POLICY = "resolve_all_observed_skills"
 CAPABILITY_SNAPSHOT_SCHEMA_VERSION = 2
 MAX_CAPABILITY_SNAPSHOT_ENTRIES = 256
