@@ -1196,7 +1196,18 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(set(cache), {"thread-1"})
         self.assertEqual(
             set(cache["thread-1"]),
-            {"thread_id", "transcript_sha256", "summary", "model", "generated_at"},
+            {
+                "cache_version",
+                "thread_id",
+                "transcript_sha256",
+                "summary",
+                "model",
+                "generated_at",
+            },
+        )
+        self.assertEqual(
+            cache["thread-1"]["cache_version"],
+            server.REQUEST_SYNTHESIS_CACHE_VERSION,
         )
         self.assertEqual(cache["thread-1"]["summary"], summaries[1])
 

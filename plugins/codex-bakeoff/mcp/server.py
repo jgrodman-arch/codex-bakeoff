@@ -66,6 +66,7 @@ MAX_RUN_LOG_BYTES = 128 * 1024
 MAX_REQUEST_SYNTHESIS_CACHE_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_SYNTHESIS_BYTES = 256 * 1024
 REQUEST_SYNTHESIS_MODEL = "gpt-5.6-terra"
+REQUEST_SYNTHESIS_CACHE_VERSION = 2
 CONTROLLER_SMOKE_TEST_MODEL = "gpt-5.6-sol"
 CLAUDE_REVIEW_MODEL = "sonnet"
 CLAUDE_PROBE_TIMEOUT = 60
@@ -2361,6 +2362,7 @@ def _cached_request_synthesis(
     with _request_synthesis_cache_lock:
         entry = _read_request_synthesis_cache_unlocked().get(thread_id)
     if not isinstance(entry, Mapping) or set(entry) != {
+        "cache_version",
         "thread_id",
         "transcript_sha256",
         "summary",
@@ -2370,7 +2372,8 @@ def _cached_request_synthesis(
         return None
     summary = entry.get("summary")
     if (
-        entry.get("thread_id") != thread_id
+        entry.get("cache_version") != REQUEST_SYNTHESIS_CACHE_VERSION
+        or entry.get("thread_id") != thread_id
         or entry.get("transcript_sha256") != transcript_sha256
         or entry.get("model") != REQUEST_SYNTHESIS_MODEL
         or not isinstance(entry.get("generated_at"), str)
@@ -2390,6 +2393,7 @@ def _cache_request_synthesis(
     generated_at: str,
 ) -> None:
     entry = {
+        "cache_version": REQUEST_SYNTHESIS_CACHE_VERSION,
         "thread_id": thread_id,
         "transcript_sha256": transcript_sha256,
         "summary": summary,

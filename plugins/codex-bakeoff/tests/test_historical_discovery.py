@@ -52,6 +52,21 @@ class HistoricalDiscoveryTests(unittest.TestCase):
             },
         }
 
+    def queued_command(self, uuid: str, text: str, timestamp: str) -> dict:
+        return {
+            "type": "attachment",
+            "uuid": uuid,
+            "sessionId": "claude-session",
+            "cwd": str(self.project),
+            "timestamp": timestamp,
+            "attachment": {
+                "type": "queued_command",
+                "prompt": text,
+                "commandMode": "prompt",
+                "origin": {"kind": "human"},
+            },
+        }
+
     def write_transcript(self, name: str, events: list[dict]) -> Path:
         path = self.root / f"{name}.jsonl"
         path.write_text(
@@ -184,6 +199,40 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         self.assertFalse(replay["prompt_reconstruction_truncated"])
         self.assertNotIn("source_sha256", replay)
         self.assertNotIn("configuration_fingerprint", replay)
+
+    def test_whole_thread_replay_includes_human_queued_commands(self) -> None:
+        requests = [
+            "download the linux repo",
+            "create an html diagram walkthrough",
+            "create a welcome.sh script to get someone oriented with it",
+            "add tests for welcome.sh",
+            "commit everything except the html",
+        ]
+        session, task = self.select(
+            [
+                self.user("u1", requests[0], "2026-01-01T10:00:00Z"),
+                {
+                    "type": "queue-operation",
+                    "operation": "enqueue",
+                    "content": requests[1],
+                    "timestamp": "2026-01-01T10:00:01Z",
+                },
+                self.queued_command("q1", requests[1], "2026-01-01T10:00:01Z"),
+                self.queued_command("q2", requests[2], "2026-01-01T10:00:02Z"),
+                self.queued_command("q3", requests[3], "2026-01-01T10:00:03Z"),
+                self.user("u2", requests[4], "2026-01-01T10:00:04Z"),
+            ]
+        )
+
+        replay = discovery.build_replay_spec(session, task)
+
+        self.assertEqual(session["task_count"], 5)
+        self.assertEqual(task["request"], "\n\n".join(requests))
+        self.assertEqual(replay["message_uuids"], ["u1", "q1", "q2", "q3", "u2"])
+        self.assertEqual(
+            replay["prompt_reconstruction_turns"],
+            [{"role": "user", "text": request} for request in requests],
+        )
 
     def test_prompt_reconstruction_resolves_numbered_reply_without_solution_output(self) -> None:
         clarification = (

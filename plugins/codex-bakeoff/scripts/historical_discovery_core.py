@@ -316,6 +316,24 @@ def _visible_message_text(event: dict[str, Any]) -> str:
     )
 
 
+def _actionable_user_text(event: dict[str, Any]) -> str:
+    if event.get("type") == "attachment":
+        attachment = event.get("attachment")
+        if not isinstance(attachment, dict):
+            return ""
+        origin = attachment.get("origin")
+        if (
+            attachment.get("type") != "queued_command"
+            or attachment.get("commandMode") != "prompt"
+            or not isinstance(origin, dict)
+            or origin.get("kind") != "human"
+        ):
+            return ""
+        prompt = attachment.get("prompt")
+        return prompt if isinstance(prompt, str) and prompt.strip() else ""
+    return _visible_message_text(event)
+
+
 def _assistant_clarification_text(value: str) -> str:
     """Extract question context without carrying unrelated assistant output."""
 
@@ -437,7 +455,7 @@ def _prompt_reconstruction_turns(
             if pending_clarification and not append_turn("assistant", pending_clarification):
                 break
             pending_clarification = ""
-            if not append_turn("user", _visible_message_text(event)):
+            if not append_turn("user", _actionable_user_text(event)):
                 break
             continue
 
@@ -475,19 +493,21 @@ def _prompt_reconstruction_turns(
 
 
 def _is_actionable_user_event(event: dict[str, Any]) -> bool:
-    if event.get("type") != "user":
+    event_type = event.get("type")
+    if event_type not in ("user", "attachment"):
         return False
     if event.get("isMeta") or event.get("isSidechain") or event.get("isCompactSummary"):
         return False
-    if event.get("sourceToolAssistantUUID") or event.get("sourceToolUseID"):
-        return False
-    message = event.get("message")
-    if not isinstance(message, dict) or message.get("role") not in (None, "user"):
-        return False
+    if event_type == "user":
+        if event.get("sourceToolAssistantUUID") or event.get("sourceToolUseID"):
+            return False
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("role") not in (None, "user"):
+            return False
     uuid = event.get("uuid")
     if not isinstance(uuid, str) or not uuid.strip():
         return False
-    text = _visible_message_text(event)
+    text = _actionable_user_text(event)
     if not text.strip():
         return False
     if INTERRUPTION_PLACEHOLDER.fullmatch(text):
@@ -555,7 +575,7 @@ def _summarize_session(record: dict[str, Any], source_path: Path) -> dict[str, A
             if is_task:
                 task_count += 1
                 if not first_request:
-                    first_request = _visible_message_text(event)
+                    first_request = _actionable_user_text(event)
                 created = _parse_timestamp(event.get("timestamp"))
                 if created is not None and (created_at is None or created < created_at):
                     created_at = created
@@ -735,7 +755,7 @@ def list_session_tasks(session: dict[str, Any]) -> list[dict[str, Any]]:
         tasks.append(
             {
                 "message_uuid": event["uuid"],
-                "request": _visible_message_text(event),
+                "request": _actionable_user_text(event),
                 "timestamp": _format_timestamp(_parse_timestamp(event.get("timestamp"))),
                 "project_dir": (
                     event.get("cwd")
@@ -1493,7 +1513,7 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
                 if not whole_thread:
                     break
             if selected_event is not None and whole_thread:
-                thread_requests.append(_visible_message_text(event))
+                thread_requests.append(_actionable_user_text(event))
                 thread_message_uuids.append(event["uuid"])
                 continue
         if selected_event is not None and whole_thread:
@@ -1551,7 +1571,9 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
         "source_path": str(source_path),
         "message_uuid": message_uuid,
         "request": (
-            "\n\n".join(thread_requests) if whole_thread else _visible_message_text(selected_event)
+            "\n\n".join(thread_requests)
+            if whole_thread
+            else _actionable_user_text(selected_event)
         ),
         "task_timestamp": timestamp,
         "project_dir": project_dir,
