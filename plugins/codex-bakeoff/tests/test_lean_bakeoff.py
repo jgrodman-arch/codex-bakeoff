@@ -160,6 +160,30 @@ class LeanBakeoffTests(unittest.TestCase):
         fallback = bakeoff.discover_codex_models(self.root / "models.json")
         self.assertTrue(fallback["options"][0]["recommended"])
 
+    def test_model_discovery_uses_existing_cache_without_app_server(self) -> None:
+        with mock.patch.object(bakeoff, "_app_server_codex_models") as app_server:
+            catalog = bakeoff.discover_codex_models(self.root / "models.json")
+
+        app_server.assert_not_called()
+        self.assertEqual(catalog["source"], str(self.root / "models.json"))
+
+    def test_model_discovery_uses_app_server_when_cache_is_missing(self) -> None:
+        expected = {
+            "status": "available",
+            "source": "codex app-server model/list",
+            "options": [{"id": "gpt-test"}],
+            "limitations": [],
+        }
+        with mock.patch.object(
+            bakeoff,
+            "_app_server_codex_models",
+            return_value=expected,
+        ) as app_server:
+            catalog = bakeoff.discover_codex_models(self.root / "missing.json")
+
+        app_server.assert_called_once_with()
+        self.assertEqual(catalog, expected)
+
     def test_app_server_model_discovery_uses_model_list_and_paginates(self) -> None:
         pages = (
             {
@@ -186,7 +210,7 @@ class LeanBakeoffTests(unittest.TestCase):
             },
         )
         with mock.patch.object(bakeoff, "_app_server_model_page", side_effect=pages) as page:
-            catalog = bakeoff.discover_codex_models()
+            catalog = bakeoff._app_server_codex_models()
 
         self.assertEqual(page.call_args_list, [mock.call(None), mock.call("next-page")])
         self.assertEqual(catalog["source"], "codex app-server model/list")

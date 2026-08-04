@@ -293,7 +293,7 @@ def _app_server_model_page(cursor: str | None) -> dict[str, Any]:
                     "clientInfo": {
                         "name": "codex-bakeoff",
                         "title": "Codex Bakeoff",
-                        "version": "1.0.30",
+                        "version": "1.0.31",
                     },
                     "capabilities": None,
                 },
@@ -324,6 +324,10 @@ def _app_server_model_page(cursor: str | None) -> dict[str, Any]:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def _app_server_codex_models() -> dict[str, Any]:
@@ -369,12 +373,13 @@ def _app_server_codex_models() -> dict[str, Any]:
 
 
 def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, Any]:
-    if model_cache is not None:
-        return _cached_codex_models(model_cache)
+    path = Path(model_cache or DEFAULT_MODEL_CACHE).expanduser()
+    if path.is_file():
+        return _cached_codex_models(path)
     try:
         return _app_server_codex_models()
     except BakeoffError as error:
-        fallback = _cached_codex_models(DEFAULT_MODEL_CACHE)
+        fallback = _cached_codex_models(path)
         fallback["limitations"] = [str(error), *fallback["limitations"]]
         return fallback
 
@@ -383,8 +388,6 @@ def _selected_model(model: str | None, model_cache: Path | None) -> str:
     if not isinstance(model, str) or not model.strip() or "\x00" in model:
         raise BakeoffError("Choose a Codex model before starting the comparison.")
     selected = model.strip()
-    if model_cache is None:
-        return selected
     catalog = discover_codex_models(model_cache)
     choices = {item["id"] for item in catalog["options"]}
     if catalog.get("status") != "available" or not choices:
@@ -2434,7 +2437,7 @@ def _add_preparation(parser: argparse.ArgumentParser) -> None:
         help="Read the manually reviewed replay request from standard input.",
     )
     parser.add_argument("--model", required=True)
-    parser.add_argument("--model-cache", type=Path)
+    parser.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
     parser.add_argument("--timeout-seconds", type=_positive_int, default=1800)
 
 
@@ -2462,11 +2465,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json(baseline)
 
     models = commands.add_parser("models")
-    models.add_argument("--model-cache", type=Path)
+    models.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
     _add_json(models)
 
     reviewers = commands.add_parser("reviewers")
-    reviewers.add_argument("--model-cache", type=Path)
+    reviewers.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
     _add_json(reviewers)
 
     prepare = commands.add_parser("prepare")
