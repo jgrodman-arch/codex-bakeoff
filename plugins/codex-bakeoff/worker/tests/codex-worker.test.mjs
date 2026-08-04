@@ -25,7 +25,7 @@ test.after(async () => {
   );
 });
 
-test("resolves Codex from an explicit override, PATH, or a macOS app bundle", async () => {
+test("probes Codex candidates in configured, PATH, and app-bundle order", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "codex-bakeoff-discovery-"));
   temporaryRoots.push(root);
   const binDirectory = path.join(root, "bin");
@@ -47,29 +47,98 @@ test("resolves Codex from an explicit override, PATH, or a macOS app bundle", as
   ]);
   await Promise.all([chmod(pathCodex, 0o755), chmod(bundledCodex, 0o755)]);
 
+  const configuredProbes = [];
   assert.equal(
     resolveCodexTarget({
       env: { CODEX_CLI_PATH: "/custom/codex", PATH: binDirectory },
       platform: "darwin",
-      applicationRoots: [root]
+      applicationRoots: [root],
+      probe(candidate) {
+        configuredProbes.push(candidate);
+        return true;
+      }
     }),
     "/custom/codex"
   );
+  assert.deepEqual(configuredProbes, ["/custom/codex"]);
+
+  const pathProbes = [];
   assert.equal(
     resolveCodexTarget({
       env: { PATH: binDirectory },
       platform: "darwin",
-      applicationRoots: [root]
+      applicationRoots: [root],
+      probe(candidate) {
+        pathProbes.push(candidate);
+        return true;
+      }
     }),
     pathCodex
   );
+  assert.deepEqual(pathProbes, [pathCodex]);
+
+  const bundleProbes = [];
   assert.equal(
     resolveCodexTarget({
       env: { PATH: "" },
       platform: "darwin",
-      applicationRoots: [root]
+      applicationRoots: [root],
+      probe(candidate) {
+        bundleProbes.push(candidate);
+        return true;
+      }
     }),
     bundledCodex
+  );
+  assert.deepEqual(bundleProbes, [bundledCodex]);
+});
+
+test("falls back from a broken configured Codex to a healthy app bundle", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "codex-bakeoff-fallback-"));
+  temporaryRoots.push(root);
+  const configuredCodex = path.join(root, "nvm", "bin", "codex");
+  const bundledCodex = path.join(
+    root,
+    "Codex.app",
+    "Contents",
+    "Resources",
+    "codex"
+  );
+  await Promise.all([
+    mkdir(path.dirname(configuredCodex), { recursive: true }),
+    mkdir(path.dirname(bundledCodex), { recursive: true })
+  ]);
+  await Promise.all([writeFile(configuredCodex, ""), writeFile(bundledCodex, "")]);
+  await Promise.all([chmod(configuredCodex, 0o755), chmod(bundledCodex, 0o755)]);
+
+  const probes = [];
+  assert.equal(
+    resolveCodexTarget({
+      env: { CODEX_CLI_PATH: configuredCodex, PATH: "" },
+      platform: "darwin",
+      applicationRoots: [root],
+      probe(candidate) {
+        probes.push(candidate);
+        return candidate === bundledCodex;
+      }
+    }),
+    bundledCodex
+  );
+  assert.deepEqual(probes, [configuredCodex, bundledCodex]);
+});
+
+test("reports the candidates when no Codex version probe succeeds", () => {
+  assert.throws(
+    () =>
+      resolveCodexTarget({
+        env: { CODEX_CLI_PATH: "/broken/codex", PATH: "" },
+        platform: "linux",
+        applicationRoots: [],
+        probe: () => false
+      }),
+    (error) =>
+      error.code === "codex_unavailable" &&
+      error.message.includes("/broken/codex")
   );
 });
 

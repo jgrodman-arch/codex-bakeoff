@@ -2,7 +2,7 @@
 
 // src/codex-worker.mjs
 import { createInterface } from "node:readline";
-import { spawn as spawn2 } from "node:child_process";
+import { spawn as spawn2, spawnSync } from "node:child_process";
 import { accessSync, constants, readdirSync, statSync as statSync2 } from "node:fs";
 import { homedir } from "node:os";
 import path3 from "node:path";
@@ -546,6 +546,8 @@ var CLI_WRAPPER_MODE_ENV = "CODEX_BAKEOFF_CODEX_WRAPPER";
 var CLI_WRAPPER_TARGET_ENV = "CODEX_BAKEOFF_CODEX_TARGET";
 var CLI_WRAPPER_OWNER_ENV = "CODEX_BAKEOFF_CODEX_OWNER_PID";
 var TREE_KILL_GRACE_MS = 2e3;
+var CODEX_VERSION_PROBE_TIMEOUT_MS = 5e3;
+var CODEX_VERSION_PROBE_MAX_BUFFER = 64 * 1024;
 var SAFE_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 var SAFE_MODEL = /^[A-Za-z0-9._:-]{1,128}$/;
 var SANDBOX_MODES = /* @__PURE__ */ new Set(["read-only", "workspace-write"]);
@@ -931,13 +933,19 @@ function defaultCodexFactory() {
 function resolveCodexTarget({
   env = process.env,
   platform = process.platform,
-  applicationRoots = defaultApplicationRoots(env, platform)
+  applicationRoots = defaultApplicationRoots(env, platform),
+  probe = probeCodexCandidate
 } = {}) {
+  const candidates = [];
+  const addCandidate = (candidate) => {
+    if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
+  };
   const configured = env.CODEX_CLI_PATH?.trim();
-  if (configured) return configured;
+  addCandidate(configured);
   const executableName = platform === "win32" ? "codex.exe" : "codex";
-  const pathMatch = findExecutableOnPath(executableName, env, platform);
-  if (pathMatch) return pathMatch;
+  for (const pathMatch of findExecutablesOnPath(executableName, env, platform)) {
+    addCandidate(pathMatch);
+  }
   if (platform === "darwin") {
     for (const applicationRoot of applicationRoots) {
       for (const applicationName of codexApplicationNames(applicationRoot)) {
@@ -948,26 +956,48 @@ function resolveCodexTarget({
           "Resources",
           "codex"
         );
-        if (isExecutableFile(candidate)) return candidate;
+        if (isExecutableFile(candidate)) addCandidate(candidate);
       }
     }
   }
-  return executableName;
+  for (const candidate of candidates) {
+    try {
+      if (probe(candidate, env)) return candidate;
+    } catch {
+    }
+  }
+  const checked = candidates.length > 0 ? ` Checked: ${candidates.join(", ")}.` : "";
+  throw new SafeWorkerError(
+    "codex_unavailable",
+    `No working Codex executable was found.${checked}`
+  );
 }
 function defaultApplicationRoots(env, platform) {
   if (platform !== "darwin") return [];
   const home = env.HOME?.trim() || homedir();
   return ["/Applications", path3.join(home, "Applications")];
 }
-function findExecutableOnPath(executableName, env, platform) {
+function findExecutablesOnPath(executableName, env, platform) {
   const pathValue = platform === "win32" ? Object.entries(env).find(([key]) => key.toLowerCase() === "path")?.[1] : env.PATH;
-  if (!pathValue) return null;
+  if (!pathValue) return [];
+  const matches = [];
   for (const directory of pathValue.split(path3.delimiter)) {
     if (!directory) continue;
     const candidate = path3.join(directory, executableName);
-    if (isExecutableFile(candidate)) return candidate;
+    if (isExecutableFile(candidate)) matches.push(candidate);
   }
-  return null;
+  return matches;
+}
+function probeCodexCandidate(candidate, env) {
+  const completed = spawnSync(candidate, ["--version"], {
+    env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: CODEX_VERSION_PROBE_TIMEOUT_MS,
+    maxBuffer: CODEX_VERSION_PROBE_MAX_BUFFER,
+    windowsHide: true
+  });
+  return completed.status === 0 && completed.error === void 0;
 }
 function codexApplicationNames(applicationRoot) {
   try {

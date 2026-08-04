@@ -604,16 +604,21 @@ def _probe_controller(port: int) -> tuple[str, dict[str, Any]]:
         else ""
     )
     supplied_proof = payload.get("proof") if isinstance(payload, Mapping) else None
-    if (
+    is_bakeoff_controller = (
         status == 200
         and isinstance(payload, Mapping)
         and payload.get("server") == SERVER_NAME
         and payload.get("protocol_version") == CONTROLLER_PROTOCOL_VERSION
+    )
+    if (
+        is_bakeoff_controller
         and isinstance(supplied_proof, str)
         and bool(expected_proof)
         and hmac.compare_digest(supplied_proof, expected_proof)
     ):
         return "compatible", dict(payload)
+    if is_bakeoff_controller:
+        return "unverified", dict(payload)
     return "foreign", dict(payload) if isinstance(payload, Mapping) else {}
 
 
@@ -745,7 +750,7 @@ def _ensure_controller_daemon(
             else None
         )
         status, health = _probe_controller(port)
-        if status == "foreign":
+        if status in {"foreign", "unverified"}:
             listener = _port_listener(port)
             if confirmed_conflict is None:
                 raise PortConflictError(

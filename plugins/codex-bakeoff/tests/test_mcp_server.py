@@ -236,6 +236,87 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(structured["process_name"], "python3")
         self.assertGreaterEqual(len(structured["confirmation_token"]), 32)
 
+    def test_probe_distinguishes_bakeoff_with_stale_runtime_token(self) -> None:
+        server = load_server()
+        payload = {
+            "server": server.SERVER_NAME,
+            "protocol_version": server.CONTROLLER_PROTOCOL_VERSION,
+            "version": server.SERVER_VERSION,
+            "proof": "proof-from-the-new-controller",
+        }
+        with (
+            mock.patch.object(
+                server,
+                "_read_controller_runtime",
+                return_value={"control_token": "stale-" + ("x" * 48)},
+            ),
+            mock.patch.object(
+                server,
+                "_http_request",
+                return_value=(200, json.dumps(payload).encode("utf-8")),
+            ),
+        ):
+            status, health = server._probe_controller(43117)
+
+        self.assertEqual(status, "unverified")
+        self.assertEqual(health, payload)
+
+    def test_spawned_controller_retries_until_new_runtime_token_is_visible(self) -> None:
+        server = load_server()
+        process = mock.Mock()
+        process.poll.return_value = None
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(server, "CONTROLLER_CACHE_ROOT", root),
+                mock.patch.object(server, "CONTROLLER_LOCK_PATH", root / "controller.lock"),
+                mock.patch.object(server, "_controller_port", return_value=43117),
+                mock.patch.object(
+                    server,
+                    "_probe_controller",
+                    side_effect=[
+                        ("absent", {}),
+                        ("unverified", {"server": server.SERVER_NAME}),
+                        ("compatible", {"version": server.SERVER_VERSION}),
+                    ],
+                ) as probe,
+                mock.patch.object(
+                    server,
+                    "_spawn_controller_daemon",
+                    return_value=process,
+                ),
+                mock.patch.object(server.time, "sleep"),
+            ):
+                port, health = server._ensure_controller_daemon()
+
+        self.assertEqual(port, 43117)
+        self.assertEqual(health["version"], server.SERVER_VERSION)
+        self.assertEqual(probe.call_count, 3)
+
+    def test_spawned_controller_still_rejects_a_foreign_listener(self) -> None:
+        server = load_server()
+        process = mock.Mock()
+        process.poll.return_value = None
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(server, "CONTROLLER_CACHE_ROOT", root),
+                mock.patch.object(server, "CONTROLLER_LOCK_PATH", root / "controller.lock"),
+                mock.patch.object(server, "_controller_port", return_value=43117),
+                mock.patch.object(
+                    server,
+                    "_probe_controller",
+                    side_effect=[("absent", {}), ("foreign", {})],
+                ),
+                mock.patch.object(
+                    server,
+                    "_spawn_controller_daemon",
+                    return_value=process,
+                ),
+                self.assertRaisesRegex(server.ControllerError, "claimed by another service"),
+            ):
+                server._ensure_controller_daemon()
+
     def test_confirmed_port_process_is_stopped_before_controller_opens(self) -> None:
         server = load_server()
         token = "confirmation-" + ("x" * 32)
@@ -2193,6 +2274,9 @@ class McpServerTests(unittest.TestCase):
                         f"#!{sys.executable}",
                         "import json, os, sys",
                         "from pathlib import Path",
+                        "if sys.argv[1:] == ['--version']:",
+                        "    print('codex fixture')",
+                        "    raise SystemExit(0)",
                         "sys.stdin.read()",
                         "args = sys.argv[1:]",
                         "workspace = Path(args[args.index('--cd') + 1])",
