@@ -293,7 +293,7 @@ def _app_server_model_page(cursor: str | None) -> dict[str, Any]:
                     "clientInfo": {
                         "name": "codex-bakeoff",
                         "title": "Codex Bakeoff",
-                        "version": "1.0.29",
+                        "version": "1.0.30",
                     },
                     "capabilities": None,
                 },

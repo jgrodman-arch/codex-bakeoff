@@ -695,7 +695,7 @@ def _remember_codex_cli_path_hint(value: Any) -> None:
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise ControllerError("The supplied Codex executable is not executable.")
     CONTROLLER_CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _write_private_json(CODEX_CLI_PATH_HINT_PATH, {"path": str(resolved)})
+    _write_private_json(CODEX_CLI_PATH_HINT_PATH, {"path": str(candidate)})
 
 
 def _codex_cli_path_hint() -> str | None:
@@ -718,6 +718,14 @@ def _worker_environment() -> dict[str, str]:
         hinted = _codex_cli_path_hint()
         if hinted is not None:
             environment["CODEX_CLI_PATH"] = hinted
+    codex_cli_path = environment.get("CODEX_CLI_PATH")
+    if codex_cli_path:
+        executable_directory = str(Path(codex_cli_path).parent)
+        path_entries = environment.get("PATH", "").split(os.pathsep)
+        if executable_directory not in path_entries:
+            environment["PATH"] = os.pathsep.join(
+                [executable_directory, *filter(None, path_entries)]
+            )
     return environment
 
 

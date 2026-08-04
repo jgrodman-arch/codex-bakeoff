@@ -168,9 +168,15 @@ class McpServerTests(unittest.TestCase):
         server = load_server()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            codex = root / "codex"
-            codex.touch()
-            codex.chmod(0o700)
+            bin_directory = root / "bin"
+            lib_directory = root / "lib"
+            bin_directory.mkdir()
+            lib_directory.mkdir()
+            target = lib_directory / "codex.js"
+            target.touch()
+            target.chmod(0o700)
+            codex = bin_directory / "codex"
+            codex.symlink_to(target)
             hint_path = root / "codex-cli-path.json"
             with (
                 mock.patch.object(server, "CODEX_CLI_PATH_HINT_PATH", hint_path),
@@ -197,10 +203,14 @@ class McpServerTests(unittest.TestCase):
                     worker_environment = server._worker_environment()
 
             self.assertTrue(result["structuredContent"]["opened"])
-            self.assertEqual(worker_environment["CODEX_CLI_PATH"], str(codex.resolve()))
+            self.assertEqual(worker_environment["CODEX_CLI_PATH"], str(codex))
+            self.assertEqual(
+                worker_environment["PATH"].split(os.pathsep)[0],
+                str(bin_directory),
+            )
             self.assertEqual(
                 json.loads(hint_path.read_text(encoding="utf-8"))["path"],
-                str(codex.resolve()),
+                str(codex),
             )
 
     def test_port_conflict_requests_confirmation_without_stopping_process(self) -> None:
