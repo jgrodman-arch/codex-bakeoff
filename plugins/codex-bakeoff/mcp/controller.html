@@ -767,6 +767,14 @@
       font-size: 12px;
     }
 
+    .footer-actions--configuration {
+      position: static;
+      margin-top: 0;
+      margin-bottom: 18px;
+      padding: 0;
+      background: none;
+    }
+
     .button {
       display: inline-flex;
       min-height: 38px;
@@ -2784,7 +2792,7 @@
             "Prepare the historical replay",
             "Complete each step, then review the exact configuration before starting."
           )}
-          <div class="footer-actions">
+          <div class="footer-actions footer-actions--configuration">
             <span class="footer-actions__note">${configurationLocked
               ? "This is the configuration used for the current bakeoff."
               : finalStep
