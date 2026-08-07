@@ -46,14 +46,7 @@ class LeanCapabilityTests(unittest.TestCase):
         self.assertEqual(result["unavailable_capabilities"], [])
 
     def test_claude_browser_uses_installed_codex_browser(self) -> None:
-        plugin = (
-            self.codex_home
-            / "plugins"
-            / "cache"
-            / "openai-bundled"
-            / "browser"
-            / "1.0.0"
-        )
+        plugin = self.codex_home / "plugins" / "cache" / "openai-bundled" / "browser" / "1.0.0"
         skill = plugin / "skills" / "control-in-app-browser"
         skill.mkdir(parents=True)
         (plugin / ".codex-plugin").mkdir()
@@ -155,9 +148,7 @@ class LeanCapabilityTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        result = capabilities.inspect_capabilities(
-            {"observed_skills": ["claude-only-test-skill"]}
-        )
+        result = capabilities.inspect_capabilities({"observed_skills": ["claude-only-test-skill"]})
 
         self.assertEqual(result["items"][0]["status"], "not_available")
         self.assertEqual(result["items"][0]["claude_source_status"], "importable")
@@ -206,9 +197,7 @@ class LeanCapabilityTests(unittest.TestCase):
         agents = project / "AGENTS.md"
         agents.write_text("Use focused tests.\n", encoding="utf-8")
 
-        result = capabilities.inspect_capabilities(
-            {"observed_instruction_paths": [str(agents)]}
-        )
+        result = capabilities.inspect_capabilities({"observed_instruction_paths": [str(agents)]})
 
         self.assertEqual(result["items"][0]["status"], "codex_native_equivalent")
         self.assertEqual(result["resolution_actions"], [])
@@ -230,9 +219,7 @@ class LeanCapabilityTests(unittest.TestCase):
     def test_missing_agents_md_is_not_available_without_import_guidance(self) -> None:
         agents = Path(self.temporary.name) / "project" / "AGENTS.md"
 
-        result = capabilities.inspect_capabilities(
-            {"observed_instruction_paths": [str(agents)]}
-        )
+        result = capabilities.inspect_capabilities({"observed_instruction_paths": [str(agents)]})
 
         self.assertEqual(result["items"][0]["status"], "not_available")
         self.assertIsNone(result["items"][0]["guidance"])
@@ -244,9 +231,7 @@ class LeanCapabilityTests(unittest.TestCase):
         claude = project / "CLAUDE.md"
         claude.write_text("Use focused tests.\n", encoding="utf-8")
 
-        result = capabilities.inspect_capabilities(
-            {"observed_instruction_paths": [str(claude)]}
-        )
+        result = capabilities.inspect_capabilities({"observed_instruction_paths": [str(claude)]})
 
         self.assertEqual(result["items"][0]["status"], "not_available")
         self.assertEqual(
@@ -262,9 +247,7 @@ class LeanCapabilityTests(unittest.TestCase):
         claude.write_text("Claude instructions.\n", encoding="utf-8")
         (project / "AGENTS.md").write_text("Codex instructions.\n", encoding="utf-8")
 
-        result = capabilities.inspect_capabilities(
-            {"observed_instruction_paths": [str(claude)]}
-        )
+        result = capabilities.inspect_capabilities({"observed_instruction_paths": [str(claude)]})
 
         self.assertEqual(result["items"][0]["status"], "not_available")
         self.assertIsNone(result["items"][0]["guidance"])

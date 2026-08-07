@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Bakeoff"
-  short_description: "Open the bakeoff controller in your browser"
-  default_prompt: "Use $codex-bakeoff to open the external-browser controller now. Do not run the workflow in chat."
+  short_description: "Open independent Replay sessions in the in-app or external browser"
+  default_prompt: "Use $codex-bakeoff to open Codex Bakeoff in the Codex in-app browser now, falling back to an external browser when unavailable. Start an independent session on an automatically available loopback port. Do not run the workflow in chat."

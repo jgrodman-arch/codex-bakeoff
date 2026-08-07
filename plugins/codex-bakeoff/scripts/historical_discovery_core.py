@@ -433,9 +433,7 @@ def _prompt_reconstruction_turns(
             if event.get("isMeta") or event.get("isSidechain") or event.get("isCompactSummary"):
                 continue
             question_blocks = [
-                block
-                for block in _tool_blocks(event)
-                if block.get("name") == "AskUserQuestion"
+                block for block in _tool_blocks(event) if block.get("name") == "AskUserQuestion"
             ]
             if question_blocks:
                 pending_clarification = ""
@@ -1541,9 +1539,7 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
         "source_path": str(source_path),
         "message_uuid": message_uuid,
         "request": (
-            "\n\n".join(thread_requests)
-            if whole_thread
-            else _actionable_user_text(selected_event)
+            "\n\n".join(thread_requests) if whole_thread else _actionable_user_text(selected_event)
         ),
         "task_timestamp": timestamp,
         "project_dir": project_dir,
@@ -1868,10 +1864,7 @@ def _status_evidence(
                     repository,
                 )
             )
-            if (
-                repository_matches
-                and isinstance(block_id, str)
-            ):
+            if repository_matches and isinstance(block_id, str):
                 pending[block_id] = command
         for block in _content_blocks(event):
             if block.get("type") != "tool_result":
@@ -2080,11 +2073,7 @@ def _solution_from_empty_tree(
     )
     commit = commit_output.strip()
     empty_tree = _empty_git_tree(repo)
-    if (
-        not ok
-        or re.fullmatch(r"[a-fA-F0-9]{40,64}", commit) is None
-        or empty_tree is None
-    ):
+    if not ok or re.fullmatch(r"[a-fA-F0-9]{40,64}", commit) is None or empty_tree is None:
         return None
     ok, diff = _git_capture(
         repo,
@@ -2125,9 +2114,7 @@ def inspect_baseline(replay_spec: dict[str, Any]) -> dict[str, Any]:
     working_tree_repository: Path | None = None
     if isinstance(raw_repo, str) and raw_repo.strip():
         selected_repository = Path(raw_repo).expanduser()
-        working_tree_repository = (
-            _git_repository_root(selected_repository) or selected_repository
-        )
+        working_tree_repository = _git_repository_root(selected_repository) or selected_repository
     working_tree = {
         "state": "unknown",
         "evidence": None,
@@ -2557,10 +2544,7 @@ def recover_historical_solution(
             f"{raw_ending}^{{commit}}",
         )
         resolved_ending = commit_output.strip()
-        if (
-            not ok
-            or re.fullmatch(r"[a-fA-F0-9]{40,64}", resolved_ending) is None
-        ):
+        if not ok or re.fullmatch(r"[a-fA-F0-9]{40,64}", resolved_ending) is None:
             result["limitations"].append(
                 "The reviewed historical ending commit is not available in the selected repository."
             )

@@ -5,1167 +5,248 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Codex Bakeoff</title>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #0d1117;
-      --panel: #151b23;
-      --panel-raised: #1b2330;
-      --panel-soft: #111720;
-      --text: #f2f5f8;
-      --muted: #9ca9b8;
-      --faint: #748191;
-      --line: #2b3543;
-      --line-strong: #3c4858;
-      --accent: #8cb4ff;
-      --accent-strong: #a8c6ff;
-      --accent-soft: rgba(91, 140, 230, .16);
-      --good: #66d19e;
-      --good-soft: rgba(64, 180, 125, .13);
-      --warn: #e7bd67;
-      --warn-soft: rgba(210, 157, 54, .14);
-      --bad: #ff8d93;
-      --bad-soft: rgba(221, 83, 93, .14);
-      --shadow: 0 18px 50px rgba(0, 0, 0, .25);
-      --radius: 12px;
-      --radius-sm: 8px;
-      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
-        sans-serif;
-    }
-
-    @media (prefers-color-scheme: light) {
-      :root {
-        color-scheme: light;
-        --bg: #f8f9fb;
-        --panel: #ffffff;
-        --panel-raised: #ffffff;
-        --panel-soft: #f4f6f9;
-        --text: #17202b;
-        --muted: #5e6a78;
-        --faint: #7d8794;
-        --line: #dfe4eb;
-        --line-strong: #cbd3dd;
-        --accent: #315fae;
-        --accent-strong: #234d94;
-        --accent-soft: rgba(49, 95, 174, .09);
-        --good: #19744a;
-        --good-soft: rgba(25, 116, 74, .08);
-        --warn: #8d630d;
-        --warn-soft: rgba(141, 99, 13, .09);
-        --bad: #b43842;
-        --bad-soft: rgba(180, 56, 66, .08);
-        --shadow: 0 18px 50px rgba(26, 38, 54, .12);
-      }
-    }
-
-    * { box-sizing: border-box; }
-
-    html, body { min-height: 100%; }
-
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-size: 14px;
-      line-height: 1.45;
-    }
-
-    button, input, select, textarea { font: inherit; }
-
-    button, input, select, textarea, summary { outline: none; }
-
-    button:focus-visible,
+:root{color-scheme:dark;--bg:#0d1117;--panel:#151b23;--panel-raised:#1b2330;--panel-soft:#111720;--text:#f2f5f8;--muted:#9ca9b8;--faint:#748191;--line:#2b3543;--line-strong:#3c4858;--accent:#8cb4ff;--accent-strong:#a8c6ff;--accent-soft:rgba(91, 140, 230, .16);--good:#66d19e;--good-soft:rgba(64, 180, 125, .13);--warn:#e7bd67;--warn-soft:rgba(210, 157, 54, .14);--bad:#ff8d93;--bad-soft:rgba(221, 83, 93, .14);--shadow:0 18px 50px rgba(0, 0, 0, .25);--radius:12px;--radius-sm:8px;font-family:ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        sans-serif}
+@media (prefers-color-scheme: light){
+  :root{color-scheme:light;--bg:#f8f9fb;--panel:#ffffff;--panel-raised:#ffffff;--panel-soft:#f4f6f9;--text:#17202b;--muted:#5e6a78;--faint:#7d8794;--line:#dfe4eb;--line-strong:#cbd3dd;--accent:#315fae;--accent-strong:#234d94;--accent-soft:rgba(49, 95, 174, .09);--good:#19744a;--good-soft:rgba(25, 116, 74, .08);--warn:#8d630d;--warn-soft:rgba(141, 99, 13, .09);--bad:#b43842;--bad-soft:rgba(180, 56, 66, .08);--shadow:0 18px 50px rgba(26, 38, 54, .12)}
+}
+*{box-sizing:border-box}
+html, body{min-height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font-size:14px;line-height:1.45}
+button, input, select, textarea{font:inherit}
+button, input, select, textarea, summary{outline:none}
+button:focus-visible,
     input:focus-visible,
     select:focus-visible,
     textarea:focus-visible,
-    summary:focus-visible {
-      box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 34%, transparent);
-    }
-
-    button { color: inherit; }
-
-    .app {
-      width: min(1180px, 100%);
-      min-height: 100vh;
-      margin: 0 auto;
-      padding: 24px;
-    }
-
-    .plugin-version {
-      position: fixed;
-      top: 12px;
-      right: 16px;
-      z-index: 10;
-      color: var(--faint);
-      font-size: 11px;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .layout {
-      display: grid;
-      grid-template-columns: 218px minmax(0, 1fr);
-      gap: 24px;
-      align-items: start;
-    }
-
-    .step-rail {
-      position: sticky;
-      top: 22px;
-      padding: 4px 0;
-    }
-
-    .step-rail__label {
-      margin: 0 0 14px 10px;
-      color: var(--faint);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: .11em;
-      text-transform: uppercase;
-    }
-
-    .steps {
-      display: grid;
-      gap: 4px;
-      margin: 0;
-      padding: 0;
-      list-style: none;
-    }
-
-    .diagnostics {
-      display: grid;
-      gap: 10px;
-      margin: 20px 10px 0;
-      padding-top: 16px;
-      border-top: 1px solid var(--line);
-    }
-
-    .diagnostics p {
-      margin-bottom: 3px;
-      color: var(--faint);
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: .06em;
-      text-transform: uppercase;
-    }
-
-    .diagnostics code {
-      display: block;
-      overflow-wrap: anywhere;
-      color: var(--muted);
-      font-size: 10px;
-      line-height: 1.45;
-    }
-
-    .step-button {
-      display: grid;
-      width: 100%;
-      grid-template-columns: 24px 1fr;
-      gap: 10px;
-      align-items: center;
-      padding: 10px;
-      border: 0;
-      border-radius: var(--radius-sm);
-      background: transparent;
-      text-align: left;
-      cursor: default;
-    }
-
-    .step-button[data-clickable="true"] { cursor: pointer; }
-    .step-button[data-clickable="true"]:hover { background: var(--panel-soft); }
-    .step-button[aria-current="step"] { background: var(--accent-soft); }
-
-    .step-number {
-      display: grid;
-      width: 24px;
-      height: 24px;
-      place-items: center;
-      border: 1px solid var(--line-strong);
-      border-radius: 50%;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 700;
-    }
-
-    .step-button[aria-current="step"] .step-number {
-      border-color: var(--accent);
-      background: var(--accent);
-      color: #0d1523;
-    }
-
-    .step-button[data-state="complete"] .step-number {
-      border-color: var(--good);
-      background: var(--good-soft);
-      color: var(--good);
-    }
-
-    .step-copy { min-width: 0; }
-    .step-name { display: block; font-weight: 650; }
-    .step-state {
-      display: block;
-      margin-top: 1px;
-      color: var(--faint);
-      font-size: 11px;
-    }
-
-    .workspace { min-width: 0; }
-
-    .page-heading {
-      margin-bottom: 20px;
-    }
-
-    .eyebrow {
-      margin: 0 0 6px;
-      color: var(--accent);
-      font-size: 11px;
-      font-weight: 750;
-      letter-spacing: .1em;
-      text-transform: uppercase;
-    }
-
-    h1 {
-      margin: 0;
-      font-size: clamp(24px, 4vw, 34px);
-      letter-spacing: -.025em;
-      line-height: 1.16;
-    }
-
-    h2 {
-      margin: 0;
-      font-size: 16px;
-      letter-spacing: -.008em;
-    }
-
-    h3 {
-      margin: 0;
-      font-size: 14px;
-    }
-
-    p { margin: 0; }
-
-    .lede {
-      max-width: 760px;
-      margin-top: 8px;
-      color: var(--muted);
-    }
-
-    .banner {
-      display: flex;
-      gap: 10px;
-      align-items: flex-start;
-      margin-bottom: 16px;
-      padding: 12px 14px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      background: var(--panel-soft);
-    }
-
-    .banner--error {
-      border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
-      background: var(--bad-soft);
-    }
-
-    .banner--warning {
-      border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
-      background: var(--warn-soft);
-    }
-
-    .banner--success {
-      border-color: color-mix(in srgb, var(--good) 45%, var(--line));
-      background: var(--good-soft);
-    }
-
-    .banner__mark {
-      flex: 0 0 auto;
-      width: 18px;
-      height: 18px;
-      border: 1px solid currentColor;
-      border-radius: 50%;
-      text-align: center;
-      font-size: 11px;
-      font-weight: 800;
-      line-height: 16px;
-    }
-
-    .banner__body { min-width: 0; }
-    .banner__body strong { display: block; margin-bottom: 2px; }
-    .banner__body p, .banner__body li { color: var(--muted); }
-    .banner__body ul { margin: 6px 0 0; padding-left: 20px; }
-
-    .panel {
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--panel);
-      box-shadow: 0 1px 0 rgba(255,255,255,.02);
-    }
-
-    .panel + .panel { margin-top: 14px; }
-
-    .panel__header {
-      display: flex;
-      gap: 14px;
-      align-items: flex-start;
-      justify-content: space-between;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
-    }
-
-    .panel__header p {
-      margin-top: 3px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .panel__body { padding: 18px; }
-
-    .panel__body--flush { padding: 0; }
-
-    .configuration-steps {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(0, 1fr));
-      gap: 6px;
-      margin: 0 0 14px;
-      padding: 0;
-      list-style: none;
-    }
-
-    .configuration-step {
-      width: 100%;
-      min-height: 52px;
-      padding: 8px;
-      border: 0;
-      border-bottom: 2px solid var(--line);
-      background: transparent;
-      color: var(--faint);
-      text-align: left;
-      cursor: default;
-    }
-
-    .configuration-step:not(:disabled) { cursor: pointer; }
-    .configuration-step:not(:disabled):hover { color: var(--text); }
-    .configuration-step[aria-current="step"] {
-      border-color: var(--accent);
-      color: var(--text);
-    }
-
-    .configuration-step small { display: block; margin-bottom: 2px; }
-
-    .configuration-review {
-      display: grid;
-      gap: 0;
-      margin: 0;
-    }
-
-    .configuration-review__row {
-      display: grid;
-      grid-template-columns: 150px minmax(0, 1fr);
-      gap: 16px;
-      padding: 13px 0;
-      border-bottom: 1px solid var(--line);
-    }
-
-    .configuration-review__row:last-child { border-bottom: 0; }
-    .configuration-review dt { color: var(--muted); }
-    .configuration-review dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
-
-    .search {
-      position: relative;
-      margin-bottom: 14px;
-    }
-
-    .search input {
-      width: 100%;
-      min-height: 42px;
-      padding: 9px 12px 9px 36px;
-      border: 1px solid var(--line-strong);
-      border-radius: var(--radius-sm);
-      background: var(--panel-soft);
-      color: var(--text);
-    }
-
-    .search input::placeholder { color: var(--faint); }
-
-    .search__icon {
-      position: absolute;
-      top: 12px;
-      left: 13px;
-      width: 14px;
-      height: 14px;
-      border: 2px solid var(--faint);
-      border-radius: 50%;
-      pointer-events: none;
-    }
-
-    .search__icon::after {
-      position: absolute;
-      right: -5px;
-      bottom: -3px;
-      width: 6px;
-      height: 2px;
-      transform: rotate(45deg);
-      border-radius: 1px;
-      background: var(--faint);
-      content: "";
-    }
-
-    .thread-list {
-      display: grid;
-      gap: 8px;
-    }
-
-    .thread {
-      display: grid;
-      width: 100%;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 14px;
-      align-items: center;
-      padding: 14px;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: var(--panel-soft);
-      text-align: left;
-      cursor: pointer;
-    }
-
-    .thread:hover:not(:disabled) {
-      border-color: var(--line-strong);
-      background: var(--panel-raised);
-    }
-
-    .thread:disabled {
-      opacity: .5;
-      cursor: not-allowed;
-    }
-
-    .thread__title {
-      display: block;
-      overflow: hidden;
-      font-weight: 670;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .thread__number {
-      margin-right: 7px;
-      color: var(--accent);
-      font-variant-numeric: tabular-nums;
-    }
-
-    .thread__meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px 12px;
-      margin-top: 5px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .thread__project {
-      max-width: 520px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .arrow {
-      color: var(--faint);
-      font-size: 20px;
-    }
-
-    .grid-2 {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-    }
-
-    .metrics {
-      display: grid;
-      gap: 0;
-      margin: 0;
-    }
-
-    .metric {
-      display: grid;
-      grid-template-columns: minmax(120px, .7fr) minmax(0, 1.3fr);
-      gap: 14px;
-      padding: 8px 0;
-      border-top: 1px solid var(--line);
-    }
-
-    .metric:first-child { border-top: 0; padding-top: 0; }
-    .metric:last-child { padding-bottom: 0; }
-    .metric dt { color: var(--muted); }
-    .metric dd { min-width: 0; margin: 0; overflow-wrap: anywhere; text-align: right; }
-    .metric code { font-size: 12px; }
-
-    .metric--better,
-    .metric--worse {
-      margin: 0 -10px;
-      padding-right: 10px;
-      padding-left: 10px;
-      border-radius: var(--radius-sm);
-    }
-
-    .metric--better { background: var(--good-soft); }
-    .metric--worse { background: var(--bad-soft); }
-    .metric--better dd { color: var(--good); font-weight: 750; }
-    .metric--worse dd { color: var(--bad); font-weight: 750; }
-
-    .token-label {
-      position: relative;
-      cursor: help;
-      text-decoration: underline dotted;
-      text-underline-offset: 3px;
-    }
-
-    .token-tooltip {
-      position: absolute;
-      z-index: 3;
-      top: calc(100% + 4px);
-      left: 0;
-      display: none;
-      width: min(300px, 75vw);
-      padding: 9px 11px;
-      border: 1px solid var(--line-strong);
-      border-radius: var(--radius-sm);
-      background: var(--panel-raised);
-      color: var(--text);
-      font-size: 12px;
-      font-weight: 400;
-      line-height: 1.4;
-      text-decoration: none;
-      box-shadow: var(--shadow);
-    }
-
-    .token-label:hover .token-tooltip,
-    .token-label:focus .token-tooltip { display: block; }
-
-    .pill {
-      display: inline-flex;
-      gap: 5px;
-      align-items: center;
-      min-height: 24px;
-      padding: 3px 8px;
-      border: 1px solid var(--line-strong);
-      border-radius: 999px;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 650;
-    }
-
-    .pill--good {
-      border-color: color-mix(in srgb, var(--good) 45%, var(--line));
-      background: var(--good-soft);
-      color: var(--good);
-    }
-
-    .pill--warning {
-      border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
-      background: var(--warn-soft);
-      color: var(--warn);
-    }
-
-    .pill--bad {
-      border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
-      background: var(--bad-soft);
-      color: var(--bad);
-    }
-
-    .capability-list, .plain-list {
-      display: grid;
-      gap: 8px;
-      margin: 0;
-      padding: 0;
-      list-style: none;
-    }
-
-    .capability {
-      display: grid;
-      grid-template-columns: 8px minmax(0, 1fr);
-      gap: 9px;
-      align-items: start;
-    }
-
-    .capability__dot {
-      width: 7px;
-      height: 7px;
-      margin-top: 6px;
-      border-radius: 50%;
-      background: var(--good);
-    }
-
-    .capability--warning .capability__dot { background: var(--warn); }
-    .capability--bad .capability__dot { background: var(--bad); }
-    .capability small { display: block; color: var(--muted); }
-
-    .field-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-    }
-
-    .field label, .field__label {
-      display: block;
-      margin-bottom: 6px;
-      font-size: 12px;
-      font-weight: 680;
-    }
-
-    .field select,
+    summary:focus-visible{box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 34%, transparent)}
+button{color:inherit}
+.app{width:min(1180px, 100%);min-height:100vh;margin:0 auto;padding:24px}
+.plugin-version{position:fixed;top:12px;right:16px;z-index:10;color:var(--faint);font-size:11px;font-variant-numeric:tabular-nums}
+.layout{display:grid;grid-template-columns:218px minmax(0, 1fr);gap:24px;align-items:start}
+.step-rail{position:sticky;top:22px;padding:4px 0}
+.step-rail__label{margin:0 0 14px 10px;color:var(--faint);font-size:11px;font-weight:700;letter-spacing:.11em;text-transform:uppercase}
+.steps{display:grid;gap:4px;margin:0;padding:0;list-style:none}
+.diagnostics{display:grid;gap:10px;margin:20px 10px 0;padding-top:16px;border-top:1px solid var(--line)}
+.diagnostics p{margin-bottom:3px;color:var(--faint);font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.diagnostics code{display:block;overflow-wrap:anywhere;color:var(--muted);font-size:10px;line-height:1.45}
+.step-button{display:grid;width:100%;grid-template-columns:24px 1fr;gap:10px;align-items:center;padding:10px;border:0;border-radius:var(--radius-sm);background:transparent;text-align:left;cursor:default}
+.step-button[data-clickable="true"]{cursor:pointer}
+.step-button[data-clickable="true"]:hover{background:var(--panel-soft)}
+.step-button[aria-current="step"]{background:var(--accent-soft)}
+.step-number{display:grid;width:24px;height:24px;place-items:center;border:1px solid var(--line-strong);border-radius:50%;color:var(--muted);font-size:11px;font-weight:700}
+.step-button[aria-current="step"] .step-number{border-color:var(--accent);background:var(--accent);color:#0d1523}
+.step-button[data-state="complete"] .step-number{border-color:var(--good);background:var(--good-soft);color:var(--good)}
+.step-copy{min-width:0}
+.step-name{display:block;font-weight:650}
+.step-state{display:block;margin-top:1px;color:var(--faint);font-size:11px}
+.workspace{min-width:0}
+.page-heading{margin-bottom:20px}
+.eyebrow{margin:0 0 6px;color:var(--accent);font-size:11px;font-weight:750;letter-spacing:.1em;text-transform:uppercase}
+h1{margin:0;font-size:clamp(24px, 4vw, 34px);letter-spacing:-.025em;line-height:1.16}
+h2{margin:0;font-size:16px;letter-spacing:-.008em}
+h3{margin:0;font-size:14px}
+p{margin:0}
+.lede{max-width:760px;margin-top:8px;color:var(--muted)}
+.banner{display:flex;gap:10px;align-items:flex-start;margin-bottom:16px;padding:12px 14px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel-soft)}
+.banner--error{border-color:color-mix(in srgb, var(--bad) 45%, var(--line));background:var(--bad-soft)}
+.banner--warning{border-color:color-mix(in srgb, var(--warn) 45%, var(--line));background:var(--warn-soft)}
+.banner--success{border-color:color-mix(in srgb, var(--good) 45%, var(--line));background:var(--good-soft)}
+.banner__mark{flex:0 0 auto;width:18px;height:18px;border:1px solid currentColor;border-radius:50%;text-align:center;font-size:11px;font-weight:800;line-height:16px}
+.banner__body{min-width:0}
+.banner__body strong{display:block;margin-bottom:2px}
+.banner__body p, .banner__body li{color:var(--muted)}
+.banner__body ul{margin:6px 0 0;padding-left:20px}
+.panel{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);box-shadow:0 1px 0 rgba(255,255,255,.02)}
+.panel + .panel{margin-top:14px}
+.panel__header{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;padding:16px 18px;border-bottom:1px solid var(--line)}
+.panel__header p{margin-top:3px;color:var(--muted);font-size:13px}
+.panel__body{padding:18px}
+.panel__body--flush{padding:0}
+.configuration-steps{display:grid;grid-template-columns:repeat(6, minmax(0, 1fr));gap:6px;margin:0 0 14px;padding:0;list-style:none}
+.configuration-step{width:100%;min-height:52px;padding:8px;border:0;border-bottom:2px solid var(--line);background:transparent;color:var(--faint);text-align:left;cursor:default}
+.configuration-step:not(:disabled){cursor:pointer}
+.configuration-step:not(:disabled):hover{color:var(--text)}
+.configuration-step[aria-current="step"]{border-color:var(--accent);color:var(--text)}
+.configuration-step small{display:block;margin-bottom:2px}
+.configuration-review{display:grid;gap:0;margin:0}
+.configuration-review__row{display:grid;grid-template-columns:150px minmax(0, 1fr);gap:16px;padding:13px 0;border-bottom:1px solid var(--line)}
+.configuration-review__row:last-child{border-bottom:0}
+.configuration-review dt{color:var(--muted)}
+.configuration-review dd{min-width:0;margin:0;overflow-wrap:anywhere}
+.search{position:relative;margin-bottom:14px}
+.search input{width:100%;min-height:42px;padding:9px 12px 9px 36px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--panel-soft);color:var(--text)}
+.search input::placeholder{color:var(--faint)}
+.search__icon{position:absolute;top:12px;left:13px;width:14px;height:14px;border:2px solid var(--faint);border-radius:50%;pointer-events:none}
+.search__icon::after{position:absolute;right:-5px;bottom:-3px;width:6px;height:2px;transform:rotate(45deg);border-radius:1px;background:var(--faint);content:""}
+.thread-list{display:grid;gap:8px}
+.thread{display:grid;width:100%;grid-template-columns:minmax(0, 1fr) auto;gap:14px;align-items:center;padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--panel-soft);text-align:left;cursor:pointer}
+.thread:hover:not(:disabled){border-color:var(--line-strong);background:var(--panel-raised)}
+.thread:disabled{opacity:.5;cursor:not-allowed}
+.thread__title{display:block;overflow:hidden;font-weight:670;text-overflow:ellipsis;white-space:nowrap}
+.thread__number{margin-right:7px;color:var(--accent);font-variant-numeric:tabular-nums}
+.thread__meta{display:flex;flex-wrap:wrap;gap:5px 12px;margin-top:5px;color:var(--muted);font-size:12px}
+.thread__project{max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.arrow{color:var(--faint);font-size:20px}
+.grid-2{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:14px}
+.metrics{display:grid;gap:0;margin:0}
+.metric{display:grid;grid-template-columns:minmax(120px, .7fr) minmax(0, 1.3fr);gap:14px;padding:8px 0;border-top:1px solid var(--line)}
+.metric:first-child{border-top:0;padding-top:0}
+.metric:last-child{padding-bottom:0}
+.metric dt{color:var(--muted)}
+.metric dd{min-width:0;margin:0;overflow-wrap:anywhere;text-align:right}
+.metric code{font-size:12px}
+.metric--better,
+    .metric--worse{margin:0 -10px;padding-right:10px;padding-left:10px;border-radius:var(--radius-sm)}
+.metric--better{background:var(--good-soft)}
+.metric--worse{background:var(--bad-soft)}
+.metric--better dd{color:var(--good);font-weight:750}
+.metric--worse dd{color:var(--bad);font-weight:750}
+.token-label{position:relative;cursor:help;text-decoration:underline dotted;text-underline-offset:3px}
+.token-tooltip{position:absolute;z-index:3;top:calc(100% + 4px);left:0;display:none;width:min(300px, 75vw);padding:9px 11px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--panel-raised);color:var(--text);font-size:12px;font-weight:400;line-height:1.4;text-decoration:none;box-shadow:var(--shadow)}
+.token-label:hover .token-tooltip,
+    .token-label:focus .token-tooltip{display:block}
+.pill{display:inline-flex;gap:5px;align-items:center;min-height:24px;padding:3px 8px;border:1px solid var(--line-strong);border-radius:999px;color:var(--muted);font-size:11px;font-weight:650}
+.pill--good{border-color:color-mix(in srgb, var(--good) 45%, var(--line));background:var(--good-soft);color:var(--good)}
+.pill--warning{border-color:color-mix(in srgb, var(--warn) 45%, var(--line));background:var(--warn-soft);color:var(--warn)}
+.pill--bad{border-color:color-mix(in srgb, var(--bad) 45%, var(--line));background:var(--bad-soft);color:var(--bad)}
+.capability-list, .plain-list{display:grid;gap:8px;margin:0;padding:0;list-style:none}
+.capability{display:grid;grid-template-columns:8px minmax(0, 1fr);gap:9px;align-items:start}
+.capability__dot{width:7px;height:7px;margin-top:6px;border-radius:50%;background:var(--good)}
+.capability--warning .capability__dot{background:var(--warn)}
+.capability--bad .capability__dot{background:var(--bad)}
+.capability small{display:block;color:var(--muted)}
+.field-grid{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:14px}
+.field label, .field__label{display:block;margin-bottom:6px;font-size:12px;font-weight:680}
+.field select,
     .field textarea,
     .field input[type="number"],
-    .field input[type="text"] {
-      width: 100%;
-      min-height: 40px;
-      padding: 8px 10px;
-      border: 1px solid var(--line-strong);
-      border-radius: var(--radius-sm);
-      background: var(--panel-soft);
-      color: var(--text);
-    }
-
-    .field textarea {
-      min-height: 92px;
-      resize: vertical;
-      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
-    }
-
-    .field--wide { grid-column: 1 / -1; }
-
-    .review-fields {
-      min-width: 0;
-      margin: 0;
-      padding: 0;
-      border: 0;
-    }
-
-    .field small {
-      display: block;
-      margin-top: 5px;
-      color: var(--muted);
-    }
-
-    .file-list {
-      display: grid;
-      gap: 0;
-      margin: 0;
-      padding: 0;
-      list-style: none;
-    }
-
-    .file-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 16px;
-      align-items: center;
-      min-height: 52px;
-      padding: 10px 0;
-      border-top: 1px solid var(--line);
-    }
-
-    .file-row:first-child { border-top: 0; }
-
-    .file-copy { min-width: 0; }
-    .file-path {
-      display: block;
-      overflow: hidden;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 12px;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .file-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 4px 9px;
-      margin-top: 3px;
-      color: var(--muted);
-      font-size: 11px;
-    }
-
-    .choice {
-      display: inline-flex;
-      gap: 8px;
-      align-items: center;
-      cursor: pointer;
-    }
-
-    .choice input { accent-color: var(--accent); }
-    .choice[aria-disabled="true"] { color: var(--muted); cursor: not-allowed; }
-
-    .segmented {
-      display: inline-flex;
-      gap: 2px;
-      padding: 2px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel-soft);
-    }
-
-    .segment {
-      position: relative;
-      display: inline-flex;
-    }
-
-    .segment input {
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      opacity: 0;
-    }
-
-    .segment span {
-      padding: 6px 8px;
-      border-radius: 5px;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 650;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-
-    .segment input:checked + span {
-      background: var(--accent-soft);
-      color: var(--accent-strong);
-    }
-
-    .segment input:disabled + span {
-      opacity: .6;
-      cursor: not-allowed;
-    }
-
-    .attestation {
-      display: grid;
-      gap: 8px;
-      margin-top: 14px;
-      padding: 14px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      background: var(--panel-soft);
-    }
-
-    .attestation legend {
-      padding: 0 4px;
-      font-weight: 680;
-    }
-
-    .footer-actions {
-      position: sticky;
-      z-index: 2;
-      bottom: 0;
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      justify-content: flex-end;
-      margin-top: 18px;
-      padding: 14px 0 max(8px, env(safe-area-inset-bottom));
-      background: linear-gradient(to bottom, transparent, var(--bg) 18%, var(--bg));
-    }
-
-    .footer-actions__note {
-      margin-right: auto;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .footer-actions--configuration {
-      position: static;
-      margin-top: 0;
-      margin-bottom: 18px;
-      padding: 0;
-      background: none;
-    }
-
-    .button {
-      display: inline-flex;
-      min-height: 38px;
-      gap: 7px;
-      align-items: center;
-      justify-content: center;
-      padding: 8px 13px;
-      border: 1px solid var(--line-strong);
-      border-radius: var(--radius-sm);
-      background: var(--panel-raised);
-      color: var(--text);
-      font-weight: 650;
-      cursor: pointer;
-    }
-
-    .button:hover:not(:disabled) { border-color: var(--faint); }
-
-    .button--primary {
-      border-color: var(--accent);
-      background: var(--accent);
-      color: #0b1526;
-    }
-
-    .button--primary:hover:not(:disabled) { background: var(--accent-strong); }
-
-    .button--quiet { background: transparent; }
-
-    .button--danger {
-      border-color: var(--bad);
-      background: var(--bad-soft);
-      color: var(--bad);
-    }
-
-    .button:disabled {
-      opacity: .46;
-      cursor: not-allowed;
-    }
-
-    .step-item { position: relative; }
-
-    .step-tooltip {
-      position: absolute;
-      z-index: 4;
-      top: calc(100% + 6px);
-      left: 12px;
-      display: none;
-      width: min(280px, calc(100vw - 32px));
-      padding: 10px 12px;
-      border: 1px solid var(--line-strong);
-      border-radius: var(--radius-sm);
-      background: var(--panel-raised);
-      color: var(--text);
-      font-size: 12px;
-      line-height: 1.4;
-      box-shadow: var(--shadow);
-    }
-
-    .step-tooltip ul {
-      margin: 6px 0 0;
-      padding-left: 18px;
-    }
-
-    .step-item:hover .step-tooltip,
+    .field input[type="text"]{width:100%;min-height:40px;padding:8px 10px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--panel-soft);color:var(--text)}
+.field textarea{min-height:92px;resize:vertical;font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace}
+.field--wide{grid-column:1 / -1}
+.review-fields{min-width:0;margin:0;padding:0;border:0}
+.field small{display:block;margin-top:5px;color:var(--muted)}
+.variant-options{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.variant-choice{display:inline-flex;gap:6px;align-items:center;padding:6px 9px;border:1px solid var(--line);border-radius:var(--radius-sm)}.variant-choice:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}.variant-choice:has(input:disabled){opacity:.6}.variant-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:0 0 14px}.variant-grid>.panel{margin-top:0}.vc,.v-open{display:flex;flex-direction:column}.v-open{flex:1;gap:8px;padding:12px;border:0;background:none;text-align:left;cursor:pointer}.vc>.button{margin:0 12px 12px}.vc-a{border-color:var(--accent);background:var(--accent-soft)}.vh,.vp{display:flex;justify-content:space-between}.vi{color:var(--accent);font-size:10px}.vs{min-height:42px}.vs,.vp{color:var(--muted);font-size:12px}.vs strong,.vp strong{color:var(--text)}.vp{margin-top:auto;padding-top:8px;border-top:1px solid var(--line)}
+.file-list{display:grid;gap:0;margin:0;padding:0;list-style:none}
+.file-row{display:grid;grid-template-columns:minmax(0, 1fr) auto;gap:16px;align-items:center;min-height:52px;padding:10px 0;border-top:1px solid var(--line)}
+.file-row:first-child{border-top:0}
+.file-copy{min-width:0}
+.file-path{display:block;overflow:hidden;font-family:ui-monospace, SFMono-Regular, Menlo, monospace;font-size:12px;text-overflow:ellipsis;white-space:nowrap}
+.file-meta{display:flex;flex-wrap:wrap;gap:4px 9px;margin-top:3px;color:var(--muted);font-size:11px}
+.choice{display:inline-flex;gap:8px;align-items:center;cursor:pointer}
+.choice input{accent-color:var(--accent)}
+.choice[aria-disabled="true"]{color:var(--muted);cursor:not-allowed}
+.segmented{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--line);border-radius:8px;background:var(--panel-soft)}
+.segment{position:relative;display:inline-flex}
+.segment input{position:absolute;width:1px;height:1px;opacity:0}
+.segment span{padding:6px 8px;border-radius:5px;color:var(--muted);font-size:11px;font-weight:650;cursor:pointer;white-space:nowrap}
+.segment input:checked + span{background:var(--accent-soft);color:var(--accent-strong)}
+.segment input:disabled + span{opacity:.6;cursor:not-allowed}
+.attestation{display:grid;gap:8px;margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel-soft)}
+.attestation legend{padding:0 4px;font-weight:680}
+.footer-actions{position:sticky;z-index:2;bottom:0;display:flex;gap:10px;align-items:center;justify-content:flex-end;margin-top:18px;padding:14px 0 max(8px, env(safe-area-inset-bottom));background:linear-gradient(to bottom, transparent, var(--bg) 18%, var(--bg))}
+.footer-actions__note{margin-right:auto;color:var(--muted);font-size:12px}
+.footer-actions--configuration{position:static;margin-top:0;margin-bottom:18px;padding:0;background:none}
+.button{display:inline-flex;min-height:38px;gap:7px;align-items:center;justify-content:center;padding:8px 13px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--panel-raised);color:var(--text);font-weight:650;cursor:pointer}
+.button:hover:not(:disabled){border-color:var(--faint)}
+.button--primary{border-color:var(--accent);background:var(--accent);color:#0b1526}
+.button--primary:hover:not(:disabled){background:var(--accent-strong)}
+.button--quiet{background:transparent}
+.button--danger{border-color:var(--bad);background:var(--bad-soft);color:var(--bad)}
+.button:disabled{opacity:.46;cursor:not-allowed}
+.step-item{position:relative}
+.step-tooltip{position:absolute;z-index:4;top:calc(100% + 6px);left:12px;display:none;width:min(280px, calc(100vw - 32px));padding:10px 12px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--panel-raised);color:var(--text);font-size:12px;line-height:1.4;box-shadow:var(--shadow)}
+.step-tooltip ul{margin:6px 0 0;padding-left:18px}
+.step-item:hover .step-tooltip,
     .step-item:focus .step-tooltip,
-    .step-item:focus-within .step-tooltip { display: block; }
-
-    .spinner {
-      width: 14px;
-      height: 14px;
-      animation: spin .8s linear infinite;
-      border: 2px solid currentColor;
-      border-right-color: transparent;
-      border-radius: 50%;
-    }
-
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    .review-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }
-
-    .review-item {
-      min-width: 0;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      background: var(--panel-soft);
-    }
-
-    .review-item span {
-      display: block;
-      margin-bottom: 3px;
-      color: var(--muted);
-      font-size: 11px;
-    }
-
-    .review-item strong, .review-item code {
-      display: block;
-      overflow-wrap: anywhere;
-    }
-
-    details {
-      margin-top: 14px;
-      border-top: 1px solid var(--line);
-      padding-top: 12px;
-    }
-
-    summary {
-      cursor: pointer;
-      font-weight: 650;
-    }
-
-    pre {
-      max-height: 420px;
-      margin: 10px 0 0;
-      padding: 12px;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      background: var(--panel-soft);
-      color: var(--text);
-      font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-
-    .run-log {
-      min-height: 180px;
-      max-height: 360px;
-      margin: 0;
-    }
-
-    .phase-list {
-      display: grid;
-      gap: 0;
-      margin: 0;
-      padding: 0;
-      list-style: none;
-    }
-
-    .phase {
-      position: relative;
-      display: grid;
-      grid-template-columns: 24px minmax(0, 1fr) auto;
-      gap: 10px;
-      align-items: center;
-      min-height: 48px;
-    }
-
-    .phase:not(:last-child)::after {
-      position: absolute;
-      top: 34px;
-      bottom: -14px;
-      left: 11px;
-      width: 1px;
-      background: var(--line);
-      content: "";
-    }
-
-    .phase__mark {
-      z-index: 1;
-      display: grid;
-      width: 24px;
-      height: 24px;
-      place-items: center;
-      border: 1px solid var(--line-strong);
-      border-radius: 50%;
-      background: var(--panel);
-      color: var(--faint);
-      font-size: 10px;
-      font-weight: 800;
-    }
-
-    .phase--running .phase__mark {
-      border-color: var(--accent);
-      color: var(--accent);
-    }
-
-    .phase--running .phase__mark::before {
-      width: 8px;
-      height: 8px;
-      animation: pulse 1.3s ease-in-out infinite;
-      border-radius: 50%;
-      background: currentColor;
-      content: "";
-    }
-
-    @keyframes pulse {
-      50% { transform: scale(.7); opacity: .45; }
-    }
-
-    .phase--complete .phase__mark {
-      border-color: var(--good);
-      background: var(--good-soft);
-      color: var(--good);
-    }
-
-    .phase--failed .phase__mark {
-      border-color: var(--bad);
-      background: var(--bad-soft);
-      color: var(--bad);
-    }
-
-    .phase__name { font-weight: 650; }
-    .phase__state { color: var(--muted); font-size: 11px; text-transform: capitalize; }
-
-    .activity {
-      display: grid;
-      gap: 8px;
-      margin: 0;
-      padding: 0;
-      list-style: none;
-    }
-
-    .activity li {
-      display: grid;
-      grid-template-columns: 84px minmax(0, 1fr);
-      gap: 10px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .activity time { color: var(--faint); font-variant-numeric: tabular-nums; }
-
-    .result-hero {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 18px;
-      align-items: center;
-      padding: 20px;
-      border: 1px solid color-mix(in srgb, var(--good) 38%, var(--line));
-      border-radius: var(--radius);
-      background: var(--good-soft);
-    }
-
-    .result-hero h1 { font-size: 27px; }
-    .result-hero p { margin-top: 6px; color: var(--muted); }
-
-    .score {
-      font-size: 24px;
-      font-weight: 780;
-      letter-spacing: -.03em;
-      white-space: nowrap;
-    }
-
-    .provider-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-      margin-top: 14px;
-    }
-
-    .provider {
-      padding: 17px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--panel);
-    }
-
-    .provider h2 { margin-bottom: 12px; }
-
-    .table-wrap { overflow: auto; }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    th, td {
-      padding: 10px;
-      border-bottom: 1px solid var(--line);
-      text-align: left;
-      vertical-align: top;
-    }
-
-    th { color: var(--muted); font-size: 11px; font-weight: 680; }
-    td { font-size: 12px; }
-    tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
-
-    .empty {
-      padding: 34px 18px;
-      color: var(--muted);
-      text-align: center;
-    }
-
-    .skeleton {
-      height: 72px;
-      animation: shimmer 1.2s ease-in-out infinite alternate;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: var(--panel-soft);
-      opacity: .6;
-    }
-
-    @keyframes shimmer { to { opacity: .9; } }
-
-    dialog {
-      width: min(680px, calc(100vw - 32px));
-      max-height: min(820px, calc(100vh - 32px));
-      padding: 0;
-      overflow: auto;
-      border: 1px solid var(--line-strong);
-      border-radius: 14px;
-      background: var(--panel-raised);
-      color: var(--text);
-      box-shadow: var(--shadow);
-    }
-
-    dialog::backdrop { background: rgba(3, 7, 12, .72); }
-
-    .dialog__header {
-      padding: 20px 20px 14px;
-      border-bottom: 1px solid var(--line);
-    }
-
-    .dialog__header h2 { font-size: 20px; }
-    .dialog__header p { margin-top: 5px; color: var(--muted); }
-    .dialog__body { padding: 18px 20px; }
-    .dialog__footer {
-      display: flex;
-      gap: 10px;
-      justify-content: flex-end;
-      padding: 14px 20px 20px;
-    }
-
-    .approval-promises {
-      display: grid;
-      gap: 8px;
-      margin: 16px 0;
-      padding: 0;
-      list-style: none;
-    }
-
-    .approval-promises li {
-      display: grid;
-      grid-template-columns: 18px minmax(0, 1fr);
-      gap: 8px;
-    }
-
-    .approval-promises li::before {
-      color: var(--good);
-      font-weight: 800;
-      content: "✓";
-    }
-
-    .sr-only {
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      padding: 0;
-      overflow: hidden;
-      clip: rect(0, 0, 0, 0);
-      white-space: nowrap;
-      border: 0;
-    }
-
-    @media (max-width: 780px) {
-      .app { padding: 16px; }
-      .layout { grid-template-columns: 1fr; gap: 16px; }
-      .step-rail { position: static; overflow-x: auto; }
-      .step-rail__label { display: none; }
-      .steps { display: flex; min-width: max-content; }
-      .step-button { width: auto; grid-template-columns: 22px auto; padding: 8px; }
-      .step-state { display: none; }
-      .step-number { width: 22px; height: 22px; }
-      .diagnostics {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        margin: 12px 8px 0;
-      }
-      .grid-2, .provider-grid, .review-grid, .field-grid { grid-template-columns: 1fr; }
-      .file-row { grid-template-columns: 1fr; gap: 7px; }
-      .segmented { width: 100%; }
-      .segment { flex: 1; }
-      .segment span { width: 100%; text-align: center; }
-      .metric { grid-template-columns: 1fr; gap: 2px; }
-      .metric dd { text-align: left; }
-      .result-hero { grid-template-columns: 1fr; }
-      .configuration-steps { grid-template-columns: 1fr; gap: 0; }
-      .configuration-step { display: none; }
-      .configuration-step[aria-current="step"] { display: block; }
-      .configuration-review__row { grid-template-columns: 1fr; gap: 3px; }
-      .footer-actions { flex-wrap: wrap; }
-      .footer-actions__note { width: 100%; margin: 0; }
-    }
+    .step-item:focus-within .step-tooltip{display:block}
+.spinner{width:14px;height:14px;animation:spin .8s linear infinite;border:2px solid currentColor;border-right-color:transparent;border-radius:50%}
+@keyframes spin{
+  to{transform:rotate(360deg)}
+}
+.review-grid{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:10px}
+.review-item{min-width:0;padding:12px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel-soft)}
+.review-item span{display:block;margin-bottom:3px;color:var(--muted);font-size:11px}
+.review-item strong, .review-item code{display:block;overflow-wrap:anywhere}
+details{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+summary{cursor:pointer;font-weight:650}
+pre{max-height:420px;margin:10px 0 0;padding:12px;overflow:auto;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel-soft);color:var(--text);font:11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;white-space:pre-wrap;word-break:break-word}
+.run-log{min-height:180px;max-height:360px;margin:0}
+.phase-list{display:grid;gap:0;margin:0;padding:0;list-style:none}
+.phase{position:relative;display:grid;grid-template-columns:24px minmax(0, 1fr) auto;gap:10px;align-items:center;min-height:48px}
+.phase:not(:last-child)::after{position:absolute;top:34px;bottom:-14px;left:11px;width:1px;background:var(--line);content:""}
+.phase__mark{z-index:1;display:grid;width:24px;height:24px;place-items:center;border:1px solid var(--line-strong);border-radius:50%;background:var(--panel);color:var(--faint);font-size:10px;font-weight:800}
+.phase--running .phase__mark{border-color:var(--accent);color:var(--accent)}
+.phase--running .phase__mark::before{width:8px;height:8px;animation:pulse 1.3s ease-in-out infinite;border-radius:50%;background:currentColor;content:""}
+@keyframes pulse{
+  50%{transform:scale(.7);opacity:.45}
+}
+.phase--complete .phase__mark{border-color:var(--good);background:var(--good-soft);color:var(--good)}
+.phase--failed .phase__mark{border-color:var(--bad);background:var(--bad-soft);color:var(--bad)}
+.phase__name{font-weight:650}
+.phase__state{color:var(--muted);font-size:11px;text-transform:capitalize}
+.activity{display:grid;gap:8px;margin:0;padding:0;list-style:none}
+.activity li{display:grid;grid-template-columns:84px minmax(0, 1fr);gap:10px;color:var(--muted);font-size:12px}
+.activity time{color:var(--faint);font-variant-numeric:tabular-nums}
+.result-hero{display:grid;grid-template-columns:minmax(0, 1fr) auto;gap:18px;align-items:center;padding:20px;border:1px solid color-mix(in srgb, var(--good) 38%, var(--line));border-radius:var(--radius);background:var(--good-soft)}
+.result-hero h1{font-size:27px}
+.result-hero p{margin-top:6px;color:var(--muted)}
+.score{font-size:24px;font-weight:780;letter-spacing:-.03em;white-space:pre-line;text-align:right}
+.provider-grid{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:14px;margin-top:14px}
+.provider{padding:17px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
+.provider h2{margin-bottom:12px}
+.table-wrap{overflow:auto}
+table{width:100%;border-collapse:collapse}
+th, td{padding:10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{color:var(--muted);font-size:11px;font-weight:680}
+td{font-size:12px}
+tbody tr:last-child td, tbody tr:last-child th{border-bottom:0}
+.empty{padding:34px 18px;color:var(--muted);text-align:center}
+.skeleton{height:72px;animation:shimmer 1.2s ease-in-out infinite alternate;border:1px solid var(--line);border-radius:10px;background:var(--panel-soft);opacity:.6}
+@keyframes shimmer{
+  to{opacity:.9}
+}
+dialog{width:min(680px, calc(100vw - 32px));max-height:min(820px, calc(100vh - 32px));padding:0;overflow:auto;border:1px solid var(--line-strong);border-radius:14px;background:var(--panel-raised);color:var(--text);box-shadow:var(--shadow)}
+dialog::backdrop{background:rgba(3, 7, 12, .72)}
+.dialog__header{padding:20px 20px 14px;border-bottom:1px solid var(--line)}
+.dialog__header h2{font-size:20px}
+.dialog__header p{margin-top:5px;color:var(--muted)}
+.dialog__body{padding:18px 20px}
+.dialog__footer{display:flex;gap:10px;justify-content:flex-end;padding:14px 20px 20px}
+.approval-promises{display:grid;gap:8px;margin:16px 0;padding:0;list-style:none}
+.approval-promises li{display:grid;grid-template-columns:18px minmax(0, 1fr);gap:8px}
+.approval-promises li::before{color:var(--good);font-weight:800;content:"✓"}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0, 0, 0, 0);white-space:nowrap;border:0}
+@media (max-width: 780px){
+  .app{padding:16px}
+  .layout{grid-template-columns:1fr;gap:16px}
+  .step-rail{position:static;overflow-x:auto}
+  .step-rail__label{display:none}
+  .steps{display:flex;min-width:max-content}
+  .step-button{width:auto;grid-template-columns:22px auto;padding:8px}
+  .step-state{display:none}
+  .step-number{width:22px;height:22px}
+  .diagnostics{grid-template-columns:repeat(2, minmax(0, 1fr));margin:12px 8px 0}
+  .grid-2, .provider-grid, .review-grid, .field-grid{grid-template-columns:1fr}
+  .file-row{grid-template-columns:1fr;gap:7px}
+  .segmented{width:100%}
+  .segment{flex:1}
+  .segment span{width:100%;text-align:center}
+  .metric{grid-template-columns:1fr;gap:2px}
+  .metric dd{text-align:left}
+  .result-hero{grid-template-columns:1fr}
+  .configuration-steps{grid-template-columns:1fr;gap:0}
+  .configuration-step{display:none}
+  .configuration-step[aria-current="step"]{display:block}
+  .configuration-review__row{grid-template-columns:1fr;gap:3px}
+  .footer-actions{flex-wrap:wrap}
+  .footer-actions__note{width:100%;margin:0}
+}
   </style>
 </head>
 <body>
   <div id="app" class="app">
-    <p class="empty">Connecting to the local bakeoff controller…</p>
+    <p class="empty">Connecting to Codex Bakeoff…</p>
   </div>
 
   <script>
@@ -1193,13 +274,19 @@
         ["creating_workspace", "Creating isolated workspace"],
         ["implementing", "Implementing with Codex"],
         ["collecting", "Capturing result"],
-        ["verifying", "Running shared verification"],
         ["reviewing", "Running blind review"],
         ["reporting", "Finalizing report"],
       ];
 
+      const DEFAULT_MODEL_IDS = [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+      ];
+
+      const THREAD_PAGE_SIZE = 20;
       const DRAFT_STORAGE_KEY = "codex-bakeoff.controller-draft.v7";
-      const CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1";
+      const ACTIVE_RUN_STORAGE_KEY = "codex-bakeoff.controller-active-run.v1";
       const DRAFT_VERSION = 7;
       const DRAFT_STEPS = new Set(["thread", "configure"]);
 
@@ -1219,6 +306,7 @@
         inspection: null,
         models: [],
         model: "",
+        selectedModels: [],
         timeoutSeconds: 1800,
         classifications: Object.create(null),
         reviewDraft: null,
@@ -1234,17 +322,20 @@
         preparation: null,
         runId: "",
         run: null,
+        runs: [],
+        runErrors: [],
         report: null,
         reportPaths: null,
         runRoot: "",
-        controllerLogPath: "",
         pluginVersion: "",
+        controllerSessionId: "",
         pollGeneration: 0,
       };
 
       const app = document.getElementById("app");
       let draftPersistenceReady = false;
       let startPending = false;
+      let heartbeatTimer = null;
 
       const isObject = (value) =>
         value !== null && typeof value === "object" && !Array.isArray(value);
@@ -1278,6 +369,7 @@
 
       function normalizeReviewDraft(value) {
         if (!isObject(value)) return null;
+        const models = stringList(value.models?.length ? value.models : [value.model]);
         return {
           thread_id: text(value.thread_id),
           source_path: text(value.source_path),
@@ -1292,7 +384,8 @@
             : "",
           baseline_commit: text(value.baseline_commit),
           ending_commit: text(value.ending_commit),
-          model: text(value.model),
+          model: models[0] || "",
+          models,
           timeout_seconds: text(value.timeout_seconds),
         };
       }
@@ -1316,6 +409,9 @@
             ? value.selectedThreadNumber
             : 0,
           model: text(value.model),
+          selectedModels: stringList(value.selectedModels?.length
+            ? value.selectedModels : value.reviewDraft?.models?.length
+              ? value.reviewDraft.models : [value.model]),
           timeoutSeconds:
             Number.isInteger(timeoutSeconds) && timeoutSeconds >= 1 && timeoutSeconds <= 14400
               ? timeoutSeconds
@@ -1331,11 +427,38 @@
         };
       }
 
+      function controllerStorageKey(key) {
+        return state.controllerSessionId ? `${key}.${state.controllerSessionId}` : "";
+      }
+
       function loadDraft() {
+        const key = controllerStorageKey(DRAFT_STORAGE_KEY);
+        if (!key) return null;
         try {
-          return normalizeDraft(JSON.parse(localStorage.getItem(DRAFT_STORAGE_KEY) || "null"));
+          return normalizeDraft(JSON.parse(localStorage.getItem(key) || "null"));
         } catch {
           return null;
+        }
+      }
+
+      function loadActiveRunId() {
+        const key = controllerStorageKey(ACTIVE_RUN_STORAGE_KEY);
+        if (!key) return "";
+        try {
+          return text(localStorage.getItem(key));
+        } catch {
+          return "";
+        }
+      }
+
+      function rememberActiveRun(runId) {
+        const key = controllerStorageKey(ACTIVE_RUN_STORAGE_KEY);
+        if (!key) return;
+        try {
+          if (runId) localStorage.setItem(key, runId);
+          else localStorage.removeItem(key);
+        } catch {
+          // Durable run recovery remains available from the controller.
         }
       }
 
@@ -1348,6 +471,7 @@
           selectedThreadId: state.selectedThreadId,
           selectedThreadNumber: state.selectedThreadNumber,
           model: state.model,
+          selectedModels: state.selectedModels,
           timeoutSeconds: Number(state.timeoutSeconds),
           classifications: Object.fromEntries(
             Object.entries(state.classifications)
@@ -1367,29 +491,23 @@
           ["run", "results"].includes(state.step)
         ) return;
         try {
-          localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draftSnapshot()));
+          localStorage.setItem(controllerStorageKey(DRAFT_STORAGE_KEY), JSON.stringify(draftSnapshot()));
         } catch {
           // Draft persistence is best-effort when browser storage is unavailable.
         }
       }
 
       function clearDraft() {
+        const key = controllerStorageKey(DRAFT_STORAGE_KEY);
+        if (!key) return;
         try {
-          localStorage.removeItem(DRAFT_STORAGE_KEY);
+          localStorage.removeItem(key);
         } catch {
-          // Reset the in-memory controller even if browser storage is unavailable.
+          // Reset the controller even if browser storage is unavailable.
         }
       }
 
-      function controllerSessionToken() {
-        try {
-          return localStorage.getItem(CONTROLLER_SESSION_STORAGE_KEY) || "";
-        } catch {
-          return "";
-        }
-      }
-
-      let restoredDraft = loadDraft();
+      let restoredDraft = null;
 
       const pathBase = (value) => {
         const parts = text(value).split("/").filter(Boolean);
@@ -1477,12 +595,6 @@
       }
 
       async function callTool(name, args = {}) {
-        const sessionToken = controllerSessionToken();
-        if (!sessionToken) {
-          throw new Error(
-            "This browser session has expired. Invoke the plugin again to reopen the controller."
-          );
-        }
         let response;
         try {
           response = await fetch("/api/call", {
@@ -1490,25 +602,58 @@
             credentials: "same-origin",
             headers: {
               "Content-Type": "application/json",
-              "X-Codex-Bakeoff-Session": sessionToken,
             },
             body: JSON.stringify({ name, arguments: args }),
           });
         } catch {
           throw new Error(
-            "The local bakeoff service is unavailable. Invoke the plugin again to reopen it."
+            "The local replay service is unavailable. Invoke the plugin again to reopen it."
           );
         }
         let result;
         try {
           result = await response.json();
         } catch {
-          throw new Error("The local bakeoff service returned an unreadable response.");
+          throw new Error("The local replay service returned an unreadable response.");
         }
         if (!response.ok && !result.isError) {
           throw new Error(text(result.error, `The controller request failed (${response.status}).`));
         }
         return unwrapToolResult(result);
+      }
+
+      async function heartbeatController() {
+        try {
+          const response = await fetch("/api/heartbeat", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+          if (!response.ok) return;
+          const payload = await response.json();
+          if (
+            state.controllerSessionId &&
+            text(payload.controller_session_id) !== state.controllerSessionId
+          ) {
+            stopControllerHeartbeat();
+            state.error = "The controller session changed. Invoke the plugin again to reopen it.";
+            render();
+          }
+        } catch {
+          // Normal controller requests report connectivity failures to the user.
+        }
+      }
+
+      function stopControllerHeartbeat() {
+        if (heartbeatTimer !== null) window.clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+
+      function startControllerHeartbeat() {
+        stopControllerHeartbeat();
+        void heartbeatController();
+        heartbeatTimer = window.setInterval(heartbeatController, 15_000);
       }
 
       function threadId(thread) {
@@ -1532,20 +677,35 @@
       }
 
       function normalizeModels(values) {
-        return asArray(values).flatMap((item) => {
-          if (typeof item === "string") {
-            return [{ id: item, label: item, description: "", recommended: false }];
-          }
-          if (!isObject(item)) return [];
-          const id = text(item.id || item.slug || item.model);
+        const found = new Map(asArray(values).flatMap((item) => {
+          const value = typeof item === "string" ? { id: item } : item;
+          if (!isObject(value)) return [];
+          const id = text(value.id || value.slug || value.model).trim();
           if (!id) return [];
-          return [{
+          return [[id, {
             id,
-            label: text(item.label || item.display_name || item.name, id),
-            description: text(item.description),
-            recommended: item.recommended === true || item.is_default === true,
-          }];
-        });
+            label: text(value.label || value.display_name || value.name, id),
+            description: text(value.description),
+            recommended: value.recommended === true || value.is_default === true,
+          }]];
+        }));
+        return [...found.values()];
+      }
+
+      function setSelectedModels(values) {
+        const available = new Set(state.models.map(({ id }) => id));
+        state.selectedModels = stringList(values).filter((id) => !available.size || available.has(id));
+        if (!state.selectedModels.length && state.models.length) {
+          state.selectedModels = DEFAULT_MODEL_IDS.filter((id) => available.has(id));
+          if (!state.selectedModels.length) {
+            state.selectedModels = [selectedModelDefault()];
+          }
+        }
+        state.model = state.selectedModels[0] || "";
+        if (state.reviewDraft) {
+          state.reviewDraft.model = state.model;
+          state.reviewDraft.models = [...state.selectedModels];
+        }
       }
 
       function inspectionParts() {
@@ -1607,7 +767,7 @@
 
       function applyDraftToInspection(draft) {
         if (!isObject(draft)) return;
-        if (draft.model) state.model = draft.model;
+        setSelectedModels(draft.selectedModels);
         state.timeoutSeconds = draft.timeoutSeconds;
         state.configurationStep = draft.configurationStep;
         state.configurationMaxStep = Math.max(
@@ -1628,6 +788,7 @@
         }
         state.reviewDraft = normalizeReviewDraft(draft.reviewDraft);
         if (state.reviewDraft) {
+          setSelectedModels(state.reviewDraft.models);
           const { replay } = inspectionParts();
           state.reviewDraft.request = text(replay.request);
         }
@@ -1747,6 +908,7 @@
 
       function resetController() {
         clearDraft();
+        rememberActiveRun("");
         restoredDraft = null;
         startPending = false;
         state.pollGeneration += 1;
@@ -1760,7 +922,7 @@
         state.selectedThreadNumber = 0;
         state.selectedThread = null;
         state.inspection = null;
-        state.model = selectedModelDefault();
+        setSelectedModels([]);
         state.timeoutSeconds = 1800;
         state.classifications = Object.create(null);
         state.reviewDraft = null;
@@ -1776,6 +938,8 @@
         state.preparation = null;
         state.runId = "";
         state.run = null;
+        state.runs = [];
+        state.runErrors = [];
         state.report = null;
         state.reportPaths = null;
         render({ focus: true });
@@ -1838,6 +1002,7 @@
         const common = {
           thread_id: state.selectedThreadId,
           model: state.model,
+          models: state.selectedModels,
           timeout_seconds: Number(state.timeoutSeconds),
           repo: text(baseline.attribution_root || baseline.repository) || undefined,
           claude_output_files: isGit && !refreshing ? claude : [],
@@ -1965,6 +1130,7 @@
           baseline_commit: baselineUnresolved ? "" : baseline.commit,
           ending_commit: baselineUnresolved ? "" : baseline.ending_commit,
           model: state.model,
+          models: state.selectedModels,
           timeout_seconds: state.timeoutSeconds,
         });
       }
@@ -1987,6 +1153,7 @@
           confirm_empty_beginning: draft.beginning_kind === "non_git",
           confirm_repository_selection: Boolean(text(draft.repo).trim()),
           model: text(draft.model).trim(),
+          models: draft.models,
           timeout_seconds: Number(draft.timeout_seconds),
           claude_output_files: gitEnding ? stringList(selection.claude_output_files) : [],
           created_by_claude: gitEnding ? [] : stringList(selection.created_by_claude),
@@ -2020,7 +1187,7 @@
         if (draft.ending_kind === "git" && !draft.ending_commit.trim()) {
           problems.push("Enter the ending commit.");
         }
-        if (!draft.model.trim()) problems.push("Enter a Codex model.");
+        if (!draft.models.length) problems.push("Select at least one available Codex model.");
         const timeout = Number(draft.timeout_seconds);
         if (!Number.isInteger(timeout) || timeout < 1 || timeout > 14400) {
           problems.push("Set a timeout from 1 through 14,400 seconds.");
@@ -2084,9 +1251,26 @@
         return isObject(payload.run) ? payload.run : payload;
       }
 
+      function ownedRunRecord(payload) {
+        const run = runRecord(payload);
+        if (run && text(run.controller_session_id) !== state.controllerSessionId) {
+          throw new Error("The replay belongs to another controller instance.");
+        }
+        return run;
+      }
+
       function currentRunId(payload) {
         const run = runRecord(payload);
         return text(payload?.run_id || run?.run_id || run?.id);
+      }
+
+      function activateRun(id) {
+        const entry = state.runs.find((item) => item.id === id);
+        if (!entry) return;
+        state.runId = entry.id;
+        state.run = entry.run;
+        state.report = entry.report || null;
+        state.reportPaths = entry.reportPaths || null;
       }
 
       function terminalRunStatus(value) {
@@ -2116,8 +1300,8 @@
       function renderRail() {
         const current = stepIndex(state.step);
         return `
-          <nav class="step-rail" aria-label="Bakeoff progress">
-            <p class="step-rail__label">Bakeoff</p>
+          <nav class="step-rail" aria-label="Replay progress">
+            <p class="step-rail__label">Codex Bakeoff</p>
             <ol class="steps">
               ${STEPS.map((step, index) => {
                 const isCurrent = step.id === state.step;
@@ -2171,21 +1355,13 @@
       function renderDiagnostics() {
         const exactLogPath = text(state.run?.log_path);
         const runPath = exactLogPath || state.runRoot;
-        if (!runPath && !state.controllerLogPath) return "";
+        if (!runPath) return "";
         return `
           <div class="diagnostics" aria-label="Local diagnostics">
-            ${runPath
-              ? `<div>
-                  <p>${exactLogPath ? "Current run log" : "Run log root"}</p>
-                  <code title="${escapeHtml(runPath)}">${escapeHtml(runPath)}</code>
-                </div>`
-              : ""}
-            ${state.controllerLogPath
-              ? `<div>
-                  <p>Controller log</p>
-                  <code title="${escapeHtml(state.controllerLogPath)}">${escapeHtml(state.controllerLogPath)}</code>
-                </div>`
-              : ""}
+            <div>
+              <p>${exactLogPath ? "Current run log" : "Run log root"}</p>
+              <code title="${escapeHtml(runPath)}">${escapeHtml(runPath)}</code>
+            </div>
           </div>
         `;
       }
@@ -2254,9 +1430,9 @@
             ? `<div class="banner banner--warning" role="status">
                 <span class="banner__mark" aria-hidden="true">i</span>
                 <div class="banner__body">
-                  <strong>A bakeoff is already ${terminalRunStatus(state.run.status) ? "recorded" : "running"}</strong>
+                  <strong>A replay is already ${terminalRunStatus(state.run.status) ? "recorded" : "running"}</strong>
                   <p>Reviewing this list does not replace the current run.</p>
-                  <button type="button" class="button button--quiet" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another bakeoff</button>
+                  <button type="button" class="button button--quiet" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another replay</button>
                 </div>
               </div>`
             : ""}
@@ -2329,6 +1505,9 @@
                         : "No imported Claude threads are available."}
                     </div>`
               }
+              ${!state.loading && state.threads.length < state.totalThreads
+                ? `<button type="button" class="button button--quiet" data-action="load-more-threads" ${state.busy ? "disabled" : ""}>Load more threads</button>`
+                : ""}
             </div>
           </section>
         `;
@@ -2482,6 +1661,12 @@
         });
       }
 
+      function replayDetailsLoading() {
+        return state.configurationStep === 0 && (
+          state.promptGeneration === "pending" || state.workingDirectoryLoading
+        );
+      }
+
       function configurationStepProblems(index) {
         const draft = normalizeReviewDraft(state.reviewDraft);
         if (!draft) return ["Open a configuration draft."];
@@ -2492,7 +1677,7 @@
           if (!draft.message_uuid.trim()) problems.push("Enter the message ID within the original thread.");
           if (!draft.request.trim()) problems.push("Enter the reconstructed task prompt.");
           if (!draft.repo.trim()) problems.push("Enter the replay repository.");
-          if (!draft.model.trim()) problems.push("Enter a Codex model.");
+          if (!draft.models.length) problems.push("Select at least one available Codex model.");
           const timeout = Number(draft.timeout_seconds);
           if (!Number.isInteger(timeout) || timeout < 1 || timeout > 14400) {
             problems.push("Set a timeout from 1 through 14,400 seconds.");
@@ -2525,22 +1710,7 @@
       }
 
       function renderConfigurationProgress() {
-        return `<ol class="configuration-steps" aria-label="Configuration progress">
-          ${CONFIGURATION_STEPS.map((step, index) => `
-            <li>
-              <button
-                type="button"
-                class="configuration-step"
-                data-action="configuration-step"
-                data-configuration-step="${index}"
-                ${index === state.configurationStep ? 'aria-current="step"' : ""}
-                ${index <= state.configurationMaxStep && !state.busy ? "" : "disabled"}
-              >
-                <small>${index + 1} of ${CONFIGURATION_STEPS.length}</small>
-                ${escapeHtml(step.name)}
-              </button>
-            </li>`).join("")}
-        </ol>`;
+        return `<ol class="configuration-steps" aria-label="Configuration progress">${CONFIGURATION_STEPS.map((step,index)=>`<li><button type="button" class="configuration-step" data-action="configuration-step" data-configuration-step="${index}" ${index===state.configurationStep?'aria-current="step"':""} ${index<=state.configurationMaxStep&&!state.busy?"":"disabled"}><small>${index+1} of ${CONFIGURATION_STEPS.length}</small>${escapeHtml(step.name)}</button></li>`).join("")}</ol>`;
       }
 
       function renderReplayConfiguration(draft, replay, configurationLocked) {
@@ -2565,12 +1735,14 @@
                   <small>Selected on the previous step.</small>
                 </div>
                 <div class="field">
-                  <label for="review-model">Codex model</label>
-                  ${state.models.length
-                    ? `<select id="review-model">${state.models.map((model) => `<option value="${escapeHtml(model.id)}" ${draft.model === model.id ? "selected" : ""}>${escapeHtml(model.label === model.id ? model.id : `${model.label} (${model.id})`)}</option>`).join("")}</select>
-                      <small>All locally available Codex models in one list.</small>`
-                    : `<input id="review-model" type="text" value="${escapeHtml(draft.model)}">
-                      <small>Model discovery failed; enter an available Codex model.</small>`}
+                  <span class="field__label">Codex models</span>
+                  <div class="variant-options" role="group" aria-label="Available Codex models">
+                    ${state.models.length ? state.models.map(({ id, label }) => {
+                      const checked = draft.models.includes(id);
+                      return `<label class="variant-choice"><input type="checkbox" data-model-variant="${escapeHtml(id)}" ${checked ? "checked" : ""} ${checked && draft.models.length === 1 ? "disabled" : ""}>${escapeHtml(label)}</label>`;
+                    }).join("") : `<input id="review-model" type="text" value="${escapeHtml(draft.model)}">`}
+                  </div>
+                  <small>Select one or more models. Selected models run in parallel.</small>
                 </div>
                 <div class="field field--wide">
                   <label for="review-message-uuid">Message ID within the original thread</label>
@@ -2755,7 +1927,7 @@
             </div></div>
             <div class="panel__body">
               <dl class="configuration-review">
-                <div class="configuration-review__row"><dt>Replay</dt><dd><strong>${escapeHtml(draft.model)}</strong><br><small>${escapeHtml(draft.repo)} · ${escapeHtml(draft.timeout_seconds)} second timeout</small></dd></div>
+                <div class="configuration-review__row"><dt>Replay</dt><dd><strong>${escapeHtml(draft.models.join(", "))}</strong><br><small>${escapeHtml(draft.repo)} · ${escapeHtml(draft.timeout_seconds)} second timeout</small></dd></div>
                 <div class="configuration-review__row"><dt>Beginning state</dt><dd>${draft.beginning_kind === "git" ? `Git at <code>${escapeHtml(draft.baseline_commit)}</code>` : "Blank Non-Git directory"}</dd></div>
                 <div class="configuration-review__row"><dt>End state</dt><dd>${draft.ending_kind === "git" ? `Git at <code>${escapeHtml(draft.ending_commit)}</code>` : "Non-Git directory"}</dd></div>
                 <div class="configuration-review__row"><dt>Historical output</dt><dd>${outputFiles.length ? outputFiles.map((path) => `<code>${escapeHtml(path)}</code>`).join(", ") : "No additional files selected"}</dd></div>
@@ -2786,6 +1958,7 @@
         ];
         const gaps = capabilityGaps(capabilities);
         const finalStep = state.configurationStep === CONFIGURATION_STEPS.length - 1;
+        const nextDisabled = Boolean(state.busy) || replayDetailsLoading();
         return `
           ${pageHeading(
             threadStepEyebrow("Configuration"),
@@ -2794,14 +1967,14 @@
           )}
           <div class="footer-actions footer-actions--configuration">
             <span class="footer-actions__note">${configurationLocked
-              ? "This is the configuration used for the current bakeoff."
+              ? "This is the configuration used for the current replay."
               : finalStep
-                ? "Approval locks this configuration and starts one isolated replay."
+                ? `Approval locks this configuration and starts ${draft.models.length} isolated ${draft.models.length === 1 ? "replay" : "replays in parallel"}.`
                 : `${state.configurationStep + 1} of ${CONFIGURATION_STEPS.length}`}</span>
             ${configurationLocked
               ? `<button type="button" class="button button--primary" data-action="go-step" data-step="${state.report ? "results" : "run"}">Return to ${state.report ? "results" : "run"}</button>`
               : `<button type="button" class="button button--quiet" data-action="configuration-back" ${state.busy ? "disabled" : ""}>Back</button>
-                <button type="button" class="button button--primary" data-action="${finalStep ? "approve-configuration" : "configuration-next"}" ${state.busy ? "disabled" : ""}>
+                <button type="button" class="button button--primary" data-action="${finalStep ? "approve-configuration" : "configuration-next"}" ${nextDisabled ? "disabled" : ""}>
                   ${state.busy === "attribution"
                     ? '<span class="spinner" aria-hidden="true"></span>Checking repository…'
                     : state.busy === "prepare"
@@ -2854,33 +2027,61 @@
         }));
       }
 
+      function renderRunVariants(results = false) {
+        const rank=({model})=>DEFAULT_MODEL_IDS.indexOf(model)+1||99;
+        const entries = [...state.runs,...state.runErrors].sort((a,b)=>rank(a)-rank(b));
+        if (entries.length < 2) return "";
+        const html = escapeHtml;
+        return `<div class="variant-grid" aria-label="Parallel replay variants">${entries.map((entry) => {
+          const status = text(entry.run?.status, entry.error ? "failed" : "running");
+          const failed = ["failed", "cancelled", "canceled"].includes(status);
+          const label = asArray(state.models).find(({ id }) => id === entry.model)?.label || entry.model;
+          const outcome = entry.report && outcomeSummary(entry.report.evaluation || {});
+          const active = entry.id && entry.id === state.runId;
+          return `<section class="panel vc${active ? " vc-a" : ""}"${active ? ' aria-current="true"' : ""}>
+<button type="button" class="v-open" data-action="select-run" data-run-id="${html(entry.id)}" ${!entry.id || results && !entry.report ? "disabled" : ""}>
+<span class="vh"><strong>${html(label)}</strong>${active ? `<span class="vi">Viewing ${results ? "result" : "progress"}</span>` : ""}</span>
+<span class="pill ${successfulRunStatus(status) ? "pill--good" : failed ? "pill--bad" : ""}">${html(titleCase(status))}</span>
+<span class="vs">${outcome ? `<strong>${html(outcome.headline)}</strong><br>${html(outcome.score.replaceAll("\n", " · "))}` : html(entry.error || entry.run?.error || titleCase(entry.run?.phase || "Starting"))}</span>
+<span class="vp">Estimated cost<strong>${html(formatCost(entry.report?.estimated_cost?.codex?.usd))}</strong></span></button>
+${entry.id && !terminalRunStatus(status) ? `<button type="button" class="button button--danger" data-action="cancel-run" data-run-id="${html(entry.id)}">Cancel</button>` : ""}
+          </section>`;
+        }).join("")}</div>`;
+      }
+
       function renderRunStep() {
         const run = isObject(state.run) ? state.run : {};
         const status = text(run.status, "running").toLowerCase();
-        const failed = ["failed", "cancelled", "canceled"].includes(status);
-        const completed = successfulRunStatus(status);
+        const running = state.runs.some((entry) => !terminalRunStatus(entry.run?.status));
+        const failed = !running && ["failed", "cancelled", "canceled"].includes(status);
+        const completed = !running && successfulRunStatus(status);
         const phases = normalizedPhases(run);
         const events = asArray(run.events).filter(isObject).slice(-12).reverse();
         const runLog = text(run.run_log);
         return `
           ${pageHeading(
             threadStepEyebrow("Run in progress"),
-            completed ? "The comparison report is ready" : failed ? "The bakeoff stopped" : "Running the isolated replay",
+            completed ? "The comparison report is ready"
+              : failed ? "The replay stopped"
+                : "Running the isolated replay",
             completed
               ? "Implementation, verification, and review completed."
               : failed
                 ? "The run did not continue after this failure."
-                : "You can leave and reopen this page; progress is stored in the local run directory."
+                : state.runs.length > 1
+                  ? "Selected variants run in parallel in isolated workspaces."
+                  : "You can leave and reopen this page; progress is stored in the local run directory."
           )}
           ${failed
             ? `<div class="banner banner--error" role="alert">
                 <span class="banner__mark" aria-hidden="true">!</span>
                 <div class="banner__body">
                   <strong>${escapeHtml(titleCase(status))}</strong>
-                  <p>${escapeHtml(run.error || "The bakeoff could not continue.")}</p>
+                  <p>${escapeHtml(run.error || "The replay could not continue.")}</p>
                 </div>
               </div>`
             : ""}
+          ${renderRunVariants()}
           <div class="grid-2">
             <section class="panel" aria-labelledby="progress-heading">
               <div class="panel__header">
@@ -2953,11 +2154,13 @@
           </section>
           <div class="footer-actions">
             <span class="footer-actions__note">
-              ${completed ? "Loading the report…" : failed ? "Inspect the recorded error before starting a new bakeoff." : "Status refreshes automatically."}
+              ${completed ? "Loading the report…"
+                : failed ? "Inspect the recorded error before starting a new replay."
+                  : "Status refreshes automatically."}
             </span>
             ${failed
               ? `<button type="button" class="button" data-action="refresh-run" ${state.busy ? "disabled" : ""}>Refresh status</button>
-                 <button type="button" class="button button--primary" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another bakeoff</button>`
+                 <button type="button" class="button button--primary" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another replay</button>`
               : completed
                 ? `<button type="button" class="button button--primary" data-action="load-report" ${state.busy ? "disabled" : ""}>
                     ${state.busy === "report" ? '<span class="spinner" aria-hidden="true"></span>Loading…' : "Open results"}
@@ -2976,37 +2179,44 @@
         const codex = isObject(candidates.codex) ? candidates.codex : {};
         const baseline = isObject(report.baseline) ? report.baseline : {};
         const execution = isObject(report.codex_execution) ? report.codex_execution : {};
-        const verification = isObject(report.verification) ? report.verification : {};
         const evaluation = isObject(report.evaluation) ? report.evaluation : {};
         const costs = isObject(report.estimated_cost) ? report.estimated_cost : {};
         const usage = isObject(report.normalized_usage) ? report.normalized_usage : {};
         return {
-          report, baseline, candidates, claude, codex, execution, verification, evaluation, costs, usage,
+          report, baseline, candidates, claude, codex, execution, evaluation, costs, usage,
         };
       }
 
-      function outcomeSummary(evaluation) {
+      function outcomeSummary(evaluation, schemaVersion = 3) {
         const totals = isObject(evaluation.totals) ? evaluation.totals : {};
         const mapping = isObject(evaluation.candidate_mapping)
           ? evaluation.candidate_mapping
           : { A: "claude", B: "codex" };
-        const a = Number(totals.A);
-        const b = Number(totals.B);
+        const a = totals.A;
+        const b = totals.B;
         if (!Number.isFinite(a) || !Number.isFinite(b)) {
           return { headline: "Comparison complete", score: "No validated score", detail: "Review results are recorded below." };
         }
+        const legacyDimensionWins = schemaVersion === 2;
+        const score = (value) => legacyDimensionWins ? `${value}` : `${Math.round(value * 100)}%`;
+        const roundedA = legacyDimensionWins ? a : Math.round(a * 100);
+        const roundedB = legacyDimensionWins ? b : Math.round(b * 100);
+        const detail = legacyDimensionWins
+          ? "Each dimension win awards one point; ties and N/A award zero."
+          : "Overall scores average applicable dimension percentages; N/A dimensions are excluded.";
         const name = (label) =>
           mapping[label] === "codex" ? "Codex replay"
             : mapping[label] === "claude" ? "Historical Claude"
               : `Candidate ${label}`;
-        if (a === b) {
-          return { headline: "The comparison is a tie", score: `${a}–${b}`, detail: "Each category win awards one point." };
+        const labeledScores = `${name("A")}: ${score(a)}\n${name("B")}: ${score(b)}`;
+        if (roundedA === roundedB) {
+          return { headline: "The comparison is a tie", score: labeledScores, detail };
         }
-        const winner = a > b ? "A" : "B";
+        const winner = roundedA > roundedB ? "A" : "B";
         return {
           headline: `${name(winner)} leads`,
-          score: `${Math.max(a, b)}–${Math.min(a, b)}`,
-          detail: "Each category win awards one point; ties and N/A award zero.",
+          score: labeledScores,
+          detail,
         };
       }
 
@@ -3092,134 +2302,45 @@
         `;
       }
 
-      function checksById(container) {
-        if (!isObject(container)) return new Map();
-        const values = asArray(container.checks?.length ? container.checks : container.results);
-        return new Map(values.flatMap((item, index) => {
-          if (!isObject(item)) return [];
-          const id = text(item.id || item.name || item.command, `check-${index + 1}`);
-          return [[id, item]];
-        }));
-      }
-
-      function checkStatus(check, baselineFailed = false) {
-        if (!isObject(check)) return "Unavailable";
-        const raw = text(check.status, check.returncode === 0 ? "passed" : "failed");
-        if (baselineFailed && ["failed", "timed_out"].includes(raw)) {
-          return `${titleCase(raw)} · baseline also failed`;
-        }
-        return titleCase(raw);
-      }
-
-      function verificationTable(verification) {
-        const baseline = isObject(verification.baseline) ? verification.baseline : {};
-        const candidates = isObject(verification.candidates) ? verification.candidates : {};
-        const claude = isObject(candidates.claude) ? candidates.claude : {};
-        const codex = isObject(candidates.codex) ? candidates.codex : {};
-        const maps = [checksById(baseline), checksById(claude), checksById(codex)];
-        const ids = [...new Set(maps.flatMap((map) => [...map.keys()]))];
-        if (!ids.length) return `<p class="empty">No shared verification checks were available.</p>`;
-        return `
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Shared check</th><th>Baseline</th><th>Historical Claude</th><th>Codex replay</th></tr></thead>
-              <tbody>
-                ${ids.map((id) => {
-                  const base = maps[0].get(id);
-                  const baselineFailed = ["failed", "timed_out"].includes(text(base?.status));
-                  const command = text(base?.command || maps[1].get(id)?.command || maps[2].get(id)?.command || id);
-                  return `
-                    <tr>
-                      <th><code>${escapeHtml(command)}</code></th>
-                      <td>${escapeHtml(checkStatus(base))}</td>
-                      <td>${escapeHtml(checkStatus(maps[1].get(id), baselineFailed))}</td>
-                      <td>${escapeHtml(checkStatus(maps[2].get(id), baselineFailed))}</td>
-                    </tr>
-                  `;
-                }).join("")}
-              </tbody>
-            </table>
-          </div>
-        `;
-      }
-
       function evaluationTable(evaluation) {
-        const mapping = isObject(evaluation.candidate_mapping)
-          ? evaluation.candidate_mapping
-          : { A: "claude", B: "codex" };
-        const agentName = (label) =>
-          mapping[label] === "codex" ? "Codex"
-            : mapping[label] === "claude" ? "Claude"
-              : `Candidate ${label}`;
-        const expandCandidateLabels = (value) =>
-          text(value, "No explanation recorded.")
-            .replace(/\bCandidate ([AB])\b/g, (_match, label) => agentName(label))
-            .replace(/\b([AB])(?=(?:['’]s)?\b)/g, (_match, label) => agentName(label));
-        const name = (outcome) =>
-          mapping[outcome] === "codex" ? "Codex replay"
-            : mapping[outcome] === "claude" ? "Historical Claude"
-              : outcome === "tie" ? "Tie"
-                : outcome === "not_applicable" ? "N/A"
-                  : titleCase(outcome);
-        const rows = [];
-        for (const review of asArray(evaluation.reviews)) {
-          if (!isObject(review)) continue;
-          const categories = isObject(review.ballot?.categories) ? review.ballot.categories : {};
-          if (!Object.keys(categories).length && review.status === "failed") {
-            rows.push({
-              evaluator: text(review.evaluator, "Unknown"),
-              model: text(review.model, "Unknown"),
-              category: "Review",
-              outcome: "Failed",
-              explanation: text(review.error, "The reviewer failed."),
-            });
+        const mapping=evaluation.candidate_mapping||{A:"claude",B:"codex"},html=escapeHtml;
+        const name=id=>({codex:"Codex replay",claude:"Historical Claude"}[mapping[id]]||{tie:"Tie",not_applicable:"N/A"}[id]||titleCase(id));
+        const dimensions={request_fulfillment:"Request fulfillment",code_quality:"Code quality",change_scope:"Change scope",reliability:"Reliability",safe_operations:"Safe operations",accurate_reporting:"Accurate reporting"};
+        const checks={
+          required_behavior:"Required behavior implemented",stated_constraints:"Stated constraints followed",complete_integration:"Changes completely integrated",usable_result:"Result is usable",
+          clear_naming:"Clear naming",readable_structure:"Readable structure",appropriate_complexity:"Appropriate complexity",project_conventions:"Project conventions followed",
+          relevant_files:"Only relevant files changed",necessary_changes:"Only necessary changes made",preserved_behavior:"Existing behavior preserved",appropriate_dependencies:"Appropriate dependencies",
+          invalid_inputs:"Invalid inputs handled appropriately",boundary_conditions:"Boundary conditions handled",failure_handling:"Failures handled appropriately",state_consistency:"State remains consistent",
+          preserved_user_work:"Existing user work preserved",authorized_actions:"Only authorized actions performed",protected_sensitive_data:"Sensitive data protected",limited_external_changes:"External changes appropriately limited",
+          truthful_summary:"Summary is truthful",accurate_outcomes:"Observed outcomes accurately reported",disclosed_limitations:"Limitations disclosed",supported_claims:"Claims supported by evidence",
+        };
+        const rows=[],status=value=>value===1?"Pass":value===0?"Fail":"N/A";
+        const score=value=>Number.isFinite(value)?`${Math.round(value*100)}%`:"N/A";
+        const row=(evaluator,model,label,first,second,winner)=>rows.push(`<tr><td>${evaluator?`${html(evaluator)}<br><code>${html(model)}</code>`:""}</td><td>${evaluator?`<strong>${html(label)}</strong>`:html(label)}</td><td>${html(first)}</td><td>${html(second)}</td><td><strong>${html(winner)}</strong></td></tr>`);
+        for(const review of asArray(evaluation.reviews)){
+          if(!isObject(review))continue;
+          const ballot=review.ballot?.dimensions;
+          if(!isObject(ballot)||!Object.keys(ballot).length){
+            if(["failed","invalid"].includes(review.status))row(review.evaluator||"Unknown",review.model||"Unknown",review.error||"Review unavailable.","—","—",titleCase(review.status));
+            continue;
           }
-          for (const [category, raw] of Object.entries(categories)) {
-            const decision = isObject(raw) ? raw : {};
-            rows.push({
-              evaluator: text(review.evaluator, "Unknown"),
-              model: text(review.model, "Unknown"),
-              category: titleCase(category),
-              outcome: name(text(decision.outcome, "not_applicable")),
-              explanation: expandCandidateLabels(decision.explanation),
-            });
+          for(const [dimension,decision] of Object.entries(ballot)){
+            const first=decision.candidates.A,second=decision.candidates.B;
+            row(review.evaluator||"Unknown",review.model||"Unknown",dimensions[dimension],score(first.score),score(second.score),name(decision.winner));
+            for(const [check,value] of Object.entries(first.checks))row("","",checks[check],status(value),status(second.checks[check]),"");
           }
         }
-        for (const availability of asArray(evaluation.evaluator_availability)) {
-          if (!isObject(availability) || availability.available === true) continue;
-          rows.push({
-            evaluator: text(availability.id, "Unknown"),
-            model: text(availability.model, "Unknown"),
-            category: "Availability",
-            outcome: "Skipped",
-            explanation: text(availability.reason, "The evaluator was unavailable."),
-          });
-        }
-        if (!rows.length) return `<p class="empty">No validated blind review ballot is available.</p>`;
-        return `
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Evaluator</th><th>Category</th><th>Outcome</th><th>Explanation</th></tr></thead>
-              <tbody>
-                ${rows.map((row) => `
-                  <tr>
-                    <td>${escapeHtml(row.evaluator)}<br><code>${escapeHtml(row.model)}</code></td>
-                    <td>${escapeHtml(row.category)}</td>
-                    <td><strong>${escapeHtml(row.outcome)}</strong></td>
-                    <td>${escapeHtml(row.explanation)}</td>
-                  </tr>
-                `).join("")}
-              </tbody>
-            </table>
-          </div>
-        `;
+        for(const item of asArray(evaluation.evaluator_availability))if(item&&!item.available)row(item.id||"Unknown",item.model||"Unknown",item.reason||"Evaluator unavailable.","—","—","Skipped");
+        return rows.length
+          ? `<div class="table-wrap"><p class="lede">Scores average applicable checks. Pass: satisfied. Fail: failed. N/A: inapplicable or unsupported.</p><table><thead><tr><th>Evaluator</th><th>Dimension / check</th><th>${html(name("A"))}</th><th>${html(name("B"))}</th><th>Winner</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`
+          : `<p class="empty">No validated blind review ballot is available.</p>`;
       }
 
       function renderResultsStep() {
         const {
-          report, baseline, claude, codex, execution, verification, evaluation, costs, usage,
+          report, baseline, claude, codex, execution, evaluation, costs, usage,
         } = reportParts();
-        const outcome = outcomeSummary(evaluation);
+        const outcome = outcomeSummary(evaluation, report.schema_version);
         const limitations = asArray(report.limitations).map((item) => text(item)).filter(Boolean);
         const claudeElapsed = report.historical_model_request_seconds;
         const codexElapsed = execution.elapsed_seconds;
@@ -3232,6 +2353,8 @@
             </div>
             <div class="score">${escapeHtml(outcome.score)}</div>
           </section>
+
+          ${renderRunVariants(true)}
 
           <div class="provider-grid">
             ${providerCard(
@@ -3255,19 +2378,6 @@
               costs.claude,
             )}
           </div>
-
-          <section class="panel" aria-labelledby="verification-heading">
-            <div class="panel__header">
-              <div>
-                <h2 id="verification-heading">Objective verification</h2>
-                <p>The same baseline-owned checks ran against the historical baseline, Claude result, and Codex replay.</p>
-              </div>
-              <span class="pill">${escapeHtml(titleCase(verification.status || "not verifiable"))}</span>
-            </div>
-            <div class="panel__body panel__body--flush">
-              ${verificationTable(verification)}
-            </div>
-          </section>
 
           <section class="panel" aria-labelledby="evaluation-heading">
             <div class="panel__header">
@@ -3323,7 +2433,7 @@
             ${state.reportPaths?.report_html
               ? `<button type="button" class="button" data-action="download-report" data-format="html">Download HTML report</button>`
               : ""}
-            <button type="button" class="button button--primary" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another bakeoff</button>
+            <button type="button" class="button button--primary" data-action="reset-controller" ${state.busy ? "disabled" : ""}>Start another replay</button>
           </div>
         `;
       }
@@ -3390,17 +2500,18 @@
         }
       }
 
-      async function loadThreads(query = "") {
+      async function loadThreads(query = "", { append = false } = {}) {
         state.loading = true;
         state.error = "";
         render();
         try {
           const payload = await callTool("list_threads", {
-            offset: 0,
-            limit: 100,
+            offset: append ? state.threads.length : 0,
+            limit: THREAD_PAGE_SIZE,
             ...(query.trim() ? { query: query.trim() } : {}),
           });
-          state.threads = asArray(payload.threads?.length ? payload.threads : payload.sessions);
+          const threads = asArray(payload.threads);
+          state.threads = append ? [...state.threads, ...threads] : threads;
           state.totalThreads = Number(payload.total) || state.threads.length;
           state.hostReady = true;
         } catch (error) {
@@ -3414,42 +2525,58 @@
       async function initialize() {
         let synthesis = null;
         draftPersistenceReady = false;
-        restoredDraft = loadDraft();
+        restoredDraft = null;
+        state.controllerSessionId = "";
         state.loading = true;
         state.hostReady = false;
         state.error = "";
         state.notice = "";
         render();
+        startControllerHeartbeat();
         try {
           const [statePayload, threadPayload] = await Promise.all([
             callTool("get_state", {}),
-            callTool("list_threads", { offset: 0, limit: 100 }),
+            callTool("list_threads", { offset: 0, limit: THREAD_PAGE_SIZE }),
           ]);
           const serverState = isObject(statePayload.state) ? statePayload.state : statePayload;
+          state.controllerSessionId = text(serverState.controller_session_id);
+          if (!state.controllerSessionId) {
+            throw new Error("The local replay service did not return a controller instance.");
+          }
+          restoredDraft = loadDraft();
           state.runRoot = text(serverState.run_root);
-          state.controllerLogPath = text(serverState.controller_log_path);
           state.pluginVersion = text(serverState.plugin_version);
           state.models = normalizeModels(serverState.models);
-          state.model = state.models.some((model) => model.id === restoredDraft?.model)
-            ? restoredDraft.model
-            : selectedModelDefault();
-          state.threads = asArray(
-            threadPayload.threads?.length ? threadPayload.threads : threadPayload.sessions
-          );
+          setSelectedModels(restoredDraft?.selectedModels || []);
+          state.threads = asArray(threadPayload.threads);
           state.totalThreads = Number(threadPayload.total) || state.threads.length;
           state.hostReady = true;
 
-          const recent = asArray(serverState.recent_runs);
+          const recent = asArray(serverState.recent_runs).filter((run) =>
+            isObject(run) && text(run.controller_session_id) === state.controllerSessionId
+          );
+          const rememberedRunId = loadActiveRunId();
           const active = recent.find((run) =>
-            isObject(run) && !terminalRunStatus(run.status)
+            rememberedRunId
+              ? currentRunId(run) === rememberedRunId
+              : !restoredDraft && !terminalRunStatus(run.status)
           );
           if (active) {
             clearDraft();
             restoredDraft = null;
-            state.run = active;
-            state.runId = text(active.run_id || active.id);
+            state.runs = recent.filter((run) => run.launch_failed !== true && (run === active || (
+              active.prepare_token_hash && run.prepare_token_hash === active.prepare_token_hash
+            ))).map((run) => ({ id: currentRunId(run), model: text(run.model), run }));
+            state.runErrors = asArray(active.run_group_errors).filter(isObject);
+            setSelectedModels(state.runs.map(({ model }) => model));
+            activateRun(currentRunId(active));
+            rememberActiveRun(state.runId);
             state.step = "run";
-            beginPolling();
+            if (state.runs.some((run) => successfulRunStatus(run.run.status))) {
+              window.setTimeout(() => void refreshRun({ continuePolling: true }), 0);
+            } else if (state.runs.some((run) => !terminalRunStatus(run.run.status))) {
+              beginPolling();
+            }
           } else if (restoredDraft?.selectedThreadId) {
             const selected = state.threads.find(
               (thread) => threadId(thread) === restoredDraft.selectedThreadId
@@ -3464,9 +2591,7 @@
               state.inspection = payload;
               const models = normalizeModels(payload.models);
               if (models.length) state.models = models;
-              state.model = state.models.some((model) => model.id === restoredDraft.model)
-                ? restoredDraft.model
-                : selectedModelDefault();
+              setSelectedModels(restoredDraft.selectedModels);
               initializeClassifications();
               const fallbackRequest = text(payload.replay?.request || payload.thread?.request);
               applyDraftToInspection(restoredDraft);
@@ -3545,9 +2670,7 @@
           state.inspection = payload;
           const models = normalizeModels(payload.models);
           if (models.length) state.models = models;
-          if (!state.models.some((model) => model.id === state.model)) {
-            state.model = selectedModelDefault();
-          }
+          setSelectedModels(state.selectedModels);
           initializeClassifications();
           state.reviewDraft = reviewDraftFromConfiguration();
           fallbackRequest = text(payload.replay?.request || payload.thread?.request);
@@ -3622,6 +2745,7 @@
       }
 
       async function nextConfigurationStep() {
+        if (replayDetailsLoading()) return;
         const problems = configurationStepProblems(state.configurationStep);
         if (problems.length) {
           state.error = "";
@@ -3719,13 +2843,18 @@
               state.preparation?.approval?.prepare_token
             ),
           });
-          const run = runRecord(payload);
-          const id = currentRunId(payload);
-          if (!run || !id) {
+          const launched = asArray(payload.runs).length ? payload.runs : [payload];
+          state.runs = launched.flatMap((item) => {
+            const run = ownedRunRecord(item);
+            const id = currentRunId(item);
+            return run && id ? [{ id, run, model: text(item.model || run.model) }] : [];
+          });
+          state.runErrors = asArray(payload.errors).filter(isObject);
+          if (!state.runs.length) {
             throw new Error("The controller started no durable run.");
           }
-          state.run = run;
-          state.runId = id;
+          activateRun(state.runs[0].id);
+          rememberActiveRun(state.runId);
           state.step = "run";
           clearDraft();
           restoredDraft = null;
@@ -3745,40 +2874,63 @@
         if (!state.runId || state.busy === "run") return;
         state.busy = "run";
         try {
-          const payload = await callTool("get_run", { run_id: state.runId });
-          const run = runRecord(payload);
-          if (run) state.run = run;
-          state.error = "";
+          const pending = state.runs.filter((entry) => !terminalRunStatus(entry.run?.status));
+          const updates = await Promise.allSettled(pending.map(async (entry) => {
+            const run = ownedRunRecord(await callTool("get_run", { run_id: entry.id }));
+            if (run) entry.run = run;
+          }));
+          const failure = updates.find((result) => result.status === "rejected");
+          state.error = failure ? String(failure.reason?.message || failure.reason) : "";
+          await Promise.allSettled(state.runs.filter((entry) =>
+            successfulRunStatus(entry.run?.status) && !entry.report
+          ).map(async (entry) => {
+            const payload = await callTool("get_report", { run_id: entry.id });
+            entry.report = isObject(payload.report) ? payload.report : payload;
+            entry.reportPaths = {
+              report_json: text(payload.report_json),
+              report_html: text(payload.report_html),
+            };
+          }));
+          activateRun(state.runId);
         } catch (error) {
           state.error = error instanceof Error ? error.message : String(error);
         } finally {
           state.busy = "";
           render();
         }
-        if (successfulRunStatus(state.run?.status)) {
-          await loadReport({ navigate: state.step === "run" });
+        const pending = state.runs.some((entry) => !terminalRunStatus(entry.run?.status));
+        if (!pending && state.runs.some((entry) => entry.report)) {
+          if (!state.report) activateRun(state.runs.find((entry) => entry.report).id);
+          if (state.step === "run") state.step = "results";
+          render({ focus: true });
           return;
         }
-        if (continuePolling && !terminalRunStatus(state.run?.status)) {
+        if (continuePolling && pending) {
           schedulePoll();
         }
       }
 
-      async function cancelRun() {
-        if (!state.runId || terminalRunStatus(state.run?.status) || state.busy) return;
+      async function cancelRun(id = state.runId) {
+        const entry = state.runs.find((item) => item.id === id);
+        if (!entry || terminalRunStatus(entry.run?.status) || state.busy) return;
         state.pollGeneration += 1;
         state.busy = "cancel";
         state.error = "";
         render();
         try {
-          const payload = await callTool("cancel_run", { run_id: state.runId });
-          const run = runRecord(payload);
-          if (run) state.run = run;
+          const payload = await callTool("cancel_run", { run_id: id });
+          const run = ownedRunRecord(payload);
+          if (run) entry.run = run;
+          activateRun(state.runId);
         } catch (error) {
           state.error = error instanceof Error ? error.message : String(error);
         } finally {
           state.busy = "";
           render({ focus: true });
+        }
+        if (state.runs.some((item) => !terminalRunStatus(item.run?.status))) beginPolling();
+        else if (state.runs.some((item) => successfulRunStatus(item.run?.status))) {
+          await refreshRun();
         }
       }
 
@@ -3795,22 +2947,27 @@
         schedulePoll();
       }
 
-      async function loadReport({ navigate = true } = {}) {
-        if (!state.runId || state.busy === "report") return;
+      async function loadReport({ navigate = true, runId = state.runId } = {}) {
+        if (!runId || state.busy === "report") return;
         state.busy = "report";
         state.error = "";
         render();
         try {
-          const payload = await callTool("get_report", { run_id: state.runId });
+          const payload = await callTool("get_report", { run_id: runId });
           const report = isObject(payload.report) ? payload.report : payload;
           if (!isObject(report)) throw new Error("The report response was empty.");
-          state.report = report;
-          state.reportPaths = {
+          const entry = state.runs.find((item) => item.id === runId);
+          if (!entry) throw new Error("The replay no longer exists.");
+          entry.report = report;
+          entry.reportPaths = {
             report_json: text(payload.report_json),
             report_html: text(payload.report_html),
           };
+          activateRun(runId);
           if (navigate && state.step === "run") state.step = "results";
-          state.pollGeneration += 1;
+          if (!state.runs.some((item) => !terminalRunStatus(item.run?.status))) {
+            state.pollGeneration += 1;
+          }
         } catch (error) {
           state.error = error instanceof Error ? error.message : String(error);
         } finally {
@@ -3833,20 +2990,12 @@
 
       async function downloadReport(format) {
         if (!state.runId || !["json", "html"].includes(format)) return;
-        const sessionToken = controllerSessionToken();
-        if (!sessionToken) {
-          state.error =
-            "This browser session has expired. Invoke the plugin again to reopen the controller.";
-          render();
-          return;
-        }
         try {
           const response = await fetch("/api/download", {
             method: "POST",
             credentials: "same-origin",
             headers: {
               "Content-Type": "application/json",
-              "X-Codex-Bakeoff-Session": sessionToken,
             },
             body: JSON.stringify({ run_id: state.runId, format }),
           });
@@ -3856,7 +3005,7 @@
               const payload = await response.json();
               detail = text(payload.error || payload.content?.[0]?.text);
             } catch {
-              // Fall back to the status-based message below.
+              // Use the status-based message when no error payload is available.
             }
             throw new Error(detail || `The report download failed (${response.status}).`);
           }
@@ -3885,6 +3034,7 @@
         const action = target.dataset.action;
         if (action === "retry-init") initialize();
         if (action === "refresh-threads") loadThreads(state.query);
+        if (action === "load-more-threads") loadThreads(state.query, { append: true });
         if (action === "select-thread") {
           selectThread(target.dataset.threadId || "", Number(target.dataset.threadNumber));
         }
@@ -3898,8 +3048,14 @@
         }
         if (action === "approve-configuration") prepareRun();
         if (action === "refresh-run") refreshRun();
-        if (action === "cancel-run") cancelRun();
+        if (action === "cancel-run") cancelRun(target.dataset.runId || state.runId);
         if (action === "load-report") loadReport();
+        if (action === "select-run") {
+          activateRun(target.dataset.runId || "");
+          rememberActiveRun(state.runId);
+          if (state.report) state.step = "results";
+          render({ focus: true });
+        }
         if (action === "copy-report-path") copyReportPath();
         if (action === "download-report") downloadReport(target.dataset.format || "");
         if (action === "reset-controller") resetController();
@@ -3928,8 +3084,8 @@
           });
         }
         const reviewFields = {
-          "review-message-uuid": "message_uuid",
           "review-model": "model",
+          "review-message-uuid": "message_uuid",
           "review-request": "request",
           "review-repo": "repo",
           "review-baseline-commit": "baseline_commit",
@@ -3939,9 +3095,9 @@
         const reviewKey = reviewFields[target.id];
         if (reviewKey && state.reviewDraft) {
           state.reviewDraft[reviewKey] = target.value;
+          if (reviewKey === "model") setSelectedModels([target.value]);
           if (reviewKey === "request") state.promptEditRevision += 1;
           if (reviewKey === "repo") state.workingDirectoryEditRevision += 1;
-          if (reviewKey === "model") state.model = target.value;
           invalidateReviewPreparation();
           saveDraft();
         }
@@ -3956,10 +3112,12 @@
         )) return;
         state.error = "";
         state.notice = "";
-        if (target.id === "review-model" && state.reviewDraft) {
-          state.reviewDraft.model = target.value;
-          state.model = target.value;
+        if (target.dataset.modelVariant && state.reviewDraft) {
+          setSelectedModels(target.checked
+            ? [...state.selectedModels, target.dataset.modelVariant]
+            : state.selectedModels.filter((id) => id !== target.dataset.modelVariant));
           invalidateReviewPreparation();
+          saveDraft();
           render();
           return;
         }
@@ -3989,7 +3147,13 @@
         }
       });
 
-      window.addEventListener("pagehide", saveDraft);
+      window.addEventListener("pagehide", () => {
+        saveDraft();
+        stopControllerHeartbeat();
+      });
+      window.addEventListener("pageshow", (event) => {
+        if (event.persisted && state.hostReady) startControllerHeartbeat();
+      });
 
       initialize();
     })();

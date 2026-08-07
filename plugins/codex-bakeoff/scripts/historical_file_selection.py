@@ -197,9 +197,7 @@ def _is_gitlink(repository: Path, relative: str) -> bool:
 
 def _bounded(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(entries) > MAX_CANDIDATE_FILES:
-        raise FileSelectionError(
-            f"More than {MAX_CANDIDATE_FILES:,} dirty files were found."
-        )
+        raise FileSelectionError(f"More than {MAX_CANDIDATE_FILES:,} dirty files were found.")
     return entries
 
 
@@ -1453,7 +1451,7 @@ def _checkout_empty_baseline(root: Path) -> None:
             "-c",
             "user.name=Codex Bakeoff",
             "-c",
-            "user.email=bakeoff@localhost",
+            "user.email=codex-bakeoff@localhost",
             "commit-tree",
             tree,
             "-m",
@@ -1639,7 +1637,7 @@ def build_directory_candidate_patch(
                     label="Claude baseline",
                 )
             _git(candidate, "init", "--quiet")
-            _git(candidate, "config", "user.email", "bakeoff@localhost")
+            _git(candidate, "config", "user.email", "codex-bakeoff@localhost")
             _git(candidate, "config", "user.name", "Codex Bakeoff")
             _neutralize_temp_git_attributes(candidate)
             _git(candidate, "add", "-f", "-A")
@@ -1735,7 +1733,7 @@ def build_directory_result_patch(
                     "The live classified sources exceed the candidate byte limit."
                 )
             _git(candidate, "init", "--quiet")
-            _git(candidate, "config", "user.email", "bakeoff@localhost")
+            _git(candidate, "config", "user.email", "codex-bakeoff@localhost")
             _git(candidate, "config", "user.name", "Codex Bakeoff")
             _neutralize_temp_git_attributes(candidate)
             _git(candidate, "add", "-f", "-A")

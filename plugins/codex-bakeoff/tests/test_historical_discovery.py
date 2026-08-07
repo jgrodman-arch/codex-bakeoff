@@ -338,9 +338,7 @@ class HistoricalDiscoveryTests(unittest.TestCase):
                     }
                 ],
             },
-            "toolUseResult": {
-                "answers": {"Which output should I create?": "CLI"}
-            },
+            "toolUseResult": {"answers": {"Which output should I create?": "CLI"}},
         }
         session, task = self.select(
             [
@@ -373,9 +371,7 @@ class HistoricalDiscoveryTests(unittest.TestCase):
 
     def test_prompt_reconstruction_marks_truncated_turns(self) -> None:
         request = "x" * (discovery.MAX_PROMPT_RECONSTRUCTION_TURN_CHARS + 1)
-        session, task = self.select(
-            [self.user("u1", request, "2026-01-01T10:00:00Z")]
-        )
+        session, task = self.select([self.user("u1", request, "2026-01-01T10:00:00Z")])
 
         replay = discovery.build_replay_spec(session, task)
 

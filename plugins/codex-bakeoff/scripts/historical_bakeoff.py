@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lean, record-only Codex Bakeoff orchestration."""
+"""Lean, record-only Replay orchestration."""
 
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ _SECRET_PATTERNS = (
 )
 
 
-class BakeoffError(ValueError):
-    """The requested bakeoff cannot continue."""
+class ReplayError(ValueError):
+    """The requested replay cannot continue."""
 
 
 def _absolute_no_follow(raw: Path | str) -> Path:
@@ -98,17 +98,13 @@ def _file_selection() -> Any:
     return _module("historical_file_selection")
 
 
-def _verification() -> Any:
-    return _module("historical_verification")
-
-
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise BakeoffError(f"Cannot read {label}: {_redact(error)}") from error
+        raise ReplayError(f"Cannot read {label}: {_redact(error)}") from error
     if not isinstance(loaded, dict):
-        raise BakeoffError(f"{label} must contain a JSON object.")
+        raise ReplayError(f"{label} must contain a JSON object.")
     return loaded
 
 
@@ -173,7 +169,7 @@ def _cached_codex_models(model_cache: str | Path) -> dict[str, Any]:
     path = Path(model_cache).expanduser()
     try:
         payload = _load_json(path, label="the local Codex model catalog")
-    except BakeoffError as error:
+    except ReplayError as error:
         return {
             "status": "unavailable",
             "source": str(path),
@@ -228,25 +224,23 @@ def _codex_cli() -> str:
     discovered = shutil.which("codex")
     if discovered:
         return discovered
-    raise BakeoffError("The Codex executable is unavailable.")
+    raise ReplayError("The Codex executable is unavailable.")
 
 
-def _read_app_server_response(
-    process: subprocess.Popen[bytes], request_id: str
-) -> dict[str, Any]:
+def _read_app_server_response(process: subprocess.Popen[bytes], request_id: str) -> dict[str, Any]:
     if process.stdout is None:
-        raise BakeoffError("Codex model discovery has no response stream.")
+        raise ReplayError("Codex model discovery has no response stream.")
     deadline = time.monotonic() + MODEL_LIST_TIMEOUT_SECONDS
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise BakeoffError("Codex model discovery timed out.")
+            raise ReplayError("Codex model discovery timed out.")
         ready, _, _ = select.select([process.stdout], [], [], remaining)
         if not ready:
-            raise BakeoffError("Codex model discovery timed out.")
+            raise ReplayError("Codex model discovery timed out.")
         line = process.stdout.readline()
         if not line:
-            raise BakeoffError("Codex app-server closed before model discovery completed.")
+            raise ReplayError("Codex app-server closed before model discovery completed.")
         try:
             response = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -256,7 +250,7 @@ def _read_app_server_response(
         error = response.get("error")
         if isinstance(error, Mapping):
             message = error.get("message")
-            raise BakeoffError(
+            raise ReplayError(
                 f"Codex model discovery failed: {_redact(message or 'app-server error')}"
             )
         result = response.get("result")
@@ -264,11 +258,9 @@ def _read_app_server_response(
             return dict(result)
 
 
-def _write_app_server_message(
-    process: subprocess.Popen[bytes], message: Mapping[str, Any]
-) -> None:
+def _write_app_server_message(process: subprocess.Popen[bytes], message: Mapping[str, Any]) -> None:
     if process.stdin is None:
-        raise BakeoffError("Codex model discovery has no request stream.")
+        raise ReplayError("Codex model discovery has no request stream.")
     process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
     process.stdin.flush()
 
@@ -282,7 +274,7 @@ def _app_server_model_page(cursor: str | None) -> dict[str, Any]:
             stderr=subprocess.PIPE,
         )
     except OSError as error:
-        raise BakeoffError(f"Codex model discovery failed: {_redact(error)}") from error
+        raise ReplayError(f"Codex model discovery failed: {_redact(error)}") from error
     try:
         _write_app_server_message(
             process,
@@ -339,7 +331,7 @@ def _app_server_codex_models() -> dict[str, Any]:
         page = _app_server_model_page(cursor)
         raw_models = page.get("data")
         if not isinstance(raw_models, list):
-            raise BakeoffError("Codex model discovery returned no model list.")
+            raise ReplayError("Codex model discovery returned no model list.")
         for item in raw_models:
             if not isinstance(item, Mapping):
                 continue
@@ -359,7 +351,7 @@ def _app_server_codex_models() -> dict[str, Any]:
         if not isinstance(next_cursor, str) or not next_cursor:
             break
         if next_cursor in seen_cursors:
-            raise BakeoffError("Codex model discovery returned a repeated cursor.")
+            raise ReplayError("Codex model discovery returned a repeated cursor.")
         seen_cursors.add(next_cursor)
         cursor = next_cursor
     if options and not any(item["recommended"] for item in options):
@@ -378,7 +370,7 @@ def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, An
         return _cached_codex_models(path)
     try:
         return _app_server_codex_models()
-    except BakeoffError as error:
+    except ReplayError as error:
         fallback = _cached_codex_models(path)
         fallback["limitations"] = [str(error), *fallback["limitations"]]
         return fallback
@@ -386,14 +378,14 @@ def discover_codex_models(model_cache: str | Path | None = None) -> dict[str, An
 
 def _selected_model(model: str | None, model_cache: Path | None) -> str:
     if not isinstance(model, str) or not model.strip() or "\x00" in model:
-        raise BakeoffError("Choose a Codex model before starting the comparison.")
+        raise ReplayError("Choose a Codex model before starting the comparison.")
     selected = model.strip()
     catalog = discover_codex_models(model_cache)
     choices = {item["id"] for item in catalog["options"]}
     if catalog.get("status") != "available" or not choices:
         return selected
     if selected not in choices:
-        raise BakeoffError("The selected Codex model is not locally available.")
+        raise ReplayError("The selected Codex model is not locally available.")
     return selected
 
 
@@ -401,7 +393,7 @@ def _sessions(ledger: Path) -> list[dict[str, Any]]:
     try:
         return _discovery().list_imported_sessions(ledger)
     except Exception as error:
-        raise BakeoffError(_redact(error)) from error
+        raise ReplayError(_redact(error)) from error
 
 
 def _selected_session(args: argparse.Namespace) -> dict[str, Any]:
@@ -410,7 +402,7 @@ def _selected_session(args: argparse.Namespace) -> dict[str, Any]:
         item for item in sessions if item.get("imported_thread_id") == args.imported_thread_id
     ]
     if len(selected) != 1:
-        raise BakeoffError("The selected imported Claude thread is unavailable.")
+        raise ReplayError("The selected imported Claude thread is unavailable.")
     return selected[0]
 
 
@@ -419,17 +411,15 @@ def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
     raw_request = sys.stdin.read() if request_from_stdin else getattr(args, "request", "")
     manual_request = str(raw_request or "").strip()
     if request_from_stdin and not manual_request:
-        raise BakeoffError("The reviewed request is blank.")
+        raise ReplayError("The reviewed request is blank.")
     if "\x00" in manual_request:
-        raise BakeoffError("The reviewed request is invalid.")
+        raise ReplayError("The reviewed request is invalid.")
     raw_source_path = getattr(args, "source_path", None)
     raw_message_uuid = getattr(args, "message_uuid", None)
     source_path = str(raw_source_path or "").strip()
     message_uuid = str(raw_message_uuid or "").strip()
     if bool(source_path) != bool(message_uuid):
-        raise BakeoffError(
-            "Enter both the source transcript path and original user-message UUID."
-        )
+        raise ReplayError("Enter both the source transcript path and original user-message UUID.")
     session_recovered = True
     try:
         session = _selected_session(args)
@@ -448,7 +438,7 @@ def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
         if source_path and message_uuid:
             reviewed_source = Path(source_path).expanduser()
             if not reviewed_source.is_absolute():
-                raise BakeoffError("The reviewed source transcript path must be absolute.")
+                raise ReplayError("The reviewed source transcript path must be absolute.")
             discovered_task: Mapping[str, Any] | None = None
             if session_recovered:
                 try:
@@ -459,8 +449,7 @@ def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
             transcript_overridden = (
                 not session_recovered
                 or not isinstance(original_source, str)
-                or reviewed_source.resolve()
-                != Path(original_source).expanduser().resolve()
+                or reviewed_source.resolve() != Path(original_source).expanduser().resolve()
                 or discovered_task is None
                 or discovered_task.get("message_uuid") != message_uuid
             )
@@ -477,9 +466,9 @@ def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
             replay = _discovery().build_replay_spec(session, task)
     except Exception as error:
         if source_path or message_uuid:
-            raise BakeoffError(_redact(error)) from error
+            raise ReplayError(_redact(error)) from error
         if not manual_request:
-            raise BakeoffError(_redact(error)) from error
+            raise ReplayError(_redact(error)) from error
         request_discovery_failed = True
         project_dir = getattr(args, "repo", None) or session.get("project_dir")
         replay = {
@@ -497,8 +486,7 @@ def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
     replay["review_decisions"] = {
         "transcript_overridden": transcript_overridden,
         "request_overridden": bool(
-            manual_request
-            and (request_discovery_failed or manual_request != discovered_request)
+            manual_request and (request_discovery_failed or manual_request != discovered_request)
         ),
     }
     return replay
@@ -606,9 +594,8 @@ def _resolved_replay_repository(
     known_roots = {root for root in changed_roots if root is not None}
     suggested = original
     if changed_files and not blocking_reasons:
-        contained_by_original = (
-            original is not None
-            and all(_path_is_within(path, original) for path in changed_files)
+        contained_by_original = original is not None and all(
+            _path_is_within(path, original) for path in changed_files
         )
         original_root = _git_root(original) if original is not None else None
         if (
@@ -623,7 +610,7 @@ def _resolved_replay_repository(
             suggested = next(iter(known_roots))
         elif len(known_roots) > 1:
             blocking_reasons.append(
-                "Claude changed files in multiple Git repositories; one bakeoff "
+                "Claude changed files in multiple Git repositories; one replay "
                 "requires one repository."
             )
         else:
@@ -638,16 +625,14 @@ def _resolved_replay_repository(
         if isinstance(raw_explicit, (str, Path)) and str(raw_explicit).strip()
         else None
     )
-    if explicit is not None and changed_files and not all(
-        _path_is_within(path, explicit) for path in changed_files
+    if (
+        explicit is not None
+        and changed_files
+        and not all(_path_is_within(path, explicit) for path in changed_files)
     ):
-        blocking_reasons.append(
-            "The selected repository excludes task-attributed Claude changes."
-        )
+        blocking_reasons.append("The selected repository excludes task-attributed Claude changes.")
     overridden_blockers: list[str] = []
-    if explicit is not None and bool(
-        getattr(args, "confirm_repository_selection", False)
-    ):
+    if explicit is not None and bool(getattr(args, "confirm_repository_selection", False)):
         overridden_blockers = list(dict.fromkeys(blocking_reasons))
         blocking_reasons = []
     effective = explicit or suggested
@@ -669,8 +654,7 @@ def _resolved_replay_repository(
         "original_project_dir": str(original) if original is not None else None,
         "effective_project_dir": str(effective) if effective is not None else None,
         "user_confirmed": bool(
-            explicit is not None
-            and getattr(args, "confirm_repository_selection", False)
+            explicit is not None and getattr(args, "confirm_repository_selection", False)
         ),
         "overridden_blocking_reasons": overridden_blockers,
     }
@@ -684,10 +668,10 @@ def _reviewed_git_baseline(
     commit: str,
 ) -> dict[str, Any]:
     if COMMIT_PATTERN.fullmatch(commit) is None:
-        raise BakeoffError("Enter a valid historical Git commit.")
+        raise ReplayError("Enter a valid historical Git commit.")
     git_root = _git_root(repository)
     if git_root is None:
-        raise BakeoffError("The reviewed repository is not an accessible Git repository.")
+        raise ReplayError("The reviewed repository is not an accessible Git repository.")
     try:
         completed = subprocess.run(
             ["git", "-C", str(git_root), "rev-parse", "--verify", f"{commit}^{{commit}}"],
@@ -697,10 +681,10 @@ def _reviewed_git_baseline(
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise BakeoffError("The reviewed historical Git commit could not be verified.") from error
+        raise ReplayError("The reviewed historical Git commit could not be verified.") from error
     resolved = completed.stdout.strip()
     if completed.returncode != 0 or re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved) is None:
-        raise BakeoffError("The reviewed historical Git commit is unavailable.")
+        raise ReplayError("The reviewed historical Git commit is unavailable.")
     return {
         "kind": "git_commit",
         "proposed_kind": "git_commit",
@@ -754,9 +738,7 @@ def _with_historical_ending_commit(
     except Exception as error:
         ending_commit_inference_error = _redact(error)
         if not reviewed_ending_commit and not (
-            beginning_kind == "git"
-            and ending_kind == "git"
-            and isinstance(starting_commit, str)
+            beginning_kind == "git" and ending_kind == "git" and isinstance(starting_commit, str)
         ):
             return {
                 **result,
@@ -798,13 +780,12 @@ def _with_historical_ending_commit(
                 ending_commit=reviewed_ending_commit,
             )
         except Exception as error:
-            raise BakeoffError(_redact(error)) from error
+            raise ReplayError(_redact(error)) from error
     else:
         recovery = inferred
     ending_commit = recovery.get("commit")
     if reviewed_override and (
-        not isinstance(ending_commit, str)
-        or not isinstance(recovery.get("diff"), str)
+        not isinstance(ending_commit, str) or not isinstance(recovery.get("diff"), str)
     ):
         limitations = recovery.get("limitations")
         detail = (
@@ -812,7 +793,7 @@ def _with_historical_ending_commit(
             if isinstance(limitations, list) and limitations
             else "The reviewed historical ending commit is invalid."
         )
-        raise BakeoffError(detail)
+        raise ReplayError(detail)
     return {
         **result,
         "ending_commit": ending_commit if isinstance(ending_commit, str) else None,
@@ -844,7 +825,7 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
         except OSError:
             selected_stat = None
         if selected_stat is not None and not stat.S_ISDIR(selected_stat.st_mode):
-            raise BakeoffError("The selected project root changed or is not a real directory.")
+            raise ReplayError("The selected project root changed or is not a real directory.")
         inspected_replay["project_dir"] = str(selected_project)
         inspected_replay["project_dirs"] = [inspected_replay["project_dir"]]
     beginning_kind = getattr(args, "beginning_kind", None)
@@ -852,37 +833,37 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
     manual_commit = str(getattr(args, "baseline_commit", "") or "").strip()
     manual_ending_commit = str(getattr(args, "ending_commit", "") or "").strip()
     if (beginning_kind is None) != (ending_kind is None):
-        raise BakeoffError("Choose both the beginning state and end state.")
+        raise ReplayError("Choose both the beginning state and end state.")
     if beginning_kind not in {None, "git", "non_git"}:
-        raise BakeoffError("Choose a Git or Non-Git beginning state.")
+        raise ReplayError("Choose a Git or Non-Git beginning state.")
     if ending_kind not in {None, "git", "non_git"}:
-        raise BakeoffError("Choose a Git or Non-Git end state.")
+        raise ReplayError("Choose a Git or Non-Git end state.")
     if beginning_kind == "git" and ending_kind == "non_git":
-        raise BakeoffError("A Git beginning state requires a Git end state.")
+        raise ReplayError("A Git beginning state requires a Git end state.")
     if beginning_kind == "git" and not manual_commit:
-        raise BakeoffError("Enter a valid historical Git commit.")
+        raise ReplayError("Enter a valid historical Git commit.")
     if beginning_kind == "non_git" and manual_commit:
-        raise BakeoffError("A Non-Git beginning state cannot have a Git commit.")
+        raise ReplayError("A Non-Git beginning state cannot have a Git commit.")
     if manual_commit and beginning_kind != "git":
-        raise BakeoffError("Choose a Git beginning state for the reviewed commit.")
+        raise ReplayError("Choose a Git beginning state for the reviewed commit.")
     if ending_kind == "git" and not manual_ending_commit:
-        raise BakeoffError("Enter a valid historical ending Git commit.")
+        raise ReplayError("Enter a valid historical ending Git commit.")
     if ending_kind == "non_git" and manual_ending_commit:
-        raise BakeoffError("A Non-Git end state cannot have a Git commit.")
+        raise ReplayError("A Non-Git end state cannot have a Git commit.")
     if manual_ending_commit and ending_kind != "git":
-        raise BakeoffError("Choose a Git end state for the reviewed ending commit.")
+        raise ReplayError("Choose a Git end state for the reviewed ending commit.")
     inspection_failed = False
     try:
         inspected = _discovery().inspect_baseline(inspected_replay)
     except Exception as error:
         if beginning_kind is None:
-            raise BakeoffError(_redact(error)) from error
+            raise ReplayError(_redact(error)) from error
         inspection_failed = True
         inspected = {}
 
     if beginning_kind == "git":
         if selected_project is None:
-            raise BakeoffError("Enter a replay repository for the reviewed Git beginning state.")
+            raise ReplayError("Enter a replay repository for the reviewed Git beginning state.")
         reviewed = _reviewed_git_baseline(
             selected_project,
             selected_project,
@@ -899,7 +880,8 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
             **reviewed,
             "beginning_kind": "git",
             "ending_kind": "git",
-            "reviewed_override": inspection_failed or not (
+            "reviewed_override": inspection_failed
+            or not (
                 inspected.get("kind") == "git_commit"
                 and str(inspected.get("commit") or "").lower() == reviewed["commit"]
             ),
@@ -912,12 +894,12 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
 
     if beginning_kind == "non_git":
         if selected_project is None:
-            raise BakeoffError("Enter a replay repository for the Non-Git beginning state.")
+            raise ReplayError("Enter a replay repository for the Non-Git beginning state.")
         git_root = _git_root(selected_project)
         if ending_kind == "git" and git_root is None:
-            raise BakeoffError("A Git end state requires an accessible Git repository.")
+            raise ReplayError("A Git end state requires an accessible Git repository.")
         if ending_kind == "non_git" and git_root is not None:
-            raise BakeoffError("A Non-Git end state cannot point inside Git.")
+            raise ReplayError("A Non-Git end state cannot point inside Git.")
         baseline = {
             **inspected,
             "kind": "unclassified_directory",
@@ -1014,18 +996,18 @@ def _capabilities(replay: Mapping[str, Any]) -> dict[str, Any]:
     try:
         return _discovery().inspect_capabilities(dict(replay))
     except Exception as error:
-        raise BakeoffError(_redact(error)) from error
+        raise ReplayError(_redact(error)) from error
 
 
 def _prompt(replay: Mapping[str, Any]) -> str:
     request = str(replay.get("request") or "").strip()
     if not request:
-        raise BakeoffError("The selected Claude thread has no replayable request.")
+        raise ReplayError("The selected Claude thread has no replayable request.")
     return (
         "Implement the reconstructed historical task as one task. "
         "Do not inspect or modify the original Claude output directory. "
         "Ignore the contents of memory_summary.md. "
-        "Do not read memory files or invoke the codex-bakeoff skill. "
+        "Do not read memory files or invoke the replay skill. "
         "Implement only from the task prompt and current workspace. "
         f"Task prompt:\n{request}"
     )
@@ -1042,7 +1024,7 @@ def _new_run_directory(parent: Path | None) -> Path:
         except FileExistsError:
             continue
         return path
-    raise BakeoffError("Cannot allocate a bakeoff run directory.")
+    raise ReplayError("Cannot allocate a replay run directory.")
 
 
 def _target_for_baseline(
@@ -1078,7 +1060,7 @@ def _target_for_baseline(
             or not isinstance(project_id, str)
             or not project_id
         ):
-            raise BakeoffError(
+            raise ReplayError(
                 "A registered baseline project path and project ID are required "
                 "for this non-Git baseline."
             )
@@ -1087,7 +1069,7 @@ def _target_for_baseline(
             "projectId": project_id,
             "environment": {"type": "local"},
         }
-    raise BakeoffError("The selected historical baseline is not runnable.")
+    raise ReplayError("The selected historical baseline is not runnable.")
 
 
 def _classified_baseline(
@@ -1104,7 +1086,7 @@ def _classified_baseline(
                 *(getattr(args, "exclude_file", None) or ()),
             )
             if non_git_values:
-                raise BakeoffError("Non-Git classification flags cannot be used for a Git project.")
+                raise ReplayError("Non-Git classification flags cannot be used for a Git project.")
             selection = _file_selection().select_git(
                 repository,
                 attribution_root=attribution_root,
@@ -1112,9 +1094,7 @@ def _classified_baseline(
                 confirmed=bool(getattr(args, "confirm_file_selection", False)),
             )
             empty_beginning_required = baseline.get("beginning_kind") == "non_git"
-            empty_beginning_confirmed = bool(
-                getattr(args, "confirm_empty_beginning", False)
-            )
+            empty_beginning_confirmed = bool(getattr(args, "confirm_empty_beginning", False))
             selection = {
                 **selection,
                 "requires_empty_beginning_confirmation": empty_beginning_required,
@@ -1147,7 +1127,7 @@ def _classified_baseline(
 
         if source_kind == "non_git":
             if getattr(args, "claude_output_file", None):
-                raise BakeoffError("--claude-output-file applies only to a Git working tree.")
+                raise ReplayError("--claude-output-file applies only to a Git working tree.")
             selection = _file_selection().select_directory(
                 repository,
                 created_by_claude=(getattr(args, "created_by_claude", None) or ()),
@@ -1175,10 +1155,10 @@ def _classified_baseline(
                 },
                 selection,
             )
-    except BakeoffError:
+    except ReplayError:
         raise
     except Exception as error:
-        raise BakeoffError(_redact(error)) from error
+        raise ReplayError(_redact(error)) from error
 
     return (
         dict(baseline),
@@ -1220,8 +1200,7 @@ def _selection_questions(
             }
         )
     if source_kind == "non_git" and (
-        selection.get("confirmed") is not True
-        or bool(selection.get("unclassified_files"))
+        selection.get("confirmed") is not True or bool(selection.get("unclassified_files"))
     ):
         questions.append(
             {
@@ -1290,16 +1269,12 @@ def _configuration(
         },
         "beginning_state": {
             "kind": baseline.get("beginning_kind"),
-            "commit": (
-                baseline.get("commit") if baseline.get("beginning_kind") == "git" else None
-            ),
+            "commit": (baseline.get("commit") if baseline.get("beginning_kind") == "git" else None),
         },
         "ending_state": {
             "kind": baseline.get("ending_kind"),
             "commit": (
-                baseline.get("ending_commit")
-                if baseline.get("ending_kind") == "git"
-                else None
+                baseline.get("ending_commit") if baseline.get("ending_kind") == "git" else None
             ),
         },
         "baseline": {
@@ -1333,13 +1308,9 @@ def _configuration(
             "repository_selection_confirmed": bool(
                 getattr(args, "confirm_repository_selection", False)
             ),
-            "transcript_overridden": bool(
-                review_decisions.get("transcript_overridden")
-            ),
+            "transcript_overridden": bool(review_decisions.get("transcript_overridden")),
             "baseline_overridden": bool(baseline.get("reviewed_override")),
-            "ending_commit_overridden": bool(
-                baseline.get("ending_commit_reviewed_override")
-            ),
+            "ending_commit_overridden": bool(baseline.get("ending_commit_reviewed_override")),
             "request_overridden": bool(review_decisions.get("request_overridden")),
             "empty_starting_directory_confirmed": bool(
                 context["file_selection"].get("empty_starting_directory_confirmed")
@@ -1350,7 +1321,7 @@ def _configuration(
 
 def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
     if args.timeout_seconds > MAX_TIMEOUT_SECONDS:
-        raise BakeoffError("The execution timeout cannot exceed 14,400 seconds.")
+        raise ReplayError("The execution timeout cannot exceed 14,400 seconds.")
     replay, repository_resolution, repository_blockers = _resolved_replay_repository(
         args,
         _selected_replay(args),
@@ -1365,7 +1336,7 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
     model = _selected_model(args.model, args.model_cache)
     try:
         capabilities = _capabilities(replay)
-    except BakeoffError as error:
+    except ReplayError as error:
         capabilities = {
             "items": [],
             "resolution_actions": [],
@@ -1390,10 +1361,8 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
     historical_candidate: dict[str, Any] | None = None
     if not questions and runnable and not blocking_reasons:
         try:
-            historical_candidate = _serialize_historical_candidate(
-                *_historical_candidate(context)
-            )
-        except BakeoffError as error:
+            historical_candidate = _serialize_historical_candidate(*_historical_candidate(context))
+        except ReplayError as error:
             blocking_reasons.append(str(error))
     context["historical_candidate"] = historical_candidate
     if repository_blockers:
@@ -1422,14 +1391,8 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
 
 def _command_prepare(args: argparse.Namespace) -> dict[str, Any]:
     prepared = _prepare_context(args)
-    result = {
-        key: value
-        for key, value in prepared.items()
-        if key != "historical_candidate"
-    }
-    result["prepared_configuration_sha256"] = _canonical_json_sha256(
-        prepared["configuration"]
-    )
+    result = {key: value for key, value in prepared.items() if key != "historical_candidate"}
+    result["prepared_configuration_sha256"] = _canonical_json_sha256(prepared["configuration"])
     historical_candidate = prepared.get("historical_candidate")
     result["historical_result_sha256"] = (
         _canonical_json_sha256(historical_candidate)
@@ -1441,7 +1404,7 @@ def _command_prepare(args: argparse.Namespace) -> dict[str, Any]:
 
 def _command_run(args: argparse.Namespace) -> dict[str, Any]:
     if not bool(getattr(args, "approve", False)):
-        raise BakeoffError(
+        raise ReplayError(
             "Run `prepare`, review its configuration, obtain explicit user approval, "
             "then rerun with --approve. No Codex task was requested."
         )
@@ -1450,10 +1413,10 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
         pending = " ".join(
             str(item.get("question")) for item in prepared["questions"] if isinstance(item, Mapping)
         )
-        raise BakeoffError(f"File classification is still required before approval: {pending}")
+        raise ReplayError(f"File classification is still required before approval: {pending}")
     if prepared["status"] != "ready_for_approval":
         detail = " ".join(prepared.get("blocking_reasons") or [])
-        raise BakeoffError(
+        raise ReplayError(
             "The prepared configuration is not runnable; no Codex task was "
             f"requested. {detail}".strip()
         )
@@ -1463,9 +1426,7 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
         None,
     )
     if expected_prepared_configuration_sha256 is not None:
-        prepared_configuration_sha256 = _canonical_json_sha256(
-            prepared["configuration"]
-        )
+        prepared_configuration_sha256 = _canonical_json_sha256(prepared["configuration"])
         if (
             not isinstance(expected_prepared_configuration_sha256, str)
             or re.fullmatch(
@@ -1478,14 +1439,14 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
                 expected_prepared_configuration_sha256,
             )
         ):
-            raise BakeoffError(
+            raise ReplayError(
                 "The prepared configuration changed or its digest is invalid; run "
                 "`prepare` again, review the current configuration, and approve it "
                 "again. No Codex task was requested."
             )
     historical_candidate = prepared.get("historical_candidate")
     if not isinstance(historical_candidate, Mapping):
-        raise BakeoffError(
+        raise ReplayError(
             "The historical Claude candidate was not frozen; no Codex task was requested."
         )
     historical_result_sha256 = _canonical_json_sha256(historical_candidate)
@@ -1502,7 +1463,7 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
             expected_historical_result_sha256,
         )
     ):
-        raise BakeoffError(
+        raise ReplayError(
             "The historical Claude result changed after preparation; prepare and "
             "approve it again. No Codex task was requested."
         )
@@ -1567,7 +1528,7 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
 def _run_directory(raw: Path) -> Path:
     path = raw.expanduser().resolve()
     if not path.is_dir() or not (path / "run.json").is_file():
-        raise BakeoffError("The bakeoff run directory is unavailable.")
+        raise ReplayError("The replay run directory is unavailable.")
     return path
 
 
@@ -1576,7 +1537,7 @@ def _command_collect_native_result(args: argparse.Namespace) -> dict[str, Any]:
     evaluator = getattr(args, "evaluator", None)
     normalization_for = getattr(args, "normalization_for", None)
     if evaluator and normalization_for:
-        raise BakeoffError("--evaluator and --normalization-for cannot be used together.")
+        raise ReplayError("--evaluator and --normalization-for cannot be used together.")
     try:
         result = _execution().collect_native_task_result(
             thread_id=args.thread_id,
@@ -1585,7 +1546,7 @@ def _command_collect_native_result(args: argparse.Namespace) -> dict[str, Any]:
             evaluator=evaluator,
         )
     except Exception as error:
-        raise BakeoffError(_redact(error)) from error
+        raise ReplayError(_redact(error)) from error
     if normalization_for:
         result["normalization_for"] = normalization_for
         path = run_directory / "reviews" / f"normalize-{normalization_for}-{args.thread_id}.json"
@@ -1593,6 +1554,8 @@ def _command_collect_native_result(args: argparse.Namespace) -> dict[str, Any]:
         path = run_directory / "reviews" / f"{evaluator}-{args.thread_id}.json"
     else:
         path = run_directory / "native-result.json"
+    if evaluator or normalization_for:
+        result = _reviewer_result_for_storage(result)
     _write_json(path, result)
     return {
         "status": "collected",
@@ -1614,7 +1577,7 @@ def _historical_candidate(
         or not isinstance(replay.get("message_uuid"), str)
         or not replay["message_uuid"].strip()
     ):
-        raise BakeoffError(
+        raise ReplayError(
             "The source transcript path and original user-message UUID must be "
             "reviewed before capturing the historical Claude result."
         )
@@ -1645,9 +1608,7 @@ def _historical_candidate(
                 baseline.get("commit"),
                 baseline_kind=baseline.get("kind", "git_commit"),
                 ending_commit=(
-                    baseline.get("ending_commit")
-                    if baseline.get("ending_kind") == "git"
-                    else None
+                    baseline.get("ending_commit") if baseline.get("ending_kind") == "git" else None
                 ),
             )
         except Exception as error:
@@ -1677,7 +1638,7 @@ def _historical_candidate(
                 "file_selection": dict(selection),
             }
         except Exception as error:
-            raise BakeoffError(
+            raise ReplayError(
                 f"The live classified Claude files could not be captured: {_redact(error)}"
             ) from error
     elif selection.get("source_kind") == "git":
@@ -1688,9 +1649,7 @@ def _historical_candidate(
                 diff, changed = _file_selection().build_git_candidate_patch(
                     repository=repository,
                     baseline_commit=(
-                        str(baseline["commit"])
-                        if isinstance(baseline.get("commit"), str)
-                        else None
+                        str(baseline["commit"]) if isinstance(baseline.get("commit"), str) else None
                     ),
                     baseline_kind=str(baseline.get("kind") or "git_commit"),
                     recovered_patch=diff if isinstance(diff, str) else None,
@@ -1707,7 +1666,7 @@ def _historical_candidate(
                     "file_selection": dict(selection),
                 }
             except Exception as error:
-                raise BakeoffError(
+                raise ReplayError(
                     f"The selected live Git changes could not be captured: {_redact(error)}"
                 ) from error
         if selection.get("working_tree_state") == "dirty":
@@ -1716,8 +1675,7 @@ def _historical_candidate(
                 "file_selection": dict(selection),
             }
         selection_reviewed = selection.get("complete") is True and (
-            selection.get("working_tree_state") == "clean"
-            or selection.get("confirmed") is True
+            selection.get("working_tree_state") == "clean" or selection.get("confirmed") is True
         )
         if selection_reviewed:
             recovery = {
@@ -1728,10 +1686,7 @@ def _historical_candidate(
     allow_no_change = bool(
         selection.get("source_kind") == "git"
         and selection.get("complete") is True
-        and (
-            selection.get("working_tree_state") == "clean"
-            or selection.get("confirmed") is True
-        )
+        and (selection.get("working_tree_state") == "clean" or selection.get("confirmed") is True)
         and not (selection.get("claude_output_changes") or [])
         and isinstance(baseline.get("ending_commit"), str)
         and isinstance(recovery.get("commit"), str)
@@ -1739,7 +1694,7 @@ def _historical_candidate(
         and isinstance(diff, str)
     )
     if not isinstance(diff, str) or (not diff.strip() and not allow_no_change):
-        raise BakeoffError(
+        raise ReplayError(
             "No attributable historical Claude patch could be captured; "
             "the comparison cannot be completed."
         )
@@ -1770,7 +1725,7 @@ def _serialize_historical_candidate(
     final_response: str,
 ) -> dict[str, Any]:
     if candidate is None:
-        raise BakeoffError("The historical Claude candidate could not be serialized.")
+        raise ReplayError("The historical Claude candidate could not be serialized.")
     return {
         "schema_version": 1,
         "candidate": _jsonable(candidate),
@@ -1793,25 +1748,25 @@ def _historical_candidate_for_completion(
         or not isinstance(metadata.get("sha256"), str)
         or re.fullmatch(r"[a-f0-9]{64}", metadata["sha256"]) is None
     ):
-        raise BakeoffError("The frozen historical Claude artifact metadata is invalid.")
+        raise ReplayError("The frozen historical Claude artifact metadata is invalid.")
     artifact_path = run_directory / "historical-result.json"
     try:
         serialized = artifact_path.read_bytes()
     except OSError as error:
-        raise BakeoffError(
+        raise ReplayError(
             f"Cannot read the frozen historical Claude artifact: {_redact(error)}"
         ) from error
     observed_digest = hashlib.sha256(serialized).hexdigest()
     if not secrets.compare_digest(observed_digest, metadata["sha256"]):
-        raise BakeoffError("The frozen historical Claude artifact digest does not match.")
+        raise ReplayError("The frozen historical Claude artifact digest does not match.")
     try:
         frozen = json.loads(serialized.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
-        raise BakeoffError(
+        raise ReplayError(
             f"Cannot read the frozen historical Claude artifact: {_redact(error)}"
         ) from error
     if not isinstance(frozen, Mapping) or frozen.get("schema_version") != 1:
-        raise BakeoffError("The frozen historical Claude candidate is invalid.")
+        raise ReplayError("The frozen historical Claude candidate is invalid.")
     raw_candidate = frozen.get("candidate")
     raw_recovery = frozen.get("recovery")
     final_response = frozen.get("final_response")
@@ -1821,7 +1776,7 @@ def _historical_candidate_for_completion(
         or not isinstance(raw_recovery, Mapping)
         or not isinstance(final_response, str)
     ):
-        raise BakeoffError("The frozen historical Claude candidate is invalid.")
+        raise ReplayError("The frozen historical Claude candidate is invalid.")
     candidate = _execution().CandidateSolution(
         provider="claude",
         diff=raw_candidate["diff"],
@@ -1840,18 +1795,18 @@ def _codex_candidate(
     selection = run.get("file_selection")
     selection = selection if isinstance(selection, Mapping) else {}
     try:
-        if selection.get("source_kind") == "non_git" or baseline.get("kind") in {
-            "empty_directory",
-            "classified_directory",
-        }:
+        if selection.get("source_kind") != "git" and (
+            selection.get("source_kind") == "non_git"
+            or baseline.get("kind") in {"empty_directory", "classified_directory"}
+        ):
             if baseline.get("kind") == "classified_directory":
                 raw_expected = baseline.get("registered_baseline_project")
                 if not isinstance(raw_expected, str) or not raw_expected:
-                    raise BakeoffError("The registered non-Git baseline project is missing.")
+                    raise ReplayError("The registered non-Git baseline project is missing.")
                 expected = _canonical_parent_path(raw_expected)
                 observed = _canonical_parent_path(worktree)
                 if observed != expected:
-                    raise BakeoffError(
+                    raise ReplayError(
                         "The observed Codex workspace does not match the registered "
                         "non-Git baseline project."
                     )
@@ -1866,10 +1821,10 @@ def _codex_candidate(
                     str(baseline["commit"]) if baseline.get("kind") == "git_commit" else None
                 ),
             )
-    except BakeoffError:
+    except ReplayError:
         raise
     except Exception as error:
-        raise BakeoffError(_redact(error)) from error
+        raise ReplayError(_redact(error)) from error
     candidate = _execution().CandidateSolution(
         provider="codex",
         diff=diff,
@@ -1911,7 +1866,7 @@ def _usage_records(
 
 def _command_complete_run(args: argparse.Namespace) -> dict[str, Any]:
     run_directory = _run_directory(args.run_dir)
-    run = _load_json(run_directory / "run.json", label="the bakeoff run")
+    run = _load_json(run_directory / "run.json", label="the replay run")
     native_path = args.native_result.expanduser().resolve()
     native = _load_json(native_path, label="the native result")
     claude_candidate, recovery, historical_final = _historical_candidate_for_completion(
@@ -1971,67 +1926,30 @@ def _command_complete_run(args: argparse.Namespace) -> dict[str, Any]:
 def _report_candidates(report: Mapping[str, Any]) -> tuple[Any | None, Any | None]:
     raw = report.get("candidates")
     raw = raw if isinstance(raw, Mapping) else {}
-    verification = report.get("verification")
-    verification = verification if isinstance(verification, Mapping) else {}
     candidates: list[Any | None] = []
     for provider in ("claude", "codex"):
         item = raw.get(provider)
         if not isinstance(item, Mapping):
             candidates.append(None)
             continue
-        evidence = _verification().verification_evidence_for_provider(verification, provider)
         candidates.append(
             _execution().CandidateSolution(
                 provider=provider,
                 diff=str(item.get("diff") or ""),
                 model=str(item.get("model") or "unknown"),
-                verification=evidence,
-                verification_results_available=(
-                    _verification().has_comparable_verification_results(verification)
-                ),
                 final_response=str(item.get("final_response") or ""),
             )
         )
     return candidates[0], candidates[1]
 
 
-def _command_verify(args: argparse.Namespace) -> dict[str, Any]:
-    run_directory = _run_directory(args.run_dir)
-    report = _load_json(run_directory / "report.json", label="the bakeoff report")
-    claude, codex = _report_candidates(report)
-    try:
-        verification = _verification().verify_candidates(
-            baseline=report["baseline"],
-            candidate_patches={
-                "claude": claude.diff if claude else None,
-                "codex": codex.diff if codex else None,
-            },
-        )
-    except Exception as error:
-        raise BakeoffError(_redact(error)) from error
-    _write_json(run_directory / "verification.json", verification)
-    report["verification"] = verification
-    _write_report(run_directory, report)
-    return {
-        "status": verification.get("status"),
-        "verification": verification,
-        "report_html": str(run_directory / "report.html"),
-        "report_json": str(run_directory / "report.json"),
-    }
-
-
 def _selected_evaluators(
     codex_model: str,
     requested: Sequence[str] | None,
-    *,
-    claude_model: str,
 ) -> list[dict[str, Any]]:
-    selected = list(requested or ("codex",))
-    evaluators = {
-        "codex": {"id": "codex", "provider": "codex", "model": codex_model},
-        "claude": {"id": "claude", "provider": "claude", "model": claude_model},
-    }
-    return [evaluators[evaluator] for evaluator in selected]
+    if requested and list(requested) != ["codex"]:
+        raise ReplayError("Exactly one Codex evaluator is required.")
+    return [{"id": "codex", "provider": "codex", "model": codex_model}]
 
 
 def _evaluator_availability(raw: str | None) -> list[dict[str, Any]]:
@@ -2040,9 +1958,11 @@ def _evaluator_availability(raw: str | None) -> list[dict[str, Any]]:
     try:
         loaded = json.loads(raw)
     except json.JSONDecodeError as error:
-        raise BakeoffError("Evaluator availability is not valid JSON.") from error
+        raise ReplayError("Evaluator availability is not valid JSON.") from error
     if not isinstance(loaded, list) or not all(isinstance(item, Mapping) for item in loaded):
-        raise BakeoffError("Evaluator availability must be a JSON list of objects.")
+        raise ReplayError("Evaluator availability must be a JSON list of objects.")
+    if len(loaded) > 1 or any(item.get("id") != "codex" for item in loaded):
+        raise ReplayError("Evaluator availability supports only the Codex reviewer.")
     return [dict(item) for item in loaded]
 
 
@@ -2061,10 +1981,7 @@ def _command_reviewers(args: argparse.Namespace) -> dict[str, Any]:
 
 def _command_evaluate(args: argparse.Namespace) -> dict[str, Any]:
     run_directory = _run_directory(args.run_dir)
-    report = _load_json(run_directory / "report.json", label="the bakeoff report")
-    if not report.get("verification"):
-        _command_verify(argparse.Namespace(run_dir=run_directory))
-        report = _load_json(run_directory / "report.json", label="the bakeoff report")
+    report = _load_json(run_directory / "report.json", label="the replay report")
     claude, codex = _report_candidates(report)
     if claude is None or codex is None:
         report["evaluation"] = {
@@ -2073,11 +1990,10 @@ def _command_evaluate(args: argparse.Namespace) -> dict[str, Any]:
         }
         _write_report(run_directory, report)
         return {"status": "unavailable", "task_requests": []}
-    run = _load_json(run_directory / "run.json", label="the bakeoff run")
+    run = _load_json(run_directory / "run.json", label="the replay run")
     evaluators = _selected_evaluators(
         str(run.get("model") or "gpt-5.6-sol"),
         args.evaluator,
-        claude_model=args.claude_model,
     )
     availability = _evaluator_availability(args.evaluator_availability_json)
     requests = _execution().prepare_review(
@@ -2101,14 +2017,130 @@ def _command_evaluate(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _reviewer_numeric_ballot(response: str | Mapping[str, Any]) -> dict[str, Any] | None:
+    if isinstance(response, str):
+        text = response.strip()
+        if text.startswith("```"):
+            text = re.sub(r"\A```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```\Z", "", text)
+        try:
+            loaded = json.loads(text)
+        except (json.JSONDecodeError, UnicodeError):
+            return None
+    else:
+        loaded = response
+    if not isinstance(loaded, Mapping) or not isinstance(loaded.get("dimensions"), Mapping):
+        return None
+
+    dimensions = {}
+    known_dimensions = _execution().REVIEW_DIMENSION_CHECKS
+    for dimension, decision in loaded["dimensions"].items():
+        if not isinstance(dimension, str) or dimension not in known_dimensions:
+            continue
+        if not isinstance(decision, Mapping):
+            continue
+        raw_candidates = decision.get("candidates")
+        if not isinstance(raw_candidates, Mapping):
+            continue
+        candidates = {}
+        for label in ("A", "B"):
+            candidate = raw_candidates.get(label)
+            if not isinstance(candidate, Mapping):
+                continue
+            raw_checks = candidate.get("checks", candidate.get("values"))
+            if not isinstance(raw_checks, Mapping):
+                continue
+            expected_checks = known_dimensions[dimension]
+            checks = {
+                check: value
+                for check, value in raw_checks.items()
+                if isinstance(check, str)
+                and (
+                    check in expected_checks
+                    or (
+                        check.startswith("invalid_")
+                        and check.removeprefix("invalid_") in expected_checks
+                    )
+                )
+                and (value is None or (type(value) is int and value in (0, 1)))
+            }
+            candidates[label] = {"checks": checks}
+        dimensions[dimension] = {"candidates": candidates}
+    return {"dimensions": dimensions}
+
+
+def _reviewer_result_for_storage(result: Mapping[str, Any]) -> dict[str, Any]:
+    metadata_fields = (
+        "status",
+        "evaluator",
+        "model",
+        "thread_id",
+        "worktree",
+        "requested_worktree",
+        "rollout_path",
+        "sandbox_policy",
+        "elapsed_seconds",
+        "usage",
+        "normalization_for",
+        "normalization_required",
+        "error",
+        "reason",
+    )
+    stored = {field: result[field] for field in metadata_fields if field in result}
+    response = result.get("ballot", result.get("final_output"))
+    if not isinstance(response, (str, Mapping)) or not response:
+        return stored
+    try:
+        ballot = _execution().parse_review_ballot(response)
+    except Exception:
+        structured = _reviewer_numeric_ballot(response)
+        if structured is not None:
+            stored["ballot"] = structured
+        stored["normalization_required"] = True
+        return stored
+    stored["ballot"] = {
+        "dimensions": {
+            dimension: {
+                "candidates": {
+                    label: {"checks": dict(candidate["checks"])}
+                    for label, candidate in decision["candidates"].items()
+                }
+            }
+            for dimension, decision in ballot["dimensions"].items()
+        }
+    }
+    if result.get("normalization_required") is not True:
+        stored.pop("normalization_required", None)
+    return stored
+
+
+def _scrub_reviewer_result_artifact(
+    run_directory: Path,
+    path: Path,
+    result: Mapping[str, Any],
+) -> None:
+    review_directory = (run_directory / "reviews").resolve()
+    artifact = path.expanduser().resolve()
+    if artifact.parent != review_directory or artifact.name in {
+        "candidate-a.json",
+        "candidate-b.json",
+    }:
+        return
+    _write_json(artifact, _reviewer_result_for_storage(result))
+
+
 def _command_collect_native_results(args: argparse.Namespace) -> dict[str, Any]:
     run_directory = _run_directory(args.run_dir)
+    sources = [path.expanduser().resolve() for path in args.native_result]
     results = [
-        _load_json(path.expanduser().resolve(), label="a native reviewer result")
-        for path in args.native_result
+        _reviewer_result_for_storage(_load_json(path, label="a native reviewer result"))
+        for path in sources
     ]
     path = run_directory / "reviews" / "results.json"
     _write_json(path, {"results": results})
+    for source, result in zip(sources, results):
+        if source != path:
+            _scrub_reviewer_result_artifact(run_directory, source, result)
     return {
         "status": "collected",
         "native_results_path": str(path),
@@ -2118,33 +2150,59 @@ def _command_collect_native_results(args: argparse.Namespace) -> dict[str, Any]:
 
 def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     run_directory = _run_directory(args.run_dir)
-    report = _load_json(run_directory / "report.json", label="the bakeoff report")
-    run = _load_json(run_directory / "run.json", label="the bakeoff run")
+    report = _load_json(run_directory / "report.json", label="the replay report")
+    run = _load_json(run_directory / "run.json", label="the replay run")
     review_path = run_directory / "review.json"
     review_state = (
         _load_json(review_path, label="the review state") if review_path.is_file() else {}
     )
     availability = review_state.get("evaluator_availability")
-    availability = availability if isinstance(availability, list) else []
+    availability = (
+        [item for item in availability if isinstance(item, Mapping) and item.get("id") == "codex"]
+        if isinstance(availability, list)
+        else []
+    )
+    native_results_path = args.native_results.expanduser().resolve()
     combined = _load_json(
-        args.native_results.expanduser().resolve(),
+        native_results_path,
         label="the native reviewer results",
     )
     raw_results = combined.get("results")
     if not isinstance(raw_results, list):
-        raise BakeoffError("The reviewer results file has no result list.")
+        raise ReplayError("The reviewer results file has no result list.")
+    if (
+        len(raw_results) != 1
+        or not isinstance(raw_results[0], Mapping)
+        or raw_results[0].get("evaluator") != "codex"
+    ):
+        raise ReplayError("Evaluation requires exactly one Codex reviewer result.")
+    raw_results = [
+        _reviewer_result_for_storage(result) if isinstance(result, Mapping) else result
+        for result in raw_results
+    ]
+    review_directory = (run_directory / "reviews").resolve()
+    if native_results_path.parent == review_directory and native_results_path.name not in {
+        "candidate-a.json",
+        "candidate-b.json",
+    }:
+        _write_json(native_results_path, {"results": raw_results})
     normalized_results: dict[str, dict[str, Any]] = {}
     for path in getattr(args, "normalized_result", None) or ():
+        normalized_path = path.expanduser().resolve()
         result = _load_json(
-            path.expanduser().resolve(),
+            normalized_path,
             label="a normalized reviewer result",
         )
         normalization_for = result.get("normalization_for")
         if not isinstance(normalization_for, str) or not normalization_for:
-            raise BakeoffError("A normalized reviewer result has no normalization target.")
+            raise ReplayError("A normalized reviewer result has no normalization target.")
+        if normalization_for != "codex":
+            raise ReplayError("Only the Codex reviewer can require normalization.")
         if normalization_for in normalized_results:
-            raise BakeoffError(f"More than one normalized result targets {normalization_for}.")
-        normalized_results[normalization_for] = result
+            raise ReplayError(f"More than one normalized result targets {normalization_for}.")
+        sanitized = _reviewer_result_for_storage(result)
+        normalized_results[normalization_for] = sanitized
+        _scrub_reviewer_result_artifact(run_directory, normalized_path, sanitized)
     reviews: list[dict[str, Any]] = []
     normalization_requests: list[dict[str, Any]] = []
     for result in raw_results:
@@ -2162,19 +2220,25 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
             continue
-        raw_ballot = str(result.get("final_output") or "")
+        recorded_ballot = result.get("ballot")
+        raw_ballot = (
+            json.dumps(recorded_ballot, ensure_ascii=False)
+            if isinstance(recorded_ballot, Mapping)
+            else str(result.get("final_output") or "")
+        )
         try:
             ballot = _execution().parse_review_ballot(raw_ballot)
+            if result.get("normalization_required") is True:
+                raise _execution().HistoricalExecutionError(
+                    "The reviewer ballot requires schema normalization."
+                )
         except Exception as error:
             normalized = normalized_results.get(evaluator)
             if normalized is None:
                 normalization_requests.append(
                     _execution().prepare_review_normalization(
                         evaluator=evaluator,
-                        model=str(
-                            run.get("model")
-                            or (model if evaluator == "codex" else "gpt-5.6-sol")
-                        ),
+                        model=str(run.get("model") or model or "gpt-5.6-sol"),
                         raw_ballot=raw_ballot,
                     )
                 )
@@ -2183,7 +2247,6 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                         "evaluator": evaluator,
                         "model": model,
                         "status": "awaiting_normalization",
-                        "raw_ballot": raw_ballot,
                         "normalization": {
                             "required": True,
                             "status": "awaiting_native_task",
@@ -2192,7 +2255,12 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     }
                 )
                 continue
-            normalized_response = str(normalized.get("final_output") or "")
+            normalized_ballot = normalized.get("ballot")
+            normalized_response = (
+                json.dumps(normalized_ballot, ensure_ascii=False)
+                if isinstance(normalized_ballot, Mapping)
+                else str(normalized.get("final_output") or "")
+            )
             try:
                 ballot = _execution().parse_review_ballot(normalized_response)
             except Exception as normalization_error:
@@ -2202,8 +2270,6 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                         "model": model,
                         "status": "invalid",
                         "error": _redact(normalization_error),
-                        "raw_ballot": raw_ballot,
-                        "normalization_response": normalized_response,
                         "normalization": {
                             "required": True,
                             "status": "failed",
@@ -2223,9 +2289,6 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     "model": model,
                     "status": "completed",
                     "ballot": ballot,
-                    "raw_ballot": raw_ballot,
-                    "normalized_ballot": ballot,
-                    "normalization_response": normalized_response,
                     "normalization": {
                         "required": True,
                         "status": "completed",
@@ -2244,8 +2307,6 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 "model": model,
                 "status": "completed",
                 "ballot": ballot,
-                "raw_ballot": raw_ballot,
-                "normalized_ballot": ballot,
                 "normalization": {
                     "required": False,
                     "status": "not_required",
@@ -2257,8 +2318,7 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             "status": "awaiting_normalization",
             "candidate_mapping": {"A": "claude", "B": "codex"},
             "reviews": reviews,
-            "totals": {"A": 0, "B": 0},
-            "task_requests": normalization_requests,
+            "totals": {"A": None, "B": None},
             "evaluator_availability": availability,
         }
         report["evaluation"] = pending
@@ -2279,7 +2339,7 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         if valid
         else {
             "reviews": reviews,
-            "totals": {"A": 0, "B": 0},
+            "totals": {"A": None, "B": None},
         }
     )
     aggregate["status"] = "completed" if valid else "unavailable"
@@ -2287,11 +2347,7 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     aggregate["reviews"] = reviews
     aggregate["all_results"] = reviews
     aggregate["evaluator_availability"] = availability
-    aggregate["limitations"] = [
-        str(item.get("reason") or "Claude evaluator unavailable.")
-        for item in availability
-        if item.get("id") == "claude" and item.get("available") is not True
-    ]
+    aggregate["limitations"] = []
     report["evaluation"] = aggregate
     _write_report(run_directory, report)
     _write_json(run_directory / "review.json", aggregate)
@@ -2308,12 +2364,12 @@ def _command_report(args: argparse.Namespace) -> dict[str, Any]:
     run_directory = _run_directory(args.run_dir)
     report_path = run_directory / "report.json"
     if not report_path.is_file():
-        raise BakeoffError("The bakeoff report is not available yet.")
-    report = _load_json(report_path, label="the bakeoff report")
+        raise ReplayError("The replay report is not available yet.")
+    report = _load_json(report_path, label="the replay report")
     rendered_report = dict(report)
     run_path = run_directory / "run.json"
     if run_path.is_file():
-        run = _load_json(run_path, label="the bakeoff run")
+        run = _load_json(run_path, label="the replay run")
         replay = run.get("replay")
         if isinstance(replay, Mapping):
             rendered_report.setdefault(
@@ -2345,7 +2401,7 @@ def _command_latest(args: argparse.Namespace) -> dict[str, Any]:
         else []
     )
     if not runs:
-        raise BakeoffError("No bakeoff run is available.")
+        raise ReplayError("No replay run is available.")
     return _command_report(argparse.Namespace(run_dir=runs[0]))
 
 
@@ -2498,10 +2554,10 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--thread-id", required=True)
     collect.add_argument("--worktree", type=Path, required=True)
     collect.add_argument("--rollout", type=Path)
-    collect.add_argument("--evaluator", choices=("codex", "claude"))
+    collect.add_argument("--evaluator", choices=("codex",))
     collect.add_argument(
         "--normalization-for",
-        choices=("codex", "claude"),
+        choices=("codex",),
         help="Record one schema-normalization task result for this evaluator.",
     )
     _add_json(collect)
@@ -2511,14 +2567,9 @@ def build_parser() -> argparse.ArgumentParser:
     complete.add_argument("--native-result", type=Path, required=True)
     _add_json(complete)
 
-    verify = commands.add_parser("verify")
-    verify.add_argument("--run-dir", type=Path, required=True)
-    _add_json(verify)
-
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("--run-dir", type=Path, required=True)
-    evaluate.add_argument("--evaluator", action="append", choices=("codex", "claude"))
-    evaluate.add_argument("--claude-model", default="sonnet")
+    evaluate.add_argument("--evaluator", action="append", choices=("codex",))
     evaluate.add_argument("--evaluator-availability-json")
     _add_json(evaluate)
 
@@ -2551,7 +2602,7 @@ def build_parser() -> argparse.ArgumentParser:
 def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "sessions":
         if args.offset < 0:
-            raise BakeoffError("The session offset cannot be negative.")
+            raise ReplayError("The session offset cannot be negative.")
         return _command_sessions(args)
     if args.command == "replay":
         return {"status": "ok", "replay": _selected_replay(args)}
@@ -2591,12 +2642,10 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return _command_run(args)
     if args.command == "collect-native-result":
         if THREAD_PATTERN.fullmatch(args.thread_id) is None:
-            raise BakeoffError("The native thread ID is invalid.")
+            raise ReplayError("The native thread ID is invalid.")
         return _command_collect_native_result(args)
     if args.command == "complete-run":
         return _command_complete_run(args)
-    if args.command == "verify":
-        return _command_verify(args)
     if args.command == "evaluate":
         return _command_evaluate(args)
     if args.command == "collect-native-results":
@@ -2607,7 +2656,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return _command_report(args)
     if args.command == "latest":
         return _command_latest(args)
-    raise BakeoffError("Unknown command.")
+    raise ReplayError("Unknown command.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2615,7 +2664,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         payload = dispatch(args)
-    except BakeoffError as error:
+    except ReplayError as error:
         payload = {"status": "error", "error": _redact(error)}
         if getattr(args, "json", False):
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))

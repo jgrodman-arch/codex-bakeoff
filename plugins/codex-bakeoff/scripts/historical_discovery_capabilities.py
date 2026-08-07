@@ -429,8 +429,7 @@ def inspect_capabilities(
             continue
         equivalent_specs = NATIVE_SKILL_EQUIVALENTS.get(identity, ())
         equivalent_matches = [
-            (display_name, skills.get(local_name))
-            for local_name, display_name in equivalent_specs
+            (display_name, skills.get(local_name)) for local_name, display_name in equivalent_specs
         ]
         if equivalent_matches and all(match is not None for _, match in equivalent_matches):
             equivalent = " + ".join(display_name for display_name, _ in equivalent_matches)
@@ -638,9 +637,7 @@ def inspect_capabilities(
     return {
         "items": items,
         "summary": counts,
-        "unavailable_capabilities": [
-            item for item in items if item["status"] == "not_available"
-        ],
+        "unavailable_capabilities": [item for item in items if item["status"] == "not_available"],
         "resolution_actions": resolution_actions,
         "known_readiness_action_ids": sorted(known_readiness),
         "verified_readiness_action_ids": sorted(applied_readiness),

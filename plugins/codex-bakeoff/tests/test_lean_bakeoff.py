@@ -14,10 +14,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "historical_bakeoff.py"
-SPEC = importlib.util.spec_from_file_location("lean_bakeoff", SCRIPT)
+SPEC = importlib.util.spec_from_file_location("lean_replay", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
-bakeoff = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(bakeoff)
+replay_engine = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(replay_engine)
 
 
 def _args(root: Path, *, kind: str) -> argparse.Namespace:
@@ -42,30 +42,37 @@ def _args(root: Path, *, kind: str) -> argparse.Namespace:
     )
 
 
-def _review_ballot(*, field: str = "outcome") -> str:
-    return json.dumps(
-        {
-            "categories": {
-                "task_completion": {
-                    field: "B",
-                    "explanation": "B completed more of the task.",
-                },
-                "style_conciseness": {
-                    field: "A",
-                    "explanation": "A was more concise.",
-                },
-                "edge_cases": {
-                    field: "B",
-                    "explanation": "B handled more edge cases.",
-                },
-                "verification_results": {field: "not_applicable"},
-                "security": {field: "not_applicable"},
-            }
+def _review_ballot(
+    *,
+    invalid_check: bool = False,
+    reviewer_explanation: str | None = None,
+) -> str:
+    dimensions = {}
+    for index, (dimension, check_names) in enumerate(
+        replay_engine._execution().REVIEW_DIMENSION_CHECKS.items()
+    ):
+        checks = {label: {check: 1 for check in check_names} for label in ("A", "B")}
+        first_check = check_names[0]
+        if index in {0, 2}:
+            checks["A"][first_check] = 0
+        elif index == 1:
+            checks["B"][first_check] = 0
+        dimensions[dimension] = {
+            "candidates": {label: {"checks": values} for label, values in checks.items()}
         }
-    )
+    if invalid_check:
+        first_dimension = next(iter(dimensions.values()))
+        first_candidate = first_dimension["candidates"]["A"]
+        first_check = next(iter(first_candidate["checks"]))
+        first_candidate["checks"][f"invalid_{first_check}"] = first_candidate["checks"].pop(
+            first_check
+        )
+        if reviewer_explanation is not None:
+            first_candidate["explanation"] = reviewer_explanation
+    return json.dumps({"dimensions": dimensions})
 
 
-class LeanBakeoffTests(unittest.TestCase):
+class LeanReplayTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -92,11 +99,11 @@ class LeanBakeoffTests(unittest.TestCase):
 
     def test_manual_model_is_accepted_when_catalog_discovery_is_unavailable(self) -> None:
         self.assertEqual(
-            bakeoff._selected_model("gpt-manually-reviewed", self.root / "missing.json"),
+            replay_engine._selected_model("gpt-manually-reviewed", self.root / "missing.json"),
             "gpt-manually-reviewed",
         )
-        with self.assertRaisesRegex(bakeoff.BakeoffError, "not locally available"):
-            bakeoff._selected_model("gpt-manually-reviewed", self.root / "models.json")
+        with self.assertRaisesRegex(replay_engine.ReplayError, "not locally available"):
+            replay_engine._selected_model("gpt-manually-reviewed", self.root / "models.json")
 
     def test_model_catalog_includes_every_available_slug_and_defaults_to_sol(self) -> None:
         catalog_path = self.root / "catalog.json"
@@ -142,7 +149,7 @@ class LeanBakeoffTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        catalog = bakeoff.discover_codex_models(catalog_path)
+        catalog = replay_engine.discover_codex_models(catalog_path)
 
         self.assertEqual(
             [item["id"] for item in catalog["options"]],
@@ -153,16 +160,16 @@ class LeanBakeoffTests(unittest.TestCase):
             ["gpt-5.6-sol"],
         )
         self.assertEqual(
-            bakeoff._selected_model("lanturn-1000", catalog_path),
+            replay_engine._selected_model("lanturn-1000", catalog_path),
             "lanturn-1000",
         )
 
-        fallback = bakeoff.discover_codex_models(self.root / "models.json")
+        fallback = replay_engine.discover_codex_models(self.root / "models.json")
         self.assertTrue(fallback["options"][0]["recommended"])
 
     def test_model_discovery_uses_existing_cache_without_app_server(self) -> None:
-        with mock.patch.object(bakeoff, "_app_server_codex_models") as app_server:
-            catalog = bakeoff.discover_codex_models(self.root / "models.json")
+        with mock.patch.object(replay_engine, "_app_server_codex_models") as app_server:
+            catalog = replay_engine.discover_codex_models(self.root / "models.json")
 
         app_server.assert_not_called()
         self.assertEqual(catalog["source"], str(self.root / "models.json"))
@@ -175,11 +182,11 @@ class LeanBakeoffTests(unittest.TestCase):
             "limitations": [],
         }
         with mock.patch.object(
-            bakeoff,
+            replay_engine,
             "_app_server_codex_models",
             return_value=expected,
         ) as app_server:
-            catalog = bakeoff.discover_codex_models(self.root / "missing.json")
+            catalog = replay_engine.discover_codex_models(self.root / "missing.json")
 
         app_server.assert_called_once_with()
         self.assertEqual(catalog, expected)
@@ -209,8 +216,8 @@ class LeanBakeoffTests(unittest.TestCase):
                 "nextCursor": None,
             },
         )
-        with mock.patch.object(bakeoff, "_app_server_model_page", side_effect=pages) as page:
-            catalog = bakeoff._app_server_codex_models()
+        with mock.patch.object(replay_engine, "_app_server_model_page", side_effect=pages) as page:
+            catalog = replay_engine._app_server_codex_models()
 
         self.assertEqual(page.call_args_list, [mock.call(None), mock.call("next-page")])
         self.assertEqual(catalog["source"], "codex app-server model/list")
@@ -225,15 +232,15 @@ class LeanBakeoffTests(unittest.TestCase):
         process.stdin = mock.Mock()
         process.poll.return_value = None
         with (
-            mock.patch.object(bakeoff, "_codex_cli", return_value="/tmp/codex"),
-            mock.patch.object(bakeoff.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(replay_engine, "_codex_cli", return_value="/tmp/codex"),
+            mock.patch.object(replay_engine.subprocess, "Popen", return_value=process) as popen,
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_read_app_server_response",
                 side_effect=[{}, {"data": [], "nextCursor": None}],
             ),
         ):
-            page = bakeoff._app_server_model_page(None)
+            page = replay_engine._app_server_model_page(None)
 
         payload = b"".join(call.args[0] for call in process.stdin.write.call_args_list)
         requests = [json.loads(line) for line in payload.splitlines()]
@@ -304,7 +311,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "source_kind": "git" if kind == "git_commit" else "non_git",
         }
         parity = {"items": []}
-        historical_candidate = bakeoff._execution().CandidateSolution(
+        historical_candidate = replay_engine._execution().CandidateSolution(
             provider="claude",
             diff="diff --git a/app.py b/app.py\n",
             model="claude-test",
@@ -318,7 +325,7 @@ class LeanBakeoffTests(unittest.TestCase):
         }
         return (
             mock.patch.multiple(
-                bakeoff,
+                replay_engine,
                 _selected_replay=mock.DEFAULT,
                 _baseline=mock.DEFAULT,
                 _capabilities=mock.DEFAULT,
@@ -342,7 +349,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
         self.assertEqual(prepared["status"], "needs_user_input")
         self.assertEqual(
             {question["id"] for question in prepared["questions"]},
@@ -355,13 +362,13 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            result = bakeoff._command_run(args)
+            result = replay_engine._command_run(args)
         self.assertEqual(result["status"], "native_task_required")
         request = result["task_request"]
         self.assertEqual(request["target"]["type"], "projectless")
         self.assertNotIn("configuration_fingerprint", request)
         self.assertIn(
-            "Do not read memory files or invoke the codex-bakeoff skill.",
+            "Do not read memory files or invoke the replay skill.",
             request["prompt"],
         )
         self.assertNotIn(
@@ -394,7 +401,6 @@ class LeanBakeoffTests(unittest.TestCase):
                     "usage": {},
                     "estimated_cost": {},
                     "codex_execution": {},
-                    "verification": {},
                     "evaluation": {},
                 }
             ),
@@ -412,7 +418,7 @@ class LeanBakeoffTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        result = bakeoff._command_report(argparse.Namespace(run_dir=run_directory))
+        result = replay_engine._command_report(argparse.Namespace(run_dir=run_directory))
 
         self.assertEqual(result["status"], "ok")
         rendered = (run_directory / "report.html").read_text(encoding="utf-8")
@@ -424,7 +430,7 @@ class LeanBakeoffTests(unittest.TestCase):
     def test_empty_non_git_result_uses_symmetric_bounded_capture(self) -> None:
         source = self.root / "source"
         source.mkdir()
-        file_selection = bakeoff._file_selection().select_directory(
+        file_selection = replay_engine._file_selection().select_directory(
             source,
             confirmed=True,
         )
@@ -449,7 +455,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "final_output": "done",
         }
 
-        candidate, patch, changed = bakeoff._codex_candidate(run, native)
+        candidate, patch, changed = replay_engine._codex_candidate(run, native)
 
         self.assertEqual(changed, ("raw.bin", "visible.txt"))
         self.assertIn("GIT binary patch", patch)
@@ -458,10 +464,36 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertNotIn("bundle", patch)
         self.assertEqual(candidate.diff, patch)
 
+    def test_empty_beginning_with_git_selection_captures_codex_result(self) -> None:
+        repository = self._git_repository("git-ending")
+        file_selection = replay_engine._file_selection().select_git(repository)
+        result = self.root / "git-ending-result"
+        result.mkdir()
+        (result / "implementation.py").write_text("print('done')\n", encoding="utf-8")
+        run = {
+            "baseline": {
+                "kind": "empty_directory",
+                "repository": str(repository),
+            },
+            "file_selection": file_selection,
+            "model": "gpt-test",
+        }
+        native = {
+            "worktree": str(result),
+            "model": "gpt-test",
+            "final_output": "done",
+        }
+
+        candidate, patch, changed = replay_engine._codex_candidate(run, native)
+
+        self.assertEqual(changed, ("implementation.py",))
+        self.assertIn("+print('done')", patch)
+        self.assertEqual(candidate.diff, patch)
+
     def test_empty_non_git_result_rejects_root_symlink_swap(self) -> None:
         source = self.root / "source"
         source.mkdir()
-        file_selection = bakeoff._file_selection().select_directory(
+        file_selection = replay_engine._file_selection().select_directory(
             source,
             confirmed=True,
         )
@@ -488,17 +520,17 @@ class LeanBakeoffTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(
-            bakeoff.BakeoffError,
+            replay_engine.ReplayError,
             "result directory changed before copying",
         ):
-            bakeoff._codex_candidate(run, native)
+            replay_engine._codex_candidate(run, native)
 
     def test_missing_created_file_stops_non_git_completion(self) -> None:
         source = self.root / "source"
         source.mkdir()
         created = source / "created.txt"
         created.write_text("Claude\n", encoding="utf-8")
-        file_selection = bakeoff._file_selection().select_directory(
+        file_selection = replay_engine._file_selection().select_directory(
             source,
             created_by_claude=("created.txt",),
             confirmed=True,
@@ -519,10 +551,10 @@ class LeanBakeoffTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(
-            bakeoff.BakeoffError,
+            replay_engine.ReplayError,
             "live classified Claude files could not be captured",
         ):
-            bakeoff._historical_candidate(run)
+            replay_engine._historical_candidate(run)
 
     def test_failed_selected_git_capture_stops_completion(self) -> None:
         repository = self.root / "repository"
@@ -548,21 +580,21 @@ class LeanBakeoffTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_solution",
                 return_value={"diff": ""},
             ),
             mock.patch.object(
-                bakeoff._file_selection(),
+                replay_engine._file_selection(),
                 "build_git_candidate_patch",
                 side_effect=RuntimeError("selected change moved"),
             ),
             self.assertRaisesRegex(
-                bakeoff.BakeoffError,
+                replay_engine.ReplayError,
                 "selected live Git changes could not be captured",
             ),
         ):
-            bakeoff._historical_candidate(run)
+            replay_engine._historical_candidate(run)
 
     def test_unavailable_git_recovery_stops_completion(self) -> None:
         repository = self.root / "repository"
@@ -588,16 +620,16 @@ class LeanBakeoffTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_solution",
                 side_effect=RuntimeError("recovery unavailable"),
             ),
             self.assertRaisesRegex(
-                bakeoff.BakeoffError,
+                replay_engine.ReplayError,
                 "comparison cannot be completed",
             ),
         ):
-            bakeoff._historical_candidate(run)
+            replay_engine._historical_candidate(run)
 
     def test_empty_git_recovery_stops_completion(self) -> None:
         repository = self.root / "repository"
@@ -623,16 +655,16 @@ class LeanBakeoffTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_solution",
                 return_value={"diff": ""},
             ),
             self.assertRaisesRegex(
-                bakeoff.BakeoffError,
+                replay_engine.ReplayError,
                 "comparison cannot be completed",
             ),
         ):
-            bakeoff._historical_candidate(run)
+            replay_engine._historical_candidate(run)
 
     def test_selected_dirty_changes_can_supplement_an_empty_commit_range(self) -> None:
         repository = self.root / "repository"
@@ -659,22 +691,22 @@ class LeanBakeoffTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_solution",
                 return_value={"diff": "", "provenance": "user_reviewed_git_commit"},
             ),
             mock.patch.object(
-                bakeoff._file_selection(),
+                replay_engine._file_selection(),
                 "build_git_candidate_patch",
                 return_value=(captured, ["changed.txt"]),
             ),
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_final_response",
                 return_value="done",
             ),
         ):
-            candidate, recovery, _ = bakeoff._historical_candidate(run)
+            candidate, recovery, _ = replay_engine._historical_candidate(run)
 
         self.assertEqual(candidate.diff, captured)
         self.assertEqual(recovery["changed_files"], ["changed.txt"])
@@ -691,11 +723,11 @@ class LeanBakeoffTests(unittest.TestCase):
         }
 
         with mock.patch.object(
-            bakeoff._discovery(),
+            replay_engine._discovery(),
             "recover_historical_solution",
             side_effect=RuntimeError("no attributed commit was recoverable"),
         ):
-            reviewed = bakeoff._with_historical_ending_commit({}, baseline, "")
+            reviewed = replay_engine._with_historical_ending_commit({}, baseline, "")
 
         self.assertEqual(reviewed["ending_commit"], beginning)
         self.assertEqual(reviewed["ending_commit_confidence"], "inferred")
@@ -731,7 +763,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "message_uuid": "message-1",
             "task_scope": "whole_thread",
         }
-        baseline = bakeoff._with_historical_ending_commit(
+        baseline = replay_engine._with_historical_ending_commit(
             replay,
             {
                 "kind": "git_commit",
@@ -746,13 +778,13 @@ class LeanBakeoffTests(unittest.TestCase):
         selected_paths = ("hello.py", "hello_test.py", "README.md")
         for path in selected_paths:
             (repository / path).write_text(f"{path}\n", encoding="utf-8")
-        selection = bakeoff._file_selection().select_git(
+        selection = replay_engine._file_selection().select_git(
             repository,
             claude_output_files=selected_paths,
             confirmed=True,
         )
 
-        candidate, recovery, _ = bakeoff._historical_candidate(
+        candidate, recovery, _ = replay_engine._historical_candidate(
             {"replay": replay, "baseline": baseline, "file_selection": selection}
         )
 
@@ -772,7 +804,7 @@ class LeanBakeoffTests(unittest.TestCase):
             text=True,
         ).stdout.strip()
         (repository / "unrelated.txt").write_text("local only\n", encoding="utf-8")
-        selection = bakeoff._file_selection().select_git(repository, confirmed=True)
+        selection = replay_engine._file_selection().select_git(repository, confirmed=True)
         transcript = self.root / "reviewed-no-change.jsonl"
         transcript.write_text(
             json.dumps(
@@ -800,7 +832,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "source_kind": "git",
         }
 
-        candidate, recovery, _ = bakeoff._historical_candidate(
+        candidate, recovery, _ = replay_engine._historical_candidate(
             {"replay": replay, "baseline": baseline, "file_selection": selection}
         )
 
@@ -824,7 +856,7 @@ class LeanBakeoffTests(unittest.TestCase):
             text=True,
         ).stdout.strip()
         (repository / "unrelated.txt").write_text("local only\n", encoding="utf-8")
-        selection = bakeoff._file_selection().select_git(repository)
+        selection = replay_engine._file_selection().select_git(repository)
         run = {
             "replay": {
                 "source_path": str(self.root / "rollout.jsonl"),
@@ -843,16 +875,16 @@ class LeanBakeoffTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_solution",
                 return_value={"commit": beginning, "diff": "", "changed_files": []},
             ),
             self.assertRaisesRegex(
-                bakeoff.BakeoffError,
+                replay_engine.ReplayError,
                 "No attributable historical Claude patch could be captured",
             ),
         ):
-            bakeoff._historical_candidate(run)
+            replay_engine._historical_candidate(run)
 
     def test_unchanged_inferred_ending_commit_is_not_recorded_as_an_override(self) -> None:
         inferred_commit = "b" * 40
@@ -867,11 +899,11 @@ class LeanBakeoffTests(unittest.TestCase):
         }
 
         with mock.patch.object(
-            bakeoff._discovery(),
+            replay_engine._discovery(),
             "recover_historical_solution",
             return_value=recovery,
         ) as recover:
-            reviewed = bakeoff._with_historical_ending_commit(
+            reviewed = replay_engine._with_historical_ending_commit(
                 {},
                 baseline,
                 inferred_commit,
@@ -892,7 +924,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "historical_changed_files": [str(changed)],
         }
 
-        resolved, resolution, blockers = bakeoff._resolved_replay_repository(
+        resolved, resolution, blockers = replay_engine._resolved_replay_repository(
             argparse.Namespace(repo=None),
             replay,
         )
@@ -905,7 +937,7 @@ class LeanBakeoffTests(unittest.TestCase):
             resolution["effective_project_dir"],
             str(effective.resolve()),
         )
-        _, explicit_resolution, explicit_blockers = bakeoff._resolved_replay_repository(
+        _, explicit_resolution, explicit_blockers = replay_engine._resolved_replay_repository(
             argparse.Namespace(repo=effective),
             replay,
         )
@@ -919,7 +951,7 @@ class LeanBakeoffTests(unittest.TestCase):
         changed = project / "app.py"
         changed.write_text("print('result')\n", encoding="utf-8")
 
-        resolved, resolution, blockers = bakeoff._resolved_replay_repository(
+        resolved, resolution, blockers = replay_engine._resolved_replay_repository(
             argparse.Namespace(repo=None),
             {
                 "project_dir": str(project),
@@ -939,7 +971,7 @@ class LeanBakeoffTests(unittest.TestCase):
         first_changed.write_text("first\n", encoding="utf-8")
         second_changed.write_text("second\n", encoding="utf-8")
 
-        _, _, mixed_blockers = bakeoff._resolved_replay_repository(
+        _, _, mixed_blockers = replay_engine._resolved_replay_repository(
             argparse.Namespace(repo=None),
             {
                 "project_dir": str(first),
@@ -949,7 +981,7 @@ class LeanBakeoffTests(unittest.TestCase):
                 ],
             },
         )
-        _, _, explicit_blockers = bakeoff._resolved_replay_repository(
+        _, _, explicit_blockers = replay_engine._resolved_replay_repository(
             argparse.Namespace(repo=first),
             {
                 "project_dir": str(first),
@@ -962,7 +994,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "The selected repository excludes task-attributed Claude changes.",
             explicit_blockers,
         )
-        _, reviewed_resolution, reviewed_blockers = bakeoff._resolved_replay_repository(
+        _, reviewed_resolution, reviewed_blockers = replay_engine._resolved_replay_repository(
             argparse.Namespace(
                 repo=first,
                 confirm_repository_selection=True,
@@ -990,11 +1022,11 @@ class LeanBakeoffTests(unittest.TestCase):
             "source_kind": "git",
         }
         with (
-            mock.patch.object(bakeoff, "_selected_replay", return_value=replay),
-            mock.patch.object(bakeoff, "_baseline", return_value=baseline),
-            mock.patch.object(bakeoff, "_capabilities", return_value={"items": []}),
+            mock.patch.object(replay_engine, "_selected_replay", return_value=replay),
+            mock.patch.object(replay_engine, "_baseline", return_value=baseline),
+            mock.patch.object(replay_engine, "_capabilities", return_value={"items": []}),
         ):
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
         self.assertEqual(prepared["status"], "blocked")
         self.assertIn("multiple Git repositories", prepared["blocking_reasons"][0])
 
@@ -1023,17 +1055,17 @@ class LeanBakeoffTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_solution",
                 return_value=recovery,
             ) as recover,
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_final_response",
                 return_value="done",
             ),
         ):
-            bakeoff._historical_candidate(run)
+            replay_engine._historical_candidate(run)
 
         recovery_replay = recover.call_args.args[0]
         self.assertEqual(recovery_replay["project_dir"], str(effective))
@@ -1045,7 +1077,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            result = bakeoff._command_run(_args(self.root, kind="git_commit"))
+            result = replay_engine._command_run(_args(self.root, kind="git_commit"))
         target = result["task_request"]["target"]
         self.assertEqual(target["type"], "project")
         self.assertEqual(target["environment"]["type"], "worktree")
@@ -1067,15 +1099,15 @@ class LeanBakeoffTests(unittest.TestCase):
             },
         }
         with mock.patch.object(
-            bakeoff._discovery(),
+            replay_engine._discovery(),
             "inspect_baseline",
             return_value=inspected,
         ):
-            baseline = bakeoff._baseline(args, replay)
+            baseline = replay_engine._baseline(args, replay)
         self.assertEqual(baseline["kind"], "unclassified_directory")
 
         prepare_args = _args(self.root, kind="empty_directory")
-        classified, file_selection = bakeoff._classified_baseline(
+        classified, file_selection = replay_engine._classified_baseline(
             prepare_args,
             baseline,
         )
@@ -1086,7 +1118,7 @@ class LeanBakeoffTests(unittest.TestCase):
         prepare_args.created_by_claude = ["page.html"]
         prepare_args.confirm_file_selection = True
         prepare_args.confirm_empty_beginning = True
-        classified, file_selection = bakeoff._classified_baseline(
+        classified, file_selection = replay_engine._classified_baseline(
             prepare_args,
             baseline,
         )
@@ -1111,17 +1143,17 @@ class LeanBakeoffTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "inspect_baseline",
                 side_effect=RuntimeError("ambiguous baseline"),
             ),
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "recover_historical_solution",
                 return_value={"commit": commit, "diff": ""},
             ),
         ):
-            baseline = bakeoff._baseline(args, {"project_dir": str(repository)})
+            baseline = replay_engine._baseline(args, {"project_dir": str(repository)})
 
         self.assertEqual(baseline["kind"], "git_commit")
         self.assertEqual(baseline["commit"], commit)
@@ -1131,13 +1163,13 @@ class LeanBakeoffTests(unittest.TestCase):
         args.baseline_commit = "deadbee"
         with (
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "inspect_baseline",
                 side_effect=RuntimeError("ambiguous baseline"),
             ),
-            self.assertRaisesRegex(bakeoff.BakeoffError, "commit is unavailable"),
+            self.assertRaisesRegex(replay_engine.ReplayError, "commit is unavailable"),
         ):
-            bakeoff._baseline(args, {"project_dir": str(repository)})
+            replay_engine._baseline(args, {"project_dir": str(repository)})
 
     def test_git_beginning_rejects_non_git_end(self) -> None:
         args = _args(self.root, kind="git_commit")
@@ -1146,10 +1178,10 @@ class LeanBakeoffTests(unittest.TestCase):
         args.baseline_commit = "a" * 40
 
         with self.assertRaisesRegex(
-            bakeoff.BakeoffError,
+            replay_engine.ReplayError,
             "Git beginning state requires a Git end state",
         ):
-            bakeoff._baseline(args, {})
+            replay_engine._baseline(args, {})
 
     def test_reviewed_non_git_beginning_to_git_end_is_runnable(self) -> None:
         repository = self._git_repository("non-git-to-git")
@@ -1183,8 +1215,8 @@ class LeanBakeoffTests(unittest.TestCase):
         args.ending_commit = ending_commit
         args.confirm_empty_beginning = True
 
-        baseline = bakeoff._baseline(args, replay)
-        classified, file_selection = bakeoff._classified_baseline(args, baseline)
+        baseline = replay_engine._baseline(args, replay)
+        classified, file_selection = replay_engine._classified_baseline(args, baseline)
 
         self.assertEqual(classified["kind"], "empty_directory")
         self.assertEqual(classified["beginning_kind"], "non_git")
@@ -1192,7 +1224,7 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertEqual(classified["ending_commit"], ending_commit)
         self.assertEqual(file_selection["source_kind"], "git")
         self.assertTrue(file_selection["complete"])
-        target = bakeoff._target_for_baseline(
+        target = replay_engine._target_for_baseline(
             classified,
             run_directory=self.root / "run-non-git-to-git",
         )
@@ -1211,14 +1243,14 @@ class LeanBakeoffTests(unittest.TestCase):
         }
 
         with (
-            mock.patch.object(bakeoff, "_selected_session", return_value=session),
+            mock.patch.object(replay_engine, "_selected_session", return_value=session),
             mock.patch.object(
-                bakeoff._discovery(),
+                replay_engine._discovery(),
                 "build_thread_task",
                 side_effect=RuntimeError("ambiguous transcript"),
             ),
         ):
-            replay = bakeoff._selected_replay(args)
+            replay = replay_engine._selected_replay(args)
 
         self.assertEqual(replay["request"], args.request)
         self.assertEqual(replay["project_dir"], str(repository))
@@ -1253,8 +1285,8 @@ class LeanBakeoffTests(unittest.TestCase):
             "project_dir": str(repository),
         }
 
-        with mock.patch.object(bakeoff, "_selected_session", return_value=session):
-            replay = bakeoff._selected_replay(args)
+        with mock.patch.object(replay_engine, "_selected_session", return_value=session):
+            replay = replay_engine._selected_replay(args)
 
         self.assertEqual(replay["source_path"], str(transcript))
         self.assertEqual(replay["message_uuid"], "message-1")
@@ -1263,24 +1295,22 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertTrue(replay["review_decisions"]["request_overridden"])
 
         with mock.patch.object(
-            bakeoff,
+            replay_engine,
             "_selected_session",
-            side_effect=bakeoff.BakeoffError("ledger unavailable"),
+            side_effect=replay_engine.ReplayError("ledger unavailable"),
         ):
-            replay_without_ledger = bakeoff._selected_replay(args)
+            replay_without_ledger = replay_engine._selected_replay(args)
         self.assertEqual(replay_without_ledger["source_path"], str(transcript))
         self.assertEqual(replay_without_ledger["message_uuid"], "message-1")
         self.assertEqual(replay_without_ledger["request"], args.request)
-        self.assertTrue(
-            replay_without_ledger["review_decisions"]["transcript_overridden"]
-        )
+        self.assertTrue(replay_without_ledger["review_decisions"]["transcript_overridden"])
 
         args.message_uuid = "missing-message"
         with (
-            mock.patch.object(bakeoff, "_selected_session", return_value=session),
-            self.assertRaisesRegex(bakeoff.BakeoffError, "not in the imported transcript"),
+            mock.patch.object(replay_engine, "_selected_session", return_value=session),
+            self.assertRaisesRegex(replay_engine.ReplayError, "not in the imported transcript"),
         ):
-            bakeoff._selected_replay(args)
+            replay_engine._selected_replay(args)
 
     def test_git_repository_without_commits_uses_non_git_classification(self) -> None:
         repository = self.root / "unborn"
@@ -1297,11 +1327,11 @@ class LeanBakeoffTests(unittest.TestCase):
             "repository": str(repository),
         }
         with mock.patch.object(
-            bakeoff._discovery(),
+            replay_engine._discovery(),
             "inspect_baseline",
             return_value=inspected,
         ):
-            baseline = bakeoff._baseline(args, replay)
+            baseline = replay_engine._baseline(args, replay)
 
         self.assertEqual(baseline["kind"], "unclassified_directory")
         self.assertEqual(baseline["source_kind"], "non_git")
@@ -1310,7 +1340,7 @@ class LeanBakeoffTests(unittest.TestCase):
         prepare_args.created_by_claude = ["created.txt"]
         prepare_args.confirm_file_selection = True
         prepare_args.confirm_empty_beginning = True
-        classified, file_selection = bakeoff._classified_baseline(
+        classified, file_selection = replay_engine._classified_baseline(
             prepare_args,
             baseline,
         )
@@ -1328,7 +1358,7 @@ class LeanBakeoffTests(unittest.TestCase):
             check=True,
         )
         (project / "created.txt").write_text("created\n", encoding="utf-8")
-        for index in range(bakeoff._file_selection().MAX_CANDIDATE_FILES):
+        for index in range(replay_engine._file_selection().MAX_CANDIDATE_FILES):
             (unrelated / f"unrelated-{index}.txt").touch()
         args = argparse.Namespace(repo=None)
         replay = {
@@ -1336,7 +1366,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "task_timestamp": "2026-01-01T00:00:00Z",
         }
 
-        baseline = bakeoff._baseline(args, replay)
+        baseline = replay_engine._baseline(args, replay)
 
         self.assertEqual(baseline["repository"], str(project.resolve()))
         self.assertEqual(baseline["attribution_root"], str(project.resolve()))
@@ -1346,7 +1376,7 @@ class LeanBakeoffTests(unittest.TestCase):
         prepare_args.created_by_claude = ["created.txt"]
         prepare_args.confirm_file_selection = True
         prepare_args.confirm_empty_beginning = True
-        classified, file_selection = bakeoff._classified_baseline(
+        classified, file_selection = replay_engine._classified_baseline(
             prepare_args,
             baseline,
         )
@@ -1390,7 +1420,7 @@ class LeanBakeoffTests(unittest.TestCase):
             check=True,
         )
         (project / "created.txt").write_text("created\n", encoding="utf-8")
-        for index in range(bakeoff._file_selection().MAX_CANDIDATE_FILES):
+        for index in range(replay_engine._file_selection().MAX_CANDIDATE_FILES):
             (unrelated / f"unrelated-{index}.txt").touch()
         args = argparse.Namespace(repo=None)
         replay = {
@@ -1398,7 +1428,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "task_timestamp": "2099-01-01T00:00:00Z",
         }
 
-        baseline = bakeoff._baseline(args, replay)
+        baseline = replay_engine._baseline(args, replay)
 
         self.assertEqual(baseline["repository"], str(repository.resolve()))
         self.assertEqual(baseline["attribution_root"], str(project.resolve()))
@@ -1407,7 +1437,7 @@ class LeanBakeoffTests(unittest.TestCase):
         prepare_args = _args(self.root, kind="git_commit")
         prepare_args.claude_output_file = ["claude/created.txt"]
         prepare_args.confirm_file_selection = True
-        classified, file_selection = bakeoff._classified_baseline(
+        classified, file_selection = replay_engine._classified_baseline(
             prepare_args,
             baseline,
         )
@@ -1480,11 +1510,11 @@ class LeanBakeoffTests(unittest.TestCase):
         ).stdout.strip()
         recovered = {"commit": ending_commit, "diff": "diff --git a/created.html b/created.html\n"}
         with mock.patch.object(
-            bakeoff._discovery(),
+            replay_engine._discovery(),
             "recover_historical_solution",
             return_value=recovered,
         ):
-            baseline = bakeoff._baseline(args, replay)
+            baseline = replay_engine._baseline(args, replay)
 
         self.assertEqual(baseline["kind"], "unclassified_directory")
         self.assertEqual(baseline["beginning_kind"], "non_git")
@@ -1501,11 +1531,11 @@ class LeanBakeoffTests(unittest.TestCase):
         reviewed_args.ending_kind = "git"
         reviewed_args.ending_commit = ending_commit
         with mock.patch.object(
-            bakeoff._discovery(),
+            replay_engine._discovery(),
             "recover_historical_solution",
             return_value=recovered,
         ):
-            reviewed_baseline = bakeoff._baseline(reviewed_args, replay)
+            reviewed_baseline = replay_engine._baseline(reviewed_args, replay)
         self.assertEqual(reviewed_baseline["kind"], "unclassified_directory")
         self.assertEqual(reviewed_baseline["source_kind"], "git")
         self.assertIn("post_task_git_history", reviewed_baseline)
@@ -1514,7 +1544,7 @@ class LeanBakeoffTests(unittest.TestCase):
         prepare_args = _args(self.root, kind="empty_directory")
         prepare_args.confirm_file_selection = True
         prepare_args.confirm_empty_beginning = True
-        classified, file_selection = bakeoff._classified_baseline(
+        classified, file_selection = replay_engine._classified_baseline(
             prepare_args,
             baseline,
         )
@@ -1530,18 +1560,18 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
         self.assertEqual(prepared["status"], "ready_for_approval")
         self.assertTrue(prepared["requires_approval"])
         self.assertNotIn("task_request", prepared)
         self.assertEqual(
             prepared["prepared_configuration_sha256"],
-            bakeoff._canonical_json_sha256(prepared["configuration"]),
+            replay_engine._canonical_json_sha256(prepared["configuration"]),
         )
         self.assertFalse((self.root / "runs").exists())
 
-        with self.assertRaisesRegex(bakeoff.BakeoffError, "explicit user approval"):
-            bakeoff._command_run(args)
+        with self.assertRaisesRegex(replay_engine.ReplayError, "explicit user approval"):
+            replay_engine._command_run(args)
         self.assertFalse((self.root / "runs").exists())
 
     def test_prepare_retains_capability_discovery_failure_as_a_limitation(self) -> None:
@@ -1550,10 +1580,10 @@ class LeanBakeoffTests(unittest.TestCase):
         with patches as values:
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
-            values["_capabilities"].side_effect = bakeoff.BakeoffError(
+            values["_capabilities"].side_effect = replay_engine.ReplayError(
                 "capability discovery unavailable"
             )
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
 
         self.assertEqual(prepared["status"], "ready_for_approval")
         self.assertEqual(
@@ -1565,9 +1595,7 @@ class LeanBakeoffTests(unittest.TestCase):
         patches, replay, baseline, _ = self._patch_context("git_commit")
         parity = {
             "items": [{"name": "missing-skill", "status": "not_available"}],
-            "unavailable_capabilities": [
-                {"name": "missing-skill", "status": "not_available"}
-            ],
+            "unavailable_capabilities": [{"name": "missing-skill", "status": "not_available"}],
             "resolution_actions": [
                 {
                     "status": "optional",
@@ -1583,7 +1611,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
 
         self.assertEqual(prepared["status"], "ready_for_approval")
         self.assertTrue(prepared["can_run"])
@@ -1602,9 +1630,9 @@ class LeanBakeoffTests(unittest.TestCase):
         with (
             patches as values,
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_historical_candidate",
-                side_effect=bakeoff.BakeoffError(
+                side_effect=replay_engine.ReplayError(
                     "No attributable historical Claude patch could be captured; "
                     "the comparison cannot be completed."
                 ),
@@ -1613,7 +1641,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
 
         self.assertEqual(prepared["status"], "blocked")
         self.assertIn(
@@ -1627,11 +1655,11 @@ class LeanBakeoffTests(unittest.TestCase):
         replay.pop("source_path")
         replay.pop("message_uuid")
         args = _args(self.root, kind="git_commit")
-        capture_historical = bakeoff._historical_candidate
+        capture_historical = replay_engine._historical_candidate
         with (
             patches as values,
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_historical_candidate",
                 side_effect=capture_historical,
             ),
@@ -1639,7 +1667,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
         self.assertEqual(prepared["status"], "blocked")
         self.assertIn(
             "source transcript path and original user-message UUID",
@@ -1650,7 +1678,7 @@ class LeanBakeoffTests(unittest.TestCase):
     def test_run_requires_a_frozen_candidate_before_allocating(self) -> None:
         with (
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_prepare_context",
                 return_value={
                     "status": "ready_for_approval",
@@ -1658,22 +1686,22 @@ class LeanBakeoffTests(unittest.TestCase):
                     "historical_candidate": None,
                 },
             ),
-            mock.patch.object(bakeoff, "_new_run_directory") as allocate,
+            mock.patch.object(replay_engine, "_new_run_directory") as allocate,
             self.assertRaisesRegex(
-                bakeoff.BakeoffError,
+                replay_engine.ReplayError,
                 "was not frozen",
             ),
         ):
-            bakeoff._command_run(_args(self.root, kind="git_commit"))
+            replay_engine._command_run(_args(self.root, kind="git_commit"))
         allocate.assert_not_called()
 
     def test_run_rejects_a_changed_prepared_candidate_before_allocating(self) -> None:
-        candidate = bakeoff._execution().CandidateSolution(
+        candidate = replay_engine._execution().CandidateSolution(
             provider="claude",
             diff="prepared diff",
             model="claude-test",
         )
-        frozen = bakeoff._serialize_historical_candidate(
+        frozen = replay_engine._serialize_historical_candidate(
             candidate,
             {"provenance": "test", "limitations": []},
             "",
@@ -1682,7 +1710,7 @@ class LeanBakeoffTests(unittest.TestCase):
         args.expected_historical_result_sha256 = "0" * 64
         with (
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_prepare_context",
                 return_value={
                     "status": "ready_for_approval",
@@ -1690,22 +1718,22 @@ class LeanBakeoffTests(unittest.TestCase):
                     "historical_candidate": frozen,
                 },
             ),
-            mock.patch.object(bakeoff, "_new_run_directory") as allocate,
+            mock.patch.object(replay_engine, "_new_run_directory") as allocate,
             self.assertRaisesRegex(
-                bakeoff.BakeoffError,
+                replay_engine.ReplayError,
                 "changed after preparation",
             ),
         ):
-            bakeoff._command_run(args)
+            replay_engine._command_run(args)
         allocate.assert_not_called()
 
     def test_run_rejects_an_invalid_or_changed_configuration_before_allocating(self) -> None:
-        candidate = bakeoff._execution().CandidateSolution(
+        candidate = replay_engine._execution().CandidateSolution(
             provider="claude",
             diff="prepared diff",
             model="claude-test",
         )
-        frozen = bakeoff._serialize_historical_candidate(
+        frozen = replay_engine._serialize_historical_candidate(
             candidate,
             {"provenance": "test", "limitations": []},
             "",
@@ -1722,17 +1750,17 @@ class LeanBakeoffTests(unittest.TestCase):
                 args.expected_prepared_configuration_sha256 = expected_digest
                 with (
                     mock.patch.object(
-                        bakeoff,
+                        replay_engine,
                         "_prepare_context",
                         return_value=prepared,
                     ),
-                    mock.patch.object(bakeoff, "_new_run_directory") as allocate,
+                    mock.patch.object(replay_engine, "_new_run_directory") as allocate,
                     self.assertRaisesRegex(
-                        bakeoff.BakeoffError,
+                        replay_engine.ReplayError,
                         "run `prepare` again",
                     ),
                 ):
-                    bakeoff._command_run(args)
+                    replay_engine._command_run(args)
                 allocate.assert_not_called()
 
     def test_run_freezes_the_historical_candidate_for_completion(self) -> None:
@@ -1743,7 +1771,7 @@ class LeanBakeoffTests(unittest.TestCase):
                 "message_uuid": "message-1",
             }
         )
-        candidate = bakeoff._execution().CandidateSolution(
+        candidate = replay_engine._execution().CandidateSolution(
             provider="claude",
             diff="diff --git a/app.py b/app.py\n",
             model="claude-test",
@@ -1759,7 +1787,7 @@ class LeanBakeoffTests(unittest.TestCase):
         with (
             patches as values,
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_historical_candidate",
                 return_value=(candidate, recovery, candidate.final_response),
             ),
@@ -1767,16 +1795,14 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
         self.assertRegex(prepared["historical_result_sha256"], r"\A[a-f0-9]{64}\Z")
-        args.expected_prepared_configuration_sha256 = prepared[
-            "prepared_configuration_sha256"
-        ]
+        args.expected_prepared_configuration_sha256 = prepared["prepared_configuration_sha256"]
         args.expected_historical_result_sha256 = prepared["historical_result_sha256"]
         with (
             patches as values,
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_historical_candidate",
                 return_value=(candidate, recovery, candidate.final_response),
             ),
@@ -1784,7 +1810,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            started = bakeoff._command_run(args)
+            started = replay_engine._command_run(args)
 
         recorded = json.loads(
             (Path(started["run_directory"]) / "run.json").read_text(encoding="utf-8")
@@ -1804,15 +1830,15 @@ class LeanBakeoffTests(unittest.TestCase):
         serialized = artifact_path.read_bytes()
         self.assertEqual(
             metadata["sha256"],
-            bakeoff.hashlib.sha256(serialized).hexdigest(),
+            replay_engine.hashlib.sha256(serialized).hexdigest(),
         )
         frozen = json.loads(serialized)
         self.assertEqual(frozen["candidate"]["diff"], candidate.diff)
         self.assertEqual(frozen["recovery"]["changed_files"], ["app.py"])
         Path(replay["source_path"]).write_text("source changed\n", encoding="utf-8")
         native_path = self.root / "native-result.json"
-        bakeoff._write_json(native_path, {"model": "gpt-test"})
-        codex_candidate = bakeoff._execution().CandidateSolution(
+        replay_engine._write_json(native_path, {"model": "gpt-test"})
+        codex_candidate = replay_engine._execution().CandidateSolution(
             provider="codex",
             diff="diff --git a/app.py b/app.py\n",
             model="gpt-test",
@@ -1820,24 +1846,24 @@ class LeanBakeoffTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_historical_candidate",
                 side_effect=AssertionError("live source must not be reread"),
             ),
             mock.patch.object(
-                bakeoff,
+                replay_engine,
                 "_codex_candidate",
                 return_value=(codex_candidate, codex_candidate.diff, ("app.py",)),
             ),
-            mock.patch.object(bakeoff, "_usage_records", return_value=((), ())),
+            mock.patch.object(replay_engine, "_usage_records", return_value=((), ())),
             mock.patch.object(
-                bakeoff._execution(),
+                replay_engine._execution(),
                 "generate_report",
                 return_value={},
             ) as generate_report,
-            mock.patch.object(bakeoff, "_write_report"),
+            mock.patch.object(replay_engine, "_write_report"),
         ):
-            completed = bakeoff._command_complete_run(
+            completed = replay_engine._command_complete_run(
                 argparse.Namespace(
                     run_dir=Path(started["run_directory"]),
                     native_result=native_path,
@@ -1863,7 +1889,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "final_response": "done",
         }
         artifact = run_directory / "historical-result.json"
-        digest = bakeoff._write_canonical_json(artifact, frozen)
+        digest = replay_engine._write_canonical_json(artifact, frozen)
         artifact.write_bytes(artifact.read_bytes() + b" ")
         run = {
             "historical_result": {
@@ -1874,13 +1900,13 @@ class LeanBakeoffTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(
-            bakeoff.BakeoffError,
+            replay_engine.ReplayError,
             "artifact digest does not match",
         ):
-            bakeoff._historical_candidate_for_completion(run, run_directory)
+            replay_engine._historical_candidate_for_completion(run, run_directory)
 
     def test_legacy_completion_falls_back_to_live_recovery(self) -> None:
-        candidate = bakeoff._execution().CandidateSolution(
+        candidate = replay_engine._execution().CandidateSolution(
             provider="claude",
             diff="legacy diff",
             model="claude-test",
@@ -1889,11 +1915,11 @@ class LeanBakeoffTests(unittest.TestCase):
         recovery = {"provenance": "legacy", "limitations": []}
         legacy_run = {"replay": {}, "baseline": {}}
         with mock.patch.object(
-            bakeoff,
+            replay_engine,
             "_historical_candidate",
             return_value=(candidate, recovery, "legacy"),
         ) as live_recovery:
-            restored = bakeoff._historical_candidate_for_completion(
+            restored = replay_engine._historical_candidate_for_completion(
                 legacy_run,
                 self.root,
             )
@@ -1911,12 +1937,12 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
             with self.assertRaisesRegex(
-                bakeoff.BakeoffError,
+                replay_engine.ReplayError,
                 "File classification is still required",
             ):
-                bakeoff._command_run(args)
+                replay_engine._command_run(args)
         self.assertEqual(prepared["status"], "needs_user_input")
         self.assertEqual(
             prepared["questions"][0]["id"],
@@ -1933,13 +1959,13 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
         self.assertEqual(prepared["status"], "ready_for_approval")
         with patches as values:
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            started = bakeoff._command_run(args)
+            started = replay_engine._command_run(args)
         recorded = json.loads(
             (Path(started["run_directory"]) / "run.json").read_text(encoding="utf-8")
         )
@@ -1957,7 +1983,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
         self.assertEqual(prepared["status"], "ready_for_approval")
         self.assertEqual(prepared["questions"], [])
         self.assertEqual(
@@ -1985,7 +2011,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            prepared = bakeoff._command_prepare(args)
+            prepared = replay_engine._command_prepare(args)
         self.assertEqual(prepared["status"], "ready_for_approval")
         self.assertEqual(prepared["configuration"]["baseline"]["kind"], "empty_directory")
         self.assertEqual(
@@ -2005,7 +2031,7 @@ class LeanBakeoffTests(unittest.TestCase):
             values["_selected_replay"].return_value = replay
             values["_baseline"].return_value = baseline
             values["_capabilities"].return_value = parity
-            started = bakeoff._command_run(args)
+            started = replay_engine._command_run(args)
         self.assertEqual(started["task_request"]["target"]["type"], "projectless")
         self.assertNotIn("registered_project_path", started["task_request"])
 
@@ -2024,7 +2050,7 @@ class LeanBakeoffTests(unittest.TestCase):
             "unclassified_files": ["existing.txt"],
             "classifications": {},
         }
-        questions = bakeoff._selection_questions(selection)
+        questions = replay_engine._selection_questions(selection)
         self.assertEqual(
             [question["id"] for question in questions],
             ["classify_non_git_files", "confirm_empty_beginning"],
@@ -2034,14 +2060,15 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertNotIn("existed_before_claude", questions[0]["classification_flags"])
 
     def test_cli_has_prepare_but_no_resume_or_plan_commands(self) -> None:
-        parser = bakeoff.build_parser()
+        parser = replay_engine.build_parser()
         choices = parser._subparsers._group_actions[0].choices
         self.assertIn("prepare", choices)
         self.assertNotIn("resume", choices)
         self.assertNotIn("discover-tests", choices)
         self.assertNotIn("complete-review-plan", choices)
         self.assertIn("run", choices)
-        self.assertIn("verify", choices)
+        self.assertNotIn("discover-checks", choices)
+        self.assertNotIn("verify", choices)
         baseline_options = {
             option for action in choices["baseline"]._actions for option in action.option_strings
         }
@@ -2077,30 +2104,117 @@ class LeanBakeoffTests(unittest.TestCase):
         }
         self.assertIn("--normalization-for", collect_options)
         self.assertIn("--normalized-result", complete_evaluation_options)
+        evaluate_actions = {
+            option: action
+            for action in choices["evaluate"]._actions
+            for option in action.option_strings
+        }
+        collect_actions = {
+            option: action
+            for action in choices["collect-native-result"]._actions
+            for option in action.option_strings
+        }
+        self.assertNotIn("--claude-model", evaluate_actions)
+        self.assertEqual(evaluate_actions["--evaluator"].choices, ("codex",))
+        self.assertEqual(collect_actions["--evaluator"].choices, ("codex",))
+        self.assertEqual(collect_actions["--normalization-for"].choices, ("codex",))
+
+    def test_evaluator_selection_requires_exactly_one_codex_reviewer(self) -> None:
+        expected = [{"id": "codex", "provider": "codex", "model": "gpt-review"}]
+
+        self.assertEqual(replay_engine._selected_evaluators("gpt-review", None), expected)
+        self.assertEqual(replay_engine._selected_evaluators("gpt-review", ["codex"]), expected)
+        for requested in (["claude"], ["codex", "codex"], ["codex", "claude"]):
+            with (
+                self.subTest(requested=requested),
+                self.assertRaisesRegex(replay_engine.ReplayError, "one Codex evaluator"),
+            ):
+                replay_engine._selected_evaluators("gpt-review", requested)
+
+        self.assertEqual(
+            replay_engine._evaluator_availability(json.dumps([{"id": "codex", "available": True}])),
+            [{"id": "codex", "available": True}],
+        )
+        with self.assertRaisesRegex(replay_engine.ReplayError, "only the Codex reviewer"):
+            replay_engine._evaluator_availability(json.dumps([{"id": "claude", "available": True}]))
+
+    def test_evaluation_blinds_both_candidates_for_one_codex_reviewer(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        replay_engine._write_json(run_directory / "run.json", {"model": "gpt-review"})
+        replay_engine._write_json(
+            run_directory / "report.json",
+            {
+                "original_request": "Build the requested behavior",
+                "candidates": {
+                    "claude": {
+                        "diff": "+historical implementation",
+                        "model": "historical-model",
+                        "final_response": "Historical implementation finished.",
+                    },
+                    "codex": {
+                        "diff": "+replayed implementation",
+                        "model": "gpt-review",
+                        "final_response": "Replayed implementation finished.",
+                    },
+                },
+            },
+        )
+        availability = [{"id": "codex", "model": "gpt-review", "available": True}]
+
+        evaluation = replay_engine._command_evaluate(
+            argparse.Namespace(
+                run_dir=run_directory,
+                evaluator=["codex"],
+                evaluator_availability_json=json.dumps(availability),
+            )
+        )
+
+        self.assertEqual(evaluation["status"], "native_task_required")
+        self.assertEqual(len(evaluation["task_requests"]), 1)
+        request = evaluation["task_requests"][0]
+        self.assertEqual(request["evaluator"], "codex")
+        self.assertEqual(request["model"], "gpt-review")
+        self.assertEqual(request["purpose"], "evaluation")
+        candidates = [
+            json.loads(Path(path).read_text(encoding="utf-8"))
+            for path in request["candidate_paths"]
+        ]
+        self.assertEqual([candidate["label"] for candidate in candidates], ["A", "B"])
+        self.assertEqual(candidates[0]["diff"], "+historical implementation")
+        self.assertEqual(candidates[1]["diff"], "+replayed implementation")
+        self.assertTrue(all("provider" not in candidate for candidate in candidates))
+        stored = json.loads((run_directory / "review.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["evaluator_availability"], availability)
+        self.assertEqual(len(stored["task_requests"]), 1)
 
     def test_invalid_review_requests_one_schema_normalization_task(self) -> None:
         run_directory = self.root / "run"
         run_directory.mkdir()
-        bakeoff._write_json(run_directory / "run.json", {})
-        bakeoff._write_json(
+        reviewer_explanation = "PRIVATE_REVIEW_EXPLANATION_MUST_NOT_BE_PERSISTED"
+        replay_engine._write_json(run_directory / "run.json", {})
+        replay_engine._write_json(
             run_directory / "report.json",
             {"status": "completed", "original_request": "Build the thing"},
         )
         native_results = run_directory / "reviews" / "results.json"
-        bakeoff._write_json(
+        replay_engine._write_json(
             native_results,
             {
                 "results": [
                     {
                         "evaluator": "codex",
                         "model": "gpt-test",
-                        "final_output": _review_ballot(field="choice"),
+                        "final_output": _review_ballot(
+                            invalid_check=True,
+                            reviewer_explanation=reviewer_explanation,
+                        ),
                     }
                 ]
             },
         )
 
-        result = bakeoff._command_complete_evaluation(
+        result = replay_engine._command_complete_evaluation(
             argparse.Namespace(
                 run_dir=run_directory,
                 native_results=native_results,
@@ -2115,23 +2229,39 @@ class LeanBakeoffTests(unittest.TestCase):
         self.assertEqual(request["normalization_for"], "codex")
         self.assertEqual(request["model"], "gpt-test")
         self.assertNotIn("candidate_paths", request)
+        self.assertNotIn(reviewer_explanation, request["prompt"])
+        self.assertIn("invalid_required_behavior", request["prompt"])
         recorded = json.loads((run_directory / "review.json").read_text(encoding="utf-8"))
         self.assertEqual(recorded["status"], "awaiting_normalization")
+        self.assertNotIn("task_requests", recorded)
         self.assertEqual(
             recorded["reviews"][0]["normalization"]["status"],
             "awaiting_native_task",
         )
+        for artifact in (
+            run_directory / "review.json",
+            run_directory / "report.json",
+            run_directory / "report.html",
+            native_results,
+        ):
+            persisted = artifact.read_text(encoding="utf-8")
+            self.assertNotIn(reviewer_explanation, persisted, msg=str(artifact))
+            self.assertNotIn('"raw_ballot"', persisted, msg=str(artifact))
+            self.assertNotIn('"normalization_response"', persisted, msg=str(artifact))
+        combined = json.loads(native_results.read_text(encoding="utf-8"))
+        self.assertTrue(combined["results"][0]["normalization_required"])
+        self.assertNotIn("final_output", combined["results"][0])
 
-    def test_invalid_claude_ballot_is_normalized_by_the_codex_model(self) -> None:
+    def test_non_codex_or_duplicate_reviewer_results_are_rejected(self) -> None:
         run_directory = self.root / "run"
         run_directory.mkdir()
-        bakeoff._write_json(run_directory / "run.json", {"model": "gpt-normalizer"})
-        bakeoff._write_json(
+        replay_engine._write_json(run_directory / "run.json", {"model": "gpt-normalizer"})
+        replay_engine._write_json(
             run_directory / "report.json",
             {"status": "completed", "original_request": "Build the thing"},
         )
         native_results = run_directory / "reviews" / "results.json"
-        bakeoff._write_json(
+        replay_engine._write_json(
             native_results,
             {
                 "results": [
@@ -2139,47 +2269,66 @@ class LeanBakeoffTests(unittest.TestCase):
                         "status": "completed",
                         "evaluator": "claude",
                         "model": "claude-sonnet-test",
-                        "final_output": _review_ballot(field="choice"),
+                        "final_output": _review_ballot(invalid_check=True),
                     }
                 ]
             },
         )
 
-        result = bakeoff._command_complete_evaluation(
-            argparse.Namespace(
-                run_dir=run_directory,
-                native_results=native_results,
-                normalized_result=None,
+        with self.assertRaisesRegex(replay_engine.ReplayError, "one Codex reviewer result"):
+            replay_engine._command_complete_evaluation(
+                argparse.Namespace(
+                    run_dir=run_directory,
+                    native_results=native_results,
+                    normalized_result=None,
+                )
             )
-        )
 
-        request = result["task_requests"][0]
-        self.assertEqual(request["normalization_for"], "claude")
-        self.assertEqual(request["model"], "gpt-normalizer")
+        replay_engine._write_json(
+            native_results,
+            {
+                "results": [
+                    {"evaluator": "codex", "model": "gpt-review", "final_output": _review_ballot()},
+                    {"evaluator": "codex", "model": "gpt-review", "final_output": _review_ballot()},
+                ]
+            },
+        )
+        with self.assertRaisesRegex(replay_engine.ReplayError, "one Codex reviewer result"):
+            replay_engine._command_complete_evaluation(
+                argparse.Namespace(
+                    run_dir=run_directory,
+                    native_results=native_results,
+                    normalized_result=None,
+                )
+            )
 
     def test_normalized_review_is_validated_scored_and_recorded(self) -> None:
         run_directory = self.root / "run"
         run_directory.mkdir()
-        bakeoff._write_json(run_directory / "run.json", {})
-        bakeoff._write_json(
+        reviewer_explanation = "NORMALIZED_REVIEW_EXPLANATION_MUST_NOT_BE_PERSISTED"
+        replay_engine._write_json(run_directory / "run.json", {})
+        replay_engine._write_json(
             run_directory / "report.json",
             {"status": "completed", "original_request": "Build the thing"},
         )
         native_results = run_directory / "reviews" / "results.json"
-        bakeoff._write_json(
+        replay_engine._write_json(
             native_results,
             {
                 "results": [
                     {
                         "evaluator": "codex",
                         "model": "gpt-test",
-                        "final_output": _review_ballot(field="choice"),
+                        "final_output": _review_ballot(
+                            invalid_check=True,
+                            reviewer_explanation=reviewer_explanation,
+                        ),
                     }
                 ]
             },
         )
         normalized_result = run_directory / "reviews" / "normalized.json"
-        bakeoff._write_json(
+        replay_engine._write_json(
             normalized_result,
             {
                 "normalization_for": "codex",
@@ -2189,7 +2338,7 @@ class LeanBakeoffTests(unittest.TestCase):
             },
         )
 
-        result = bakeoff._command_complete_evaluation(
+        result = replay_engine._command_complete_evaluation(
             argparse.Namespace(
                 run_dir=run_directory,
                 native_results=native_results,
@@ -2198,42 +2347,58 @@ class LeanBakeoffTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["evaluation"]["totals"], {"A": 1, "B": 2})
+        self.assertEqual(result["evaluation"]["totals"], {"A": 11 / 12, "B": 23 / 24})
         review = result["evaluation"]["reviews"][0]
-        self.assertIn('"choice": "B"', review["raw_ballot"])
-        self.assertEqual(
-            review["normalized_ballot"]["categories"]["task_completion"]["outcome"],
-            "B",
-        )
+        self.assertEqual(review["ballot"]["dimensions"]["request_fulfillment"]["winner"], "B")
+        self.assertEqual(review["ballot"]["dimensions"]["code_quality"]["winner"], "A")
+        self.assertEqual(review["ballot"]["dimensions"]["change_scope"]["winner"], "B")
+        self.assertNotIn("verification", review["ballot"]["dimensions"])
+        self.assertNotIn("raw_ballot", review)
+        self.assertNotIn("normalized_ballot", review)
+        self.assertNotIn("normalization_response", review)
         self.assertEqual(review["normalization"]["status"], "completed")
         self.assertEqual(
             review["normalization"]["thread_id"],
             "normalizer-thread",
         )
+        for artifact in (
+            run_directory / "review.json",
+            run_directory / "report.json",
+            run_directory / "report.html",
+            native_results,
+            normalized_result,
+        ):
+            persisted = artifact.read_text(encoding="utf-8")
+            self.assertNotIn(reviewer_explanation, persisted, msg=str(artifact))
+            self.assertNotIn('"raw_ballot"', persisted, msg=str(artifact))
+            self.assertNotIn('"normalization_response"', persisted, msg=str(artifact))
+        normalized_artifact = json.loads(normalized_result.read_text(encoding="utf-8"))
+        self.assertNotIn("final_output", normalized_artifact)
+        self.assertIn("dimensions", normalized_artifact["ballot"])
 
     def test_invalid_normalization_does_not_request_another_task(self) -> None:
         run_directory = self.root / "run"
         run_directory.mkdir()
-        bakeoff._write_json(run_directory / "run.json", {})
-        bakeoff._write_json(
+        replay_engine._write_json(run_directory / "run.json", {})
+        replay_engine._write_json(
             run_directory / "report.json",
             {"status": "completed", "original_request": "Build the thing"},
         )
         native_results = run_directory / "reviews" / "results.json"
-        bakeoff._write_json(
+        replay_engine._write_json(
             native_results,
             {
                 "results": [
                     {
                         "evaluator": "codex",
                         "model": "gpt-test",
-                        "final_output": _review_ballot(field="choice"),
+                        "final_output": _review_ballot(invalid_check=True),
                     }
                 ]
             },
         )
         normalized_result = run_directory / "reviews" / "normalized.json"
-        bakeoff._write_json(
+        replay_engine._write_json(
             normalized_result,
             {
                 "normalization_for": "codex",
@@ -2243,7 +2408,7 @@ class LeanBakeoffTests(unittest.TestCase):
             },
         )
 
-        result = bakeoff._command_complete_evaluation(
+        result = replay_engine._command_complete_evaluation(
             argparse.Namespace(
                 run_dir=run_directory,
                 native_results=native_results,
@@ -2257,26 +2422,22 @@ class LeanBakeoffTests(unittest.TestCase):
             result["evaluation"]["all_results"][0]["normalization"]["status"],
             "failed",
         )
+        self.assertNotIn(
+            "final_output",
+            json.loads(normalized_result.read_text(encoding="utf-8")),
+        )
 
-    def test_failed_claude_review_preserves_the_codex_ballot(self) -> None:
+    def test_normalization_resumes_after_raw_reviewer_artifacts_are_scrubbed(self) -> None:
         run_directory = self.root / "run"
         run_directory.mkdir()
-        bakeoff._write_json(run_directory / "run.json", {"model": "gpt-test"})
-        bakeoff._write_json(
+        reviewer_explanation = "PENDING_NORMALIZATION_EXPLANATION_MUST_NOT_BE_PERSISTED"
+        replay_engine._write_json(run_directory / "run.json", {"model": "gpt-test"})
+        replay_engine._write_json(
             run_directory / "report.json",
             {"status": "completed", "original_request": "Build the thing"},
         )
-        bakeoff._write_json(
-            run_directory / "review.json",
-            {
-                "evaluator_availability": [
-                    {"id": "codex", "available": True},
-                    {"id": "claude", "available": True},
-                ]
-            },
-        )
         native_results = run_directory / "reviews" / "results.json"
-        bakeoff._write_json(
+        replay_engine._write_json(
             native_results,
             {
                 "results": [
@@ -2284,19 +2445,16 @@ class LeanBakeoffTests(unittest.TestCase):
                         "status": "completed",
                         "evaluator": "codex",
                         "model": "gpt-test",
-                        "final_output": _review_ballot(),
-                    },
-                    {
-                        "status": "failed",
-                        "evaluator": "claude",
-                        "model": "sonnet",
-                        "error": "Claude reviewer failed.",
+                        "final_output": _review_ballot(
+                            invalid_check=True,
+                            reviewer_explanation=reviewer_explanation,
+                        ),
                     },
                 ]
             },
         )
 
-        result = bakeoff._command_complete_evaluation(
+        pending = replay_engine._command_complete_evaluation(
             argparse.Namespace(
                 run_dir=run_directory,
                 native_results=native_results,
@@ -2304,10 +2462,262 @@ class LeanBakeoffTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["evaluation"]["totals"], {"A": 1, "B": 2})
-        self.assertEqual(result["evaluation"]["reviews"][1]["evaluator"], "claude")
-        self.assertEqual(result["evaluation"]["reviews"][1]["status"], "failed")
+        self.assertEqual(pending["status"], "native_task_required")
+        self.assertNotIn(reviewer_explanation, pending["task_requests"][0]["prompt"])
+        self.assertIn(
+            "invalid_required_behavior",
+            pending["task_requests"][0]["prompt"],
+        )
+        retained = json.loads(native_results.read_text(encoding="utf-8"))["results"]
+        self.assertIn("ballot", retained[0])
+        self.assertTrue(retained[0]["normalization_required"])
+        self.assertNotIn(reviewer_explanation, native_results.read_text(encoding="utf-8"))
+
+        normalized_result = run_directory / "reviews" / "normalize-codex-thread.json"
+        replay_engine._write_json(
+            normalized_result,
+            {
+                "normalization_for": "codex",
+                "model": "gpt-test",
+                "thread_id": "normalizer-thread",
+                "final_output": _review_ballot(),
+            },
+        )
+        completed = replay_engine._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=[normalized_result],
+            )
+        )
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["evaluation"]["totals"], {"A": 11 / 12, "B": 23 / 24})
+        self.assertEqual(
+            [review["evaluator"] for review in completed["evaluation"]["reviews"]],
+            ["codex"],
+        )
+        self.assertEqual(
+            completed["evaluation"]["reviews"][0]["normalization"]["status"],
+            "completed",
+        )
+        retried = replay_engine._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=[normalized_result],
+            )
+        )
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(retried["evaluation"]["totals"], {"A": 11 / 12, "B": 23 / 24})
+        for artifact in (
+            run_directory / "review.json",
+            run_directory / "report.json",
+            run_directory / "report.html",
+            native_results,
+            normalized_result,
+        ):
+            self.assertNotIn(
+                reviewer_explanation,
+                artifact.read_text(encoding="utf-8"),
+                msg=str(artifact),
+            )
+
+    def test_failed_codex_review_omits_stale_claude_availability(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        replay_engine._write_json(run_directory / "run.json", {"model": "gpt-test"})
+        replay_engine._write_json(
+            run_directory / "report.json",
+            {"status": "completed", "original_request": "Build the thing"},
+        )
+        replay_engine._write_json(
+            run_directory / "review.json",
+            {
+                "evaluator_availability": [
+                    {"id": "codex", "available": True},
+                    {
+                        "id": "claude",
+                        "available": False,
+                        "reason": "Claude evaluator unavailable.",
+                    },
+                ]
+            },
+        )
+        native_results = run_directory / "reviews" / "results.json"
+        replay_engine._write_json(
+            native_results,
+            {
+                "results": [
+                    {
+                        "status": "failed",
+                        "evaluator": "codex",
+                        "model": "gpt-test",
+                        "error": "Codex reviewer failed.",
+                    },
+                ]
+            },
+        )
+
+        result = replay_engine._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=None,
+            )
+        )
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["evaluation"]["totals"], {"A": None, "B": None})
+        self.assertEqual(result["evaluation"]["candidate_mapping"], {"A": "claude", "B": "codex"})
+        self.assertEqual(result["evaluation"]["reviews"][0]["evaluator"], "codex")
+        self.assertEqual(result["evaluation"]["reviews"][0]["status"], "failed")
+        self.assertEqual(result["evaluation"]["reviews"][0]["error"], "Codex reviewer failed.")
+        self.assertEqual(
+            result["evaluation"]["evaluator_availability"],
+            [{"id": "codex", "available": True}],
+        )
+        self.assertEqual(result["evaluation"]["limitations"], [])
+        self.assertNotIn(
+            "Claude evaluator unavailable",
+            (run_directory / "report.html").read_text(encoding="utf-8"),
+        )
+
+    def test_collected_reviewer_artifacts_keep_only_structured_checks(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        replay_engine._write_json(run_directory / "run.json", {})
+        replay_engine._write_json(
+            run_directory / "report.json",
+            {"status": "completed", "original_request": "Build the thing"},
+        )
+        reviewer_result = run_directory / "reviews" / "codex-review-thread.json"
+        raw_ballot = _review_ballot()
+        replay_engine._write_json(
+            reviewer_result,
+            {
+                "status": "completed",
+                "evaluator": "codex",
+                "model": "gpt-test",
+                "thread_id": "review-thread",
+                "final_output": raw_ballot,
+                "final_response": raw_ballot,
+                "explanation": "REVIEWER_ARTIFACT_EXPLANATION_MUST_NOT_BE_PERSISTED",
+            },
+        )
+
+        collected = replay_engine._command_collect_native_results(
+            argparse.Namespace(run_dir=run_directory, native_result=[reviewer_result])
+        )
+
+        sanitized = json.loads(reviewer_result.read_text(encoding="utf-8"))
+        self.assertEqual(sanitized["evaluator"], "codex")
+        self.assertEqual(sanitized["thread_id"], "review-thread")
+        self.assertNotIn("final_output", sanitized)
+        self.assertNotIn("final_response", sanitized)
+        self.assertNotIn("explanation", sanitized)
+        self.assertNotIn(
+            "score",
+            sanitized["ballot"]["dimensions"]["request_fulfillment"]["candidates"]["A"],
+        )
+
+        native_results = Path(collected["native_results_path"])
+        combined_before_completion = json.loads(native_results.read_text(encoding="utf-8"))[
+            "results"
+        ][0]
+        self.assertNotIn("final_output", combined_before_completion)
+        self.assertNotIn("final_response", combined_before_completion)
+        self.assertNotIn("explanation", combined_before_completion)
+        self.assertIn("ballot", combined_before_completion)
+        completed = replay_engine._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=None,
+            )
+        )
+
+        self.assertEqual(completed["status"], "completed")
+        combined = json.loads(native_results.read_text(encoding="utf-8"))["results"][0]
+        self.assertNotIn("final_output", combined)
+        self.assertNotIn("final_response", combined)
+        self.assertNotIn("explanation", combined)
+        self.assertIn("ballot", combined)
+
+    def test_reviewer_collection_never_persists_free_text_or_unrecognized_identifiers(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        replay_engine._write_json(run_directory / "run.json", {})
+        reviewer_explanation = "REVIEWER_COLLECTION_EXPLANATION_MUST_NOT_BE_PERSISTED"
+        ballot = json.loads(
+            _review_ballot(invalid_check=True, reviewer_explanation=reviewer_explanation)
+        )
+        ballot["dimensions"]["private_reviewer_explanation_must_not_be_persisted"] = {
+            "candidates": {"A": {"checks": {"private_reviewer_notes": 1}}}
+        }
+        ballot["dimensions"]["request_fulfillment"]["candidates"]["A"]["checks"][
+            "private_reviewer_notes"
+        ] = 1
+        raw_ballot = json.dumps(ballot)
+        result = {
+            "status": "completed",
+            "evaluator": "codex",
+            "model": "gpt-test",
+            "thread_id": "review-thread",
+            "worktree": str(self.root),
+            "final_output": raw_ballot,
+            "final_response": raw_ballot,
+        }
+        with mock.patch.object(
+            replay_engine._execution(),
+            "collect_native_task_result",
+            return_value=result,
+        ):
+            collected = replay_engine._command_collect_native_result(
+                argparse.Namespace(
+                    run_dir=run_directory,
+                    thread_id="review-thread",
+                    worktree=self.root,
+                    rollout=None,
+                    evaluator="codex",
+                    normalization_for=None,
+                )
+            )
+
+        reviewer_artifact = Path(collected["native_result_path"])
+        persisted = reviewer_artifact.read_text(encoding="utf-8")
+        self.assertNotIn(reviewer_explanation, persisted)
+        self.assertNotIn("private_reviewer_explanation", persisted)
+        self.assertNotIn("private_reviewer_notes", persisted)
+        sanitized = json.loads(persisted)
+        self.assertTrue(sanitized["normalization_required"])
+        self.assertIn(
+            "invalid_required_behavior",
+            sanitized["ballot"]["dimensions"]["request_fulfillment"]["candidates"]["A"]["checks"],
+        )
+        self.assertNotIn("final_output", sanitized)
+        self.assertNotIn("final_response", sanitized)
+
+    def test_collecting_reviewer_results_does_not_rewrite_external_sources(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        replay_engine._write_json(run_directory / "run.json", {})
+        external_result = self.root / "external-review.json"
+        replay_engine._write_json(
+            external_result,
+            {
+                "evaluator": "codex",
+                "model": "gpt-test",
+                "final_output": _review_ballot(),
+            },
+        )
+        original = external_result.read_text(encoding="utf-8")
+
+        replay_engine._command_collect_native_results(
+            argparse.Namespace(run_dir=run_directory, native_result=[external_result])
+        )
+
+        self.assertEqual(external_result.read_text(encoding="utf-8"), original)
 
     def test_legacy_classified_result_must_come_from_registered_project(self) -> None:
         expected = self.root / "registered"
@@ -2329,10 +2739,10 @@ class LeanBakeoffTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(
-            bakeoff.BakeoffError,
+            replay_engine.ReplayError,
             "does not match the registered",
         ):
-            bakeoff._codex_candidate(run, native)
+            replay_engine._codex_candidate(run, native)
 
 
 if __name__ == "__main__":

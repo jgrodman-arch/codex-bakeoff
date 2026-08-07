@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
-"""MCP launcher and local web controller for Codex Bakeoff."""
+"""MCP launcher, local web controller, and durable run coordinator for Codex Bakeoff."""
+
+# This portable MCP plugin intentionally uses standard-library HTTP and stdio.
+# ruff: noqa: T201, TID251
 
 from __future__ import annotations
 
@@ -23,9 +25,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import webbrowser
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,21 +45,25 @@ RUN_LOG_NAME = "run.log"
 SERVER_NAME = "codex-bakeoff"
 APP_TITLE = "Codex Bakeoff"
 CONTROLLER_HOST = "127.0.0.1"
-DEFAULT_CONTROLLER_PORT = 43117
+DEFAULT_CONTROLLER_PORT = 43118
 CONTROLLER_PROTOCOL_VERSION = 1
-CONTROLLER_CACHE_ROOT = RUN_ROOT.parent
-CONTROLLER_RUNTIME_PATH = CONTROLLER_CACHE_ROOT / "controller-server.json"
-CONTROLLER_LOCK_PATH = CONTROLLER_CACHE_ROOT / "controller-server.lock"
-CONTROLLER_LOG_PATH = CONTROLLER_CACHE_ROOT / "controller-server.log"
-CODEX_CLI_PATH_HINT_PATH = CONTROLLER_CACHE_ROOT / "codex-cli-path.json"
-CONTROLLER_SESSION_STORAGE_KEY = "codex-bakeoff.controller-session.v1"
-CONTROLLER_INSTANCE_STORAGE_KEY = "codex-bakeoff.controller-instance.v1"
-CONTROLLER_SESSION_HEADER = "X-Codex-Bakeoff-Session"
+REPLAY_CACHE_ROOT = RUN_ROOT.parent
+CONTROLLER_CACHE_ROOT = REPLAY_CACHE_ROOT
+CONTROLLER_SESSION_ID = os.environ.get("CODEX_BAKEOFF_CONTROLLER_SESSION_ID") or secrets.token_hex(
+    16
+)
+CONTROLLER_INSTANCE_ROOT = CONTROLLER_CACHE_ROOT / "controllers" / CONTROLLER_SESSION_ID
+CONTROLLER_RUNTIME_PATH = CONTROLLER_INSTANCE_ROOT / "controller-server.json"
+CONTROLLER_LOG_PATH = CONTROLLER_INSTANCE_ROOT / "controller-server.log"
+CONTROLLER_CONTROL_HEADER = "X-Codex-Replay-Control"
+CODEX_CLI_PATH_HINT_PATH = CONTROLLER_INSTANCE_ROOT / "codex-cli-path.json"
+COORDINATOR_REQUEST_NAME = "coordinator-request.json"
+CONTROLLER_HEARTBEAT_INTERVAL_SECONDS = 15
+DEFAULT_CONTROLLER_IDLE_TIMEOUT_SECONDS = 3_600.0
 MAX_TEXT_BYTES = 32 * 1024
 MAX_STATE_BYTES = 512 * 1024
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_HTTP_BODY_BYTES = 1024 * 1024
-MAX_BROWSER_SESSIONS = 256
 MAX_SELECTION_ITEMS = 2_000
 MAX_PREPARE_TOKENS = 256
 MAX_COMMAND_TIMEOUT = 14_700
@@ -66,8 +72,6 @@ MAX_RUN_LOG_BYTES = 128 * 1024
 MAX_REQUEST_SYNTHESIS_BYTES = 256 * 1024
 REQUEST_SYNTHESIS_MODEL = "gpt-5.6-terra"
 CONTROLLER_SMOKE_TEST_MODEL = "gpt-5.6-sol"
-CLAUDE_REVIEW_MODEL = "sonnet"
-CLAUDE_PROBE_TIMEOUT = 60
 REQUEST_SYNTHESIS_SCHEMA = {
     "type": "object",
     "properties": {"request": {"type": "string"}},
@@ -82,6 +86,7 @@ WORKING_DIRECTORY_SCHEMA = {
 }
 RUN_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 COMMIT_PATTERN = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
+PUBLIC_TOOL_NAMES = frozenset({"open_controller"})
 HTTP_TOOL_NAMES = frozenset(
     {
         "get_state",
@@ -102,22 +107,19 @@ PHASES = (
     ("creating_workspace", "Creating isolated workspace"),
     ("implementing", "Implementing with Codex"),
     ("collecting", "Capturing result"),
-    ("verifying", "Running shared verification"),
     ("reviewing", "Running blind review"),
     ("reporting", "Finalizing report"),
 )
 
-_jobs: dict[str, threading.Thread] = {}
 _jobs_lock = threading.RLock()
 _prepared_runs: dict[str, dict[str, Any]] = {}
 _active_processes: set[subprocess.Popen[str]] = set()
 _run_processes: dict[str, set[subprocess.Popen[str]]] = {}
 _run_cancellations: dict[str, threading.Event] = {}
 _active_processes_lock = threading.RLock()
-_pending_port_conflicts: dict[str, dict[str, Any]] = {}
-_pending_port_conflicts_lock = threading.Lock()
 _run_log_lock = threading.Lock()
 _shutdown = threading.Event()
+_coordinator_run_id: str | None = None
 
 
 class ControllerError(ValueError):
@@ -125,7 +127,7 @@ class ControllerError(ValueError):
 
 
 class RunCancelled(RuntimeError):
-    """An active bakeoff was cancelled by the user."""
+    """An active replay was cancelled by the user."""
 
 
 class WorkerError(ControllerError):
@@ -137,16 +139,12 @@ class WorkerError(ControllerError):
         super().__init__(message)
 
 
-class PortConflictError(ControllerError):
-    """A local listener must be confirmed before it can be stopped."""
+class StateTransitionConflict(RuntimeError):
+    """A durable run changed before its requested transition acquired the lock."""
 
-    def __init__(self, port: int, pid: int, process_name: str) -> None:
-        self.port = port
-        self.pid = pid
-        self.process_name = process_name
-        super().__init__(
-            f"Port {port} is already in use by {process_name} (PID {pid})."
-        )
+    def __init__(self, state: Mapping[str, Any]) -> None:
+        self.state = dict(state)
+        super().__init__("The replay state changed before it could be updated.")
 
 
 def _python_runtime_issue(version_info: Any = None) -> dict[str, Any] | None:
@@ -192,16 +190,6 @@ def _node_runtime() -> str:
         "Node.js 18 or newer could not be found. Install Node.js or set "
         "CODEX_MCP_NODE_PATH to an executable Node runtime."
     )
-
-
-def _claude_runtime() -> str | None:
-    executable = shutil.which("claude")
-    if executable is None:
-        return None
-    candidate = Path(executable).resolve()
-    if not candidate.is_file() or not os.access(candidate, os.X_OK):
-        return None
-    return str(candidate)
 
 
 def _utc_now() -> str:
@@ -250,21 +238,29 @@ def _configuration_schema(*, approval: bool = False) -> dict[str, Any]:
         "thread_id": {"type": "string", "minLength": 1},
         "imported_thread_id": {"type": "string", "minLength": 1},
         "model": {"type": "string", "minLength": 1},
+        "models": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+            "maxItems": MAX_SELECTION_ITEMS,
+            "uniqueItems": True,
+            "description": "Selected available Codex models to replay in parallel.",
+        },
         "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 14_400},
-        "repo": {"type": "string", "minLength": 1},
-        "source_path": {"type": "string", "minLength": 1},
-        "message_uuid": {"type": "string", "minLength": 1},
-        "request": {"type": "string", "minLength": 1},
+        "repo": {"type": ["string", "null"], "minLength": 1},
+        "source_path": {"type": ["string", "null"], "minLength": 1},
+        "message_uuid": {"type": ["string", "null"], "minLength": 1},
+        "request": {"type": ["string", "null"], "minLength": 1},
         "beginning_kind": {
-            "type": "string",
-            "enum": ["git", "non_git"],
+            "type": ["string", "null"],
+            "enum": ["git", "non_git", None],
         },
         "ending_kind": {
-            "type": "string",
-            "enum": ["git", "non_git"],
+            "type": ["string", "null"],
+            "enum": ["git", "non_git", None],
         },
-        "baseline_commit": {"type": "string", "minLength": 7, "maxLength": 64},
-        "ending_commit": {"type": "string", "minLength": 7, "maxLength": 64},
+        "baseline_commit": {"type": ["string", "null"], "maxLength": 64},
+        "ending_commit": {"type": ["string", "null"], "maxLength": 64},
         "confirm_empty_beginning": {"type": "boolean"},
         "confirm_repository_selection": {"type": "boolean"},
         "claude_output_files": _string_array("Git working-tree changes attributed to Claude."),
@@ -293,7 +289,13 @@ def _tool_definition(
     *,
     read_only: bool,
     idempotent: bool | None = None,
+    destructive: bool = False,
+    open_world: bool = False,
 ) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "openai/toolInvocation/invoking": f"{title}…",
+        "openai/toolInvocation/invoked": f"{title} finished.",
+    }
     return {
         "name": name,
         "title": title,
@@ -301,15 +303,12 @@ def _tool_definition(
         "inputSchema": dict(schema),
         "annotations": {
             "readOnlyHint": read_only,
-            "destructiveHint": not read_only,
+            "destructiveHint": destructive,
             "idempotentHint": read_only if idempotent is None else idempotent,
-            "openWorldHint": not read_only,
+            "openWorldHint": open_world,
         },
         "execution": {"taskSupport": "forbidden"},
-        "_meta": {
-            "openai/toolInvocation/invoking": f"Opening {APP_TITLE} in your browser…",
-            "openai/toolInvocation/invoked": f"{APP_TITLE} opened in your browser.",
-        },
+        "_meta": metadata,
     }
 
 
@@ -318,7 +317,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         _tool_definition(
             "open_controller",
             f"Open {APP_TITLE}",
-            "Open the interactive bakeoff controller in the default external browser.",
+            "Prepare the local Codex Bakeoff controller URL for the in-app browser or external browser fallback.",
             _object_schema(
                 {
                     "codex_cli_path": {
@@ -328,27 +327,6 @@ def tool_definitions() -> list[dict[str, Any]]:
                 }
             ),
             read_only=True,
-            idempotent=False,
-        ),
-        _tool_definition(
-            "stop_port_process_and_open_controller",
-            f"Stop port process and open {APP_TITLE}",
-            (
-                "After the user explicitly confirms, stop the exact process previously "
-                "reported as occupying the controller port and open the controller."
-            ),
-            _object_schema(
-                {
-                    "confirmed": {"type": "boolean", "const": True},
-                    "confirmation_token": {
-                        "type": "string",
-                        "minLength": 32,
-                        "description": "Short-lived token returned by open_controller.",
-                    },
-                },
-                ["confirmed", "confirmation_token"],
-            ),
-            read_only=False,
             idempotent=False,
         ),
     ]
@@ -399,11 +377,24 @@ def _write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
             temporary.unlink()
 
 
-def _read_controller_runtime() -> dict[str, Any]:
+def _controller_instance_directory(controller_session_id: str) -> Path:
+    if re.fullmatch(r"[a-f0-9]{32}", controller_session_id) is None:
+        raise ControllerError("The controller session ID is invalid.")
+    return RUN_ROOT.parent / "controllers" / controller_session_id
+
+
+def _controller_runtime_path(controller_session_id: str | None = None) -> Path:
+    if controller_session_id is None:
+        return CONTROLLER_RUNTIME_PATH
+    return _controller_instance_directory(controller_session_id) / "controller-server.json"
+
+
+def _read_controller_runtime(controller_session_id: str | None = None) -> dict[str, Any]:
+    runtime_path = _controller_runtime_path(controller_session_id)
     try:
-        if CONTROLLER_RUNTIME_PATH.stat().st_size > 64 * 1024:
+        if runtime_path.stat().st_size > 64 * 1024:
             return {}
-        payload = json.loads(CONTROLLER_RUNTIME_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(runtime_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     return dict(payload) if isinstance(payload, Mapping) else {}
@@ -417,140 +408,21 @@ def _port_accepts_connections(port: int) -> bool:
         return False
 
 
-def _port_listener(port: int) -> dict[str, Any]:
-    executable = shutil.which("lsof")
-    if executable is None and Path("/usr/sbin/lsof").is_file():
-        executable = "/usr/sbin/lsof"
-    if executable is None:
-        raise ControllerError(
-            f"Port {port} is in use, but the listening process could not be identified safely."
-        )
-    completed = subprocess.run(
-        [
-            executable,
-            "-nP",
-            f"-iTCP:{port}",
-            "-sTCP:LISTEN",
-            "-Fpc",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=3,
-    )
-    listeners: dict[int, str] = {}
-    current_pid: int | None = None
-    for line in completed.stdout.splitlines():
-        if line.startswith("p") and line[1:].isdigit():
-            current_pid = int(line[1:])
-            listeners.setdefault(current_pid, "unknown process")
-        elif line.startswith("c") and current_pid is not None and line[1:].strip():
-            listeners[current_pid] = line[1:].strip()
-    if len(listeners) != 1:
-        raise ControllerError(
-            f"Port {port} is in use, but its listening process could not be identified safely."
-        )
-    pid, process_name = next(iter(listeners.items()))
-    if pid == os.getpid():
-        raise ControllerError("The controller cannot stop its own MCP server process.")
-    return {"port": port, "pid": pid, "process_name": process_name}
-
-
-def _remember_port_conflict(error: PortConflictError) -> str:
-    token = secrets.token_urlsafe(32)
-    now = time.monotonic()
-    with _pending_port_conflicts_lock:
-        expired = [
-            key
-            for key, value in _pending_port_conflicts.items()
-            if float(value.get("expires_at", 0)) <= now
-        ]
-        for key in expired:
-            _pending_port_conflicts.pop(key, None)
-        if len(_pending_port_conflicts) >= MAX_PREPARE_TOKENS:
-            oldest = min(
-                _pending_port_conflicts,
-                key=lambda key: float(
-                    _pending_port_conflicts[key].get("created_at", 0)
-                ),
-            )
-            _pending_port_conflicts.pop(oldest, None)
-        _pending_port_conflicts[token] = {
-            "port": error.port,
-            "pid": error.pid,
-            "process_name": error.process_name,
-            "created_at": now,
-            "expires_at": now + 600,
-        }
-    return token
-
-
-def _consume_port_confirmation(token: str, port: int) -> dict[str, Any]:
-    with _pending_port_conflicts_lock:
-        conflict = _pending_port_conflicts.pop(token, None)
-    if conflict is None or float(conflict.get("expires_at", 0)) <= time.monotonic():
-        raise ControllerError(
-            "The port-process confirmation expired. Open the controller and confirm again."
-        )
-    if conflict.get("port") != port:
-        raise ControllerError(
-            "The configured controller port changed. Open the controller and confirm again."
-        )
-    return conflict
-
-
-def _stop_confirmed_port_listener(
-    port: int,
-    confirmed: Mapping[str, Any],
-) -> None:
-    listener = _port_listener(port)
-    if (
-        listener["pid"] != confirmed.get("pid")
-        or listener["process_name"] != confirmed.get("process_name")
-    ):
-        raise PortConflictError(
-            port,
-            int(listener["pid"]),
-            str(listener["process_name"]),
-        )
-    pid = int(listener["pid"])
+def _controller_idle_timeout_seconds() -> float:
+    configured = os.environ.get("CODEX_BAKEOFF_CONTROLLER_IDLE_TIMEOUT_SECONDS")
+    if configured is None:
+        return DEFAULT_CONTROLLER_IDLE_TIMEOUT_SECONDS
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except PermissionError as error:
+        timeout = float(configured)
+    except ValueError as error:
         raise ControllerError(
-            f"Permission was denied while stopping PID {pid} on port {port}."
+            "CODEX_BAKEOFF_CONTROLLER_IDLE_TIMEOUT_SECONDS must be a positive number."
         ) from error
-
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if not _port_accepts_connections(port):
-            return
-        time.sleep(0.05)
-
-    listener = _port_listener(port)
-    if listener["pid"] != pid:
-        raise PortConflictError(
-            port,
-            int(listener["pid"]),
-            str(listener["process_name"]),
+    if timeout <= 0 or not timeout < float("inf"):
+        raise ControllerError(
+            "CODEX_BAKEOFF_CONTROLLER_IDLE_TIMEOUT_SECONDS must be a positive number."
         )
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    except PermissionError as error:
-        raise ControllerError(
-            f"Permission was denied while killing PID {pid} on port {port}."
-        ) from error
-
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        if not _port_accepts_connections(port):
-            return
-        time.sleep(0.05)
-    raise ControllerError(f"PID {pid} did not release port {port}.")
+    return timeout
 
 
 def _http_request(
@@ -576,8 +448,16 @@ def _http_request(
         return None, b""
 
 
-def _probe_controller(port: int) -> tuple[str, dict[str, Any]]:
-    runtime = _read_controller_runtime()
+def _probe_controller(
+    port: int,
+    *,
+    controller_session_id: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    runtime = (
+        _read_controller_runtime()
+        if controller_session_id is None
+        else _read_controller_runtime(controller_session_id)
+    )
     control_token = runtime.get("control_token")
     challenge = secrets.token_urlsafe(24)
     status, body = _http_request(
@@ -600,26 +480,34 @@ def _probe_controller(port: int) -> tuple[str, dict[str, Any]]:
         else ""
     )
     supplied_proof = payload.get("proof") if isinstance(payload, Mapping) else None
-    is_bakeoff_controller = (
+    is_replay_controller = (
         status == 200
         and isinstance(payload, Mapping)
         and payload.get("server") == SERVER_NAME
         and payload.get("protocol_version") == CONTROLLER_PROTOCOL_VERSION
     )
     if (
-        is_bakeoff_controller
+        is_replay_controller
         and isinstance(supplied_proof, str)
         and bool(expected_proof)
         and hmac.compare_digest(supplied_proof, expected_proof)
     ):
         return "compatible", dict(payload)
-    if is_bakeoff_controller:
+    if is_replay_controller:
         return "unverified", dict(payload)
     return "foreign", dict(payload) if isinstance(payload, Mapping) else {}
 
 
-def _runtime_control_token(port: int) -> str:
-    runtime = _read_controller_runtime()
+def _runtime_control_token(
+    port: int,
+    *,
+    controller_session_id: str | None = None,
+) -> str:
+    runtime = (
+        _read_controller_runtime()
+        if controller_session_id is None
+        else _read_controller_runtime(controller_session_id)
+    )
     token = runtime.get("control_token")
     if runtime.get("port") != port or not isinstance(token, str) or len(token) < 32:
         raise ControllerError(
@@ -632,16 +520,14 @@ def _control_request(
     port: int,
     path: str,
     *,
+    controller_session_id: str | None = None,
     timeout: float = 2.0,
 ) -> tuple[int | None, dict[str, Any]]:
-    token = _runtime_control_token(port)
+    token = _runtime_control_token(port, controller_session_id=controller_session_id)
     status, body = _http_request(
         "POST",
         f"{_controller_origin(port)}{path}",
-        headers={
-            "Content-Type": "application/json",
-            "X-Codex-Bakeoff-Control": token,
-        },
+        headers={"Content-Type": "application/json", CONTROLLER_CONTROL_HEADER: token},
         data=b"{}",
         timeout=timeout,
     )
@@ -652,34 +538,42 @@ def _control_request(
     return status, dict(payload) if isinstance(payload, Mapping) else {}
 
 
-def _stop_outdated_controller(port: int) -> bool:
-    status, payload = _control_request(port, "/api/shutdown")
-    if status == 200:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if _probe_controller(port)[0] == "absent":
-                return True
-            time.sleep(0.05)
-        raise ControllerError("The previous local controller did not stop.")
-    if status == 409 and payload.get("active_run") is True:
-        return False
-    raise ControllerError("The previous local controller could not be replaced safely.")
-
-
-def _spawn_controller_daemon() -> subprocess.Popen[bytes]:
+def _spawn_controller_daemon(
+    *,
+    reservation: socket.socket,
+    controller_session_id: str,
+    codex_cli_path: str | None = None,
+) -> subprocess.Popen[bytes]:
     if not APP_HTML.is_file():
-        raise ControllerError("The external controller HTML is unavailable.")
-    CONTROLLER_CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    CONTROLLER_LOG_PATH.touch(mode=0o600, exist_ok=True)
-    CONTROLLER_LOG_PATH.chmod(0o600)
-    with CONTROLLER_LOG_PATH.open("ab", buffering=0) as log:
+        raise ControllerError("The local controller HTML is unavailable.")
+    instance_directory = _controller_instance_directory(controller_session_id)
+    instance_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    instance_directory.chmod(0o700)
+    log_path = instance_directory / "controller-server.log"
+    log_path.touch(mode=0o600, exist_ok=True)
+    log_path.chmod(0o600)
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "CODEX_BAKEOFF_RUN_ROOT": str(RUN_ROOT),
+            "CODEX_BAKEOFF_CONTROLLER_PORT": str(reservation.getsockname()[1]),
+            "CODEX_BAKEOFF_CONTROLLER_SESSION_ID": controller_session_id,
+            "CODEX_BAKEOFF_CONTROLLER_SOCKET_FD": str(reservation.fileno()),
+        }
+    )
+    if codex_cli_path is not None:
+        environment["CODEX_CLI_PATH"] = codex_cli_path
+        _write_private_json(instance_directory / "codex-cli-path.json", {"path": codex_cli_path})
+    with log_path.open("ab", buffering=0) as log:
         return subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "--http"],
             cwd=PLUGIN_ROOT,
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            pass_fds=(reservation.fileno(),),
             close_fds=True,
         )
 
@@ -696,7 +590,7 @@ def _remember_codex_cli_path_hint(value: Any) -> None:
         raise ControllerError("The supplied Codex executable does not exist.") from error
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise ControllerError("The supplied Codex executable is not executable.")
-    CONTROLLER_CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    REPLAY_CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     _write_private_json(CODEX_CLI_PATH_HINT_PATH, {"path": str(candidate)})
 
 
@@ -733,105 +627,93 @@ def _worker_environment() -> dict[str, str]:
 
 def _ensure_controller_daemon(
     *,
-    confirmation_token: str | None = None,
+    codex_cli_path: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    port = _controller_port()
-    CONTROLLER_CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with CONTROLLER_LOCK_PATH.open("a+", encoding="utf-8") as lock:
-        CONTROLLER_LOCK_PATH.chmod(0o600)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        confirmed_conflict = (
-            _consume_port_confirmation(confirmation_token, port)
-            if confirmation_token is not None
-            else None
-        )
-        status, health = _probe_controller(port)
-        if status in {"foreign", "unverified"}:
-            listener = _port_listener(port)
-            if confirmed_conflict is None:
-                raise PortConflictError(
-                    port,
-                    int(listener["pid"]),
-                    str(listener["process_name"]),
-                )
-            _stop_confirmed_port_listener(port, confirmed_conflict)
-            status, health = _probe_controller(port)
-            if status != "absent":
-                raise ControllerError(f"Port {port} was not released.")
-        if status == "compatible":
-            if health.get("version") == SERVER_VERSION:
-                return port, health
-            if not _stop_outdated_controller(port):
-                return port, health
-
-        process = _spawn_controller_daemon()
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            status, health = _probe_controller(port)
-            if status == "compatible":
-                return port, health
-            if status == "foreign":
+    preferred_port = _controller_port()
+    controller_session_id = secrets.token_hex(16)
+    instance_directory = _controller_instance_directory(controller_session_id)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        try:
+            reservation.bind((CONTROLLER_HOST, preferred_port))
+        except OSError:
+            try:
+                reservation.bind((CONTROLLER_HOST, 0))
+            except OSError as error:
                 raise ControllerError(
-                    f"Port {port} was claimed by another service while the controller started."
-                )
-            return_code = process.poll()
-            if return_code is not None:
-                raise ControllerError(
-                    "The external controller could not start. "
-                    f"See {CONTROLLER_LOG_PATH} for details."
-                )
-            time.sleep(0.05)
-    raise ControllerError("The external controller did not become ready.")
+                    "An available local controller port could not be reserved."
+                ) from error
+        port = int(reservation.getsockname()[1])
+        try:
+            process = _spawn_controller_daemon(
+                reservation=reservation,
+                controller_session_id=controller_session_id,
+                codex_cli_path=codex_cli_path,
+            )
+        except OSError as error:
+            raise ControllerError("The local controller process could not start.") from error
+
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        status, health = _probe_controller(port, controller_session_id=controller_session_id)
+        if status == "compatible" and health.get("controller_session_id") == controller_session_id:
+            return port, health
+        return_code = process.poll()
+        if return_code is not None:
+            raise ControllerError(
+                "The local controller could not start. "
+                f"See {instance_directory / 'controller-server.log'} for details."
+            )
+        time.sleep(0.05)
+    raise ControllerError("The local controller did not become ready.")
 
 
-def _request_browser_login(port: int) -> str:
-    status, payload = _control_request(port, "/api/launch")
-    path = payload.get("path")
-    if status != 200 or not isinstance(path, str) or not path.startswith("/auth?token="):
-        raise ControllerError("The external controller could not create a browser session.")
-    return f"{_controller_origin(port)}{path}"
-
-
-def _open_external_controller(
+def _open_controller(
     *,
-    confirmation_token: str | None = None,
     codex_cli_path: Any = None,
 ) -> dict[str, Any]:
     if codex_cli_path is not None:
         _remember_codex_cli_path_hint(codex_cli_path)
     _run_controller_smoke_test()
-    try:
-        port, health = _ensure_controller_daemon(
-            confirmation_token=confirmation_token,
-        )
-    except PortConflictError as error:
-        token = _remember_port_conflict(error)
-        return _text_result(
-            (
-                f"Port {error.port} is in use by {error.process_name} "
-                f"(PID {error.pid}). Ask the user to confirm whether this exact "
-                "process should be stopped."
-            ),
-            {
-                "opened": False,
-                "requires_confirmation": True,
-                "port": error.port,
-                "pid": error.pid,
-                "process_name": error.process_name,
-                "confirmation_token": token,
-            },
-        )
-    launch_url = _request_browser_login(port)
-    if not webbrowser.open(launch_url, new=2, autoraise=True):
-        raise ControllerError("No external browser was available to open the controller.")
+    port, health = _ensure_controller_daemon(codex_cli_path=codex_cli_path)
+    launch_url = f"{_controller_origin(port)}/"
     return _text_result(
-        "The Codex Bakeoff controller opened in your external browser.",
+        "Codex Bakeoff is ready to open in the in-app browser or an external browser.",
         {
-            "opened": True,
+            "prepared": True,
+            "opened": False,
+            "launch_url": launch_url,
             "origin": _controller_origin(port),
             "controller_version": health.get("version"),
+            "controller_session_id": health.get("controller_session_id"),
         },
     )
+
+
+def _active_controller_runs(controller_session_id: str | None = None) -> int:
+    owner = controller_session_id or CONTROLLER_SESSION_ID
+    if not RUN_ROOT.is_dir():
+        return 0
+    try:
+        run_directories = list(RUN_ROOT.iterdir())
+    except OSError:
+        return 0
+    active_runs = 0
+    for run_directory in run_directories:
+        if not run_directory.is_dir():
+            continue
+        state_path = _state_path(run_directory)
+        if not state_path.is_file():
+            continue
+        try:
+            state = _read_json(state_path)
+        except ControllerError:
+            continue
+        if state.get("controller_session_id") != owner or state.get("status") != "running":
+            continue
+        coordinator_pid = state.get("coordinator_pid") or state.get("controller_pid")
+        if _pid_is_alive(coordinator_pid):
+            active_runs += 1
+    return active_runs
 
 
 class _ControllerHTTPServer(http.server.ThreadingHTTPServer):
@@ -842,57 +724,59 @@ class _ControllerHTTPServer(http.server.ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         control_token: str,
+        *,
+        inherited_socket: socket.socket | None = None,
+        controller_session_id: str | None = None,
     ) -> None:
         self.control_token = control_token
-        self.instance_id = secrets.token_urlsafe(24)
+        self.controller_session_id = controller_session_id or CONTROLLER_SESSION_ID
         self.app_html = APP_HTML.read_bytes()
-        self.login_tokens: dict[str, float] = {}
-        self.login_lock = threading.Lock()
-        self.session_tokens: dict[str, float] = {}
-        self.session_lock = threading.Lock()
-        super().__init__(server_address, _ControllerHTTPRequestHandler)
+        self.heartbeat_lock = threading.Lock()
+        self.last_heartbeat = time.monotonic()
+        self.idle_timeout_seconds = _controller_idle_timeout_seconds()
+        self.idle_stop = threading.Event()
+        if inherited_socket is None:
+            super().__init__(server_address, _ControllerHTTPRequestHandler)
+        else:
+            super().__init__(
+                server_address,
+                _ControllerHTTPRequestHandler,
+                bind_and_activate=False,
+            )
+            self.socket.close()
+            self.socket = inherited_socket
+            self.server_address = self.socket.getsockname()
+            self.server_name = CONTROLLER_HOST
+            self.server_port = int(self.server_address[1])
+            self.server_activate()
         port = int(self.server_address[1])
         self.origin = _controller_origin(port)
         self.expected_host = f"{CONTROLLER_HOST}:{port}"
 
-    def issue_login(self) -> str:
-        token = secrets.token_urlsafe(48)
-        now = time.monotonic()
-        with self.login_lock:
-            self.login_tokens = {
-                value: expiry for value, expiry in self.login_tokens.items() if expiry > now
-            }
-            self.login_tokens[token] = now + 60
-        return token
+    def touch_heartbeat(self) -> None:
+        with self.heartbeat_lock:
+            self.last_heartbeat = time.monotonic()
 
-    def consume_login(self, token: str) -> bool:
-        with self.login_lock:
-            expiry = self.login_tokens.pop(token, 0)
-        return expiry > time.monotonic()
 
-    def issue_session(self) -> str:
-        token = secrets.token_urlsafe(48)
-        now = time.monotonic()
-        with self.session_lock:
-            self.session_tokens = {
-                value: expiry for value, expiry in self.session_tokens.items() if expiry > now
-            }
-            while len(self.session_tokens) >= MAX_BROWSER_SESSIONS:
-                self.session_tokens.pop(next(iter(self.session_tokens)))
-            self.session_tokens[token] = now + (24 * 60 * 60)
-        return token
-
-    def authorize_session(self, token: str) -> bool:
-        if not token:
-            return False
-        now = time.monotonic()
-        with self.session_lock:
-            expiry = self.session_tokens.get(token, 0)
-            if expiry <= now:
-                self.session_tokens.pop(token, None)
-                return False
-            self.session_tokens[token] = now + (24 * 60 * 60)
-        return True
+def _monitor_controller_idle(server: _ControllerHTTPServer) -> None:
+    interval = min(1.0, max(0.05, server.idle_timeout_seconds / 4))
+    while not server.idle_stop.wait(interval):
+        with server.heartbeat_lock:
+            elapsed = time.monotonic() - server.last_heartbeat
+        if elapsed < server.idle_timeout_seconds:
+            continue
+        if _active_controller_runs(server.controller_session_id):
+            server.touch_heartbeat()
+            continue
+        with _active_processes_lock:
+            if _active_processes:
+                server.touch_heartbeat()
+                continue
+        with server.heartbeat_lock:
+            if time.monotonic() - server.last_heartbeat < server.idle_timeout_seconds:
+                continue
+        server.shutdown()
+        return
 
 
 class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -949,14 +833,8 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         return self.headers.get("Host") == self.server.expected_host
 
     def _control_authorized(self) -> bool:
-        supplied = self.headers.get("X-Codex-Bakeoff-Control", "")
-        return bool(supplied) and secrets.compare_digest(
-            supplied,
-            self.server.control_token,
-        )
-
-    def _session_authorized(self) -> bool:
-        return self.server.authorize_session(self.headers.get(CONTROLLER_SESSION_HEADER, ""))
+        supplied = self.headers.get(CONTROLLER_CONTROL_HEADER, "")
+        return bool(supplied) and secrets.compare_digest(supplied, self.server.control_token)
 
     def _read_json_body(self) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length")
@@ -981,8 +859,6 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/health":
             challenge = urllib.parse.parse_qs(parsed.query).get("challenge", [""])[0]
-            with _jobs_lock:
-                active_runs = len(_jobs)
             self._send_json(
                 200,
                 {
@@ -990,7 +866,8 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                     "protocol_version": CONTROLLER_PROTOCOL_VERSION,
                     "version": SERVER_VERSION,
                     "pid": os.getpid(),
-                    "active_runs": active_runs,
+                    "controller_session_id": self.server.controller_session_id,
+                    "active_runs": _active_controller_runs(self.server.controller_session_id),
                     "proof": (
                         hmac.new(
                             self.server.control_token.encode("utf-8"),
@@ -1003,76 +880,36 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 },
             )
             return
-        if parsed.path == "/auth":
-            token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
-            if not token or not self.server.consume_login(token):
-                self._send(401, b"This controller link is invalid or expired.")
-                return
-            session_token = self.server.issue_session()
-            bootstrap = (
-                '<!doctype html><meta charset="utf-8"><title>Opening controller</title>'
-                "<script>"
-                f"if(localStorage.getItem({json.dumps(CONTROLLER_INSTANCE_STORAGE_KEY)})!=="
-                f"{json.dumps(self.server.instance_id)})localStorage.clear();"
-                f"localStorage.setItem({json.dumps(CONTROLLER_INSTANCE_STORAGE_KEY)},"
-                f"{json.dumps(self.server.instance_id)});"
-                f"localStorage.setItem({json.dumps(CONTROLLER_SESSION_STORAGE_KEY)},"
-                f"{json.dumps(session_token)});"
-                "location.replace('/');"
-                "</script>"
-            ).encode("utf-8")
-            self._send(
-                200,
-                bootstrap,
-                content_type="text/html; charset=utf-8",
-            )
-            return
         if parsed.path == "/favicon.ico":
             self._send(204)
             return
         if parsed.path != "/":
             self._send(404, b"Not found.")
             return
-        self._send(
-            200,
-            self.server.app_html,
-            content_type="text/html; charset=utf-8",
-        )
+        self._send(200, self.server.app_html, content_type="text/html; charset=utf-8")
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API.
         if not self._valid_host():
             self._send(421, b"Invalid host.")
             return
         path = urllib.parse.urlsplit(self.path).path
-        if path == "/api/launch":
-            if not self._control_authorized():
-                self._send_json(401, {"error": "Unauthorized."})
-                return
-            token = self.server.issue_login()
-            self._send_json(200, {"path": f"/auth?token={token}"})
-            return
         if path == "/api/shutdown":
             if not self._control_authorized():
                 self._send_json(401, {"error": "Unauthorized."})
                 return
-            with _jobs_lock:
-                jobs_active = bool(_jobs)
             with _active_processes_lock:
                 processes_active = bool(_active_processes)
-            if jobs_active or processes_active:
+            if _active_controller_runs(self.server.controller_session_id) or processes_active:
                 self._send_json(
                     409,
-                    {"active_run": True, "error": "A bakeoff is still running."},
+                    {"active_run": True, "error": "A replay is still running."},
                 )
                 return
             self._send_json(200, {"stopping": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
-        if path not in {"/api/call", "/api/download"}:
+        if path not in {"/api/call", "/api/download", "/api/heartbeat"}:
             self._send_json(404, {"error": "Not found."})
-            return
-        if not self._session_authorized():
-            self._send_json(401, {"error": "Unauthorized."})
             return
         if self.headers.get("Origin") != self.server.origin:
             self._send_json(403, {"error": "Invalid origin."})
@@ -1082,6 +919,17 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json_body()
+            if path == "/api/heartbeat":
+                self.server.touch_heartbeat()
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "controller_session_id": self.server.controller_session_id,
+                        "heartbeat_interval_seconds": CONTROLLER_HEARTBEAT_INTERVAL_SECONDS,
+                    },
+                )
+                return
             if path == "/api/download":
                 run_id = payload.get("run_id")
                 artifact_format = payload.get("format")
@@ -1089,20 +937,29 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                     raise ControllerError("run_id is required.")
                 if artifact_format not in {"json", "html"}:
                     raise ControllerError("format must be json or html.")
-                artifact_path = _safe_run_directory(run_id) / f"report.{artifact_format}"
-                if not artifact_path.is_file():
-                    raise ControllerError("The bakeoff report is not ready.")
+                run_directory = _safe_run_directory(run_id)
+                _ensure_controller_owns_run(run_directory, require_state=False)
+                artifact_path = run_directory / f"report.{artifact_format}"
+                if artifact_path.resolve().parent != run_directory:
+                    raise ControllerError("The replay report is outside its run directory.")
+                try:
+                    if artifact_path.stat().st_size > MAX_REPORT_BYTES:
+                        raise ControllerError(f"report.{artifact_format} is too large to display.")
+                    artifact_bytes = artifact_path.read_bytes()
+                except ControllerError:
+                    raise
+                except OSError as error:
+                    raise ControllerError("The replay report is not ready.") from error
                 self._send(
                     200,
-                    artifact_path.read_bytes(),
+                    artifact_bytes,
                     content_type={
                         "json": "application/json; charset=utf-8",
                         "html": "text/html; charset=utf-8",
                     }[artifact_format],
                     headers={
                         "Content-Disposition": (
-                            f'attachment; filename="codex-bakeoff-{run_id}-report.'
-                            f'{artifact_format}"'
+                            f'attachment; filename="codex-bakeoff-{run_id}-report.{artifact_format}"'
                         )
                     },
                 )
@@ -1117,10 +974,7 @@ class _ControllerHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         except ControllerError as error:
             self._send_json(
                 400,
-                {
-                    "content": [{"type": "text", "text": str(error)}],
-                    "isError": True,
-                },
+                {"content": [{"type": "text", "text": str(error)}], "isError": True},
             )
             return
         except Exception:
@@ -1144,20 +998,53 @@ def _remove_runtime_if_owned(control_token: str) -> None:
             CONTROLLER_RUNTIME_PATH.unlink()
         except FileNotFoundError:
             pass
+        instance_directory = CONTROLLER_RUNTIME_PATH.parent
+        if CODEX_CLI_PATH_HINT_PATH.parent == instance_directory:
+            try:
+                CODEX_CLI_PATH_HINT_PATH.unlink()
+            except OSError:
+                pass
+        if CONTROLLER_LOG_PATH.parent == instance_directory:
+            try:
+                if CONTROLLER_LOG_PATH.stat().st_size == 0:
+                    CONTROLLER_LOG_PATH.unlink()
+            except OSError:
+                pass
+        try:
+            instance_directory.rmdir()
+        except OSError:
+            pass
 
 
 def run_http() -> int:
     port = _controller_port()
     control_token = secrets.token_urlsafe(48)
+    inherited_socket: socket.socket | None = None
+    inherited_descriptor = os.environ.pop("CODEX_BAKEOFF_CONTROLLER_SOCKET_FD", None)
+    if inherited_descriptor is not None:
+        try:
+            inherited_socket = socket.socket(fileno=int(inherited_descriptor))
+        except (OSError, ValueError) as error:
+            print(f"Cannot recover the reserved controller socket: {error}", file=sys.stderr)
+            return 1
     try:
         RUN_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         RUN_ROOT.chmod(0o700)
     except OSError as error:
-        print(f"Cannot secure the bakeoff run directory: {error}", file=sys.stderr)
+        if inherited_socket is not None:
+            inherited_socket.close()
+        print(f"Cannot secure the replay run directory: {error}", file=sys.stderr)
         return 1
     try:
-        server = _ControllerHTTPServer((CONTROLLER_HOST, port), control_token)
-    except OSError as error:
+        server = _ControllerHTTPServer(
+            (CONTROLLER_HOST, port),
+            control_token,
+            inherited_socket=inherited_socket,
+            controller_session_id=CONTROLLER_SESSION_ID,
+        )
+    except (ControllerError, OSError) as error:
+        if inherited_socket is not None:
+            inherited_socket.close()
         print(f"Cannot bind the controller to {_controller_origin(port)}: {error}", file=sys.stderr)
         return 1
     _write_private_json(
@@ -1168,13 +1055,22 @@ def run_http() -> int:
             "version": SERVER_VERSION,
             "pid": os.getpid(),
             "port": port,
+            "controller_session_id": CONTROLLER_SESSION_ID,
             "control_token": control_token,
         },
     )
-    _reconcile_interrupted_runs()
+    _adopt_orphaned_runs(controller_session_id=CONTROLLER_SESSION_ID)
+    _reconcile_interrupted_runs(controller_session_id=CONTROLLER_SESSION_ID)
+    idle_monitor = threading.Thread(
+        target=_monitor_controller_idle,
+        args=(server,),
+        daemon=True,
+    )
+    idle_monitor.start()
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
+        server.idle_stop.set()
         server.server_close()
         _remove_runtime_if_owned(control_token)
     return 0
@@ -1247,7 +1143,7 @@ def _read_run_log(run_directory: Path) -> str:
     path = _run_log_path(run_directory)
     try:
         if path.resolve().parent != run_directory.resolve():
-            raise ControllerError("The bakeoff run log is outside the run directory.")
+            raise ControllerError("The replay run log is outside the run directory.")
         with path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
             size = stream.tell()
@@ -1256,7 +1152,7 @@ def _read_run_log(run_directory: Path) -> str:
     except FileNotFoundError:
         return ""
     except (OSError, RuntimeError) as error:
-        raise ControllerError("Cannot read the bakeoff run log.") from error
+        raise ControllerError("Cannot read the replay run log.") from error
 
 
 def _run_snapshot(run_directory: Path, state: Mapping[str, Any]) -> dict[str, Any]:
@@ -1264,6 +1160,8 @@ def _run_snapshot(run_directory: Path, state: Mapping[str, Any]) -> dict[str, An
 
 
 def _append_run_log(path: Path, source: str, message: str) -> None:
+    if source.startswith(("review:", "normalization:")) and source.endswith(":stdout"):
+        message = "[reviewer output omitted]"
     line = f"{_utc_now()} [{source}] {message.rstrip()}\n"
     try:
         with _run_log_lock:
@@ -1273,7 +1171,7 @@ def _append_run_log(path: Path, source: str, message: str) -> None:
             finally:
                 os.close(descriptor)
     except OSError as error:
-        print(f"Cannot write bakeoff run log: {error}", file=sys.stderr)
+        print(f"Cannot write replay run log: {error}", file=sys.stderr)
 
 
 def _record_completed_process(
@@ -1318,7 +1216,7 @@ def _run_process(
     with _active_processes_lock:
         cancellation = _run_cancellations.get(run_id) if run_id is not None else None
         if cancellation is not None and cancellation.is_set():
-            raise RunCancelled("The bakeoff was cancelled.")
+            raise RunCancelled("The replay was cancelled.")
         process = subprocess.Popen(
             list(command),
             cwd=cwd,
@@ -1395,7 +1293,7 @@ def _run_process(
         stdout_thread.join()
         stderr_thread.join()
         if cancellation is not None and cancellation.is_set():
-            raise RunCancelled("The bakeoff was cancelled.")
+            raise RunCancelled("The replay was cancelled.")
         _append_run_log(
             stream_log_path,
             stream_log_label,
@@ -1428,7 +1326,7 @@ def _run_process(
                     if not processes:
                         _run_processes.pop(run_id, None)
     if cancellation is not None and cancellation.is_set():
-        raise RunCancelled("The bakeoff was cancelled.")
+        raise RunCancelled("The replay was cancelled.")
     return subprocess.CompletedProcess(
         args=list(command),
         returncode=process.returncode,
@@ -1475,12 +1373,12 @@ def _engine(
     except json.JSONDecodeError as error:
         detail = (completed.stderr or completed.stdout or "No output.").strip()
         raise ControllerError(
-            f"The bakeoff engine returned invalid output: {detail[:500]}"
+            f"The replay engine returned invalid output: {detail[:500]}"
         ) from error
     if not isinstance(payload, dict):
-        raise ControllerError("The bakeoff engine returned an invalid response.")
+        raise ControllerError("The replay engine returned an invalid response.")
     if completed.returncode != 0 or payload.get("status") == "error":
-        raise ControllerError(str(payload.get("error") or "The bakeoff command failed."))
+        raise ControllerError(str(payload.get("error") or "The replay command failed."))
     return payload
 
 
@@ -1488,6 +1386,28 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
     model = arguments.get("model")
     if not isinstance(model, str) or not model.strip() or "\x00" in model:
         raise ControllerError("Choose a Codex model.")
+    model = model.strip()
+    selected_models: list[str] | None = None
+    if "models" in arguments:
+        raw_models = arguments.get("models")
+        if not isinstance(raw_models, list) or not raw_models:
+            raise ControllerError("Choose at least one Codex model.")
+        if len(raw_models) > MAX_SELECTION_ITEMS:
+            raise ControllerError("Choose a bounded number of Codex models.")
+        selected_models = []
+        for selected_model in raw_models:
+            if (
+                not isinstance(selected_model, str)
+                or not selected_model.strip()
+                or "\x00" in selected_model
+            ):
+                raise ControllerError("Choose only valid Codex models.")
+            selected_model = selected_model.strip()
+            if selected_model in selected_models:
+                raise ControllerError("Choose each Codex model only once.")
+            selected_models.append(selected_model)
+        if model != selected_models[0]:
+            raise ControllerError("The primary Codex model must match the first selected variant.")
     source_path = arguments.get("source_path")
     if source_path is not None:
         if not isinstance(source_path, str) or not source_path.strip() or "\x00" in source_path:
@@ -1510,14 +1430,12 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
         request = request.strip()
     beginning_kind = arguments.get("beginning_kind")
     if beginning_kind is not None and (
-        not isinstance(beginning_kind, str)
-        or beginning_kind not in {"git", "non_git"}
+        not isinstance(beginning_kind, str) or beginning_kind not in {"git", "non_git"}
     ):
         raise ControllerError("Choose a Git or Non-Git beginning state.")
     ending_kind = arguments.get("ending_kind")
     if ending_kind is not None and (
-        not isinstance(ending_kind, str)
-        or ending_kind not in {"git", "non_git"}
+        not isinstance(ending_kind, str) or ending_kind not in {"git", "non_git"}
     ):
         raise ControllerError("Choose a Git or Non-Git end state.")
     if (beginning_kind is None) != (ending_kind is None):
@@ -1532,8 +1450,7 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
         if not baseline_commit:
             baseline_commit = None
     if beginning_kind == "git" and (
-        not isinstance(baseline_commit, str)
-        or COMMIT_PATTERN.fullmatch(baseline_commit) is None
+        not isinstance(baseline_commit, str) or COMMIT_PATTERN.fullmatch(baseline_commit) is None
     ):
         raise ControllerError("Enter a valid historical Git commit.")
     if beginning_kind == "non_git" and baseline_commit is not None:
@@ -1548,20 +1465,19 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
         if not ending_commit:
             ending_commit = None
     if ending_kind == "git" and (
-        not isinstance(ending_commit, str)
-        or COMMIT_PATTERN.fullmatch(ending_commit) is None
+        not isinstance(ending_commit, str) or COMMIT_PATTERN.fullmatch(ending_commit) is None
     ):
         raise ControllerError("Enter a valid historical ending Git commit.")
     if ending_kind == "non_git" and ending_commit is not None:
         raise ControllerError("A Non-Git end state cannot have a Git commit.")
     if ending_commit is not None and ending_kind != "git":
         raise ControllerError("Choose a Git end state for ending_commit.")
-    return {
+    configuration = {
         "thread_id": _thread_id(arguments),
         "source_path": source_path,
         "message_uuid": message_uuid,
         "request": request,
-        "model": model.strip(),
+        "model": model,
         "timeout_seconds": _bounded_int(
             arguments.get("timeout_seconds"),
             default=1800,
@@ -1574,14 +1490,15 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
         "baseline_commit": baseline_commit,
         "ending_commit": ending_commit,
         "confirm_empty_beginning": arguments.get("confirm_empty_beginning") is True,
-        "confirm_repository_selection": (
-            arguments.get("confirm_repository_selection") is True
-        ),
+        "confirm_repository_selection": (arguments.get("confirm_repository_selection") is True),
         "claude_output_files": _string_list(arguments, "claude_output_files"),
         "created_by_claude": _string_list(arguments, "created_by_claude"),
         "excluded_files": _string_list(arguments, "excluded_files"),
         "confirm_file_selection": arguments.get("confirm_file_selection") is True,
     }
+    if selected_models is not None:
+        configuration["models"] = selected_models
+    return configuration
 
 
 def _configuration_fingerprint(configuration: Mapping[str, Any]) -> str:
@@ -1644,28 +1561,50 @@ def _configuration_arguments(arguments: Mapping[str, Any]) -> list[str]:
 
 def _prepare_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
     configuration = _normalized_configuration(arguments)
-    payload = _engine(
-        "prepare",
-        _configuration_arguments(arguments),
-        input_text=configuration["request"],
-    )
-    ready = payload.get("status") == "ready_for_approval"
+    selected_models = list(configuration.get("models") or [configuration["model"]])
+    preparations: dict[str, dict[str, Any]] = {}
+    for selected_model in selected_models:
+        model_configuration = {
+            key: value for key, value in configuration.items() if key != "models"
+        }
+        model_configuration["model"] = selected_model
+        preparations[selected_model] = _engine(
+            "prepare",
+            _configuration_arguments(model_configuration),
+            input_text=configuration["request"],
+        )
+
+    payload = preparations[selected_models[0]]
+    ready = all(item.get("status") == "ready_for_approval" for item in preparations.values())
     historical_result_sha256 = payload.get("historical_result_sha256")
-    if ready and (
-        not isinstance(historical_result_sha256, str)
-        or re.fullmatch(r"[a-f0-9]{64}", historical_result_sha256) is None
-    ):
-        raise ControllerError(
-            "The prepared historical Claude result has no valid integrity digest."
-        )
     prepared_configuration_sha256 = payload.get("prepared_configuration_sha256")
-    if ready and (
-        not isinstance(prepared_configuration_sha256, str)
-        or re.fullmatch(r"[a-f0-9]{64}", prepared_configuration_sha256) is None
-    ):
-        raise ControllerError(
-            "The prepared bakeoff configuration has no valid integrity digest."
-        )
+    prepared_configuration_digests: dict[str, str] = {}
+    if ready:
+        if (
+            not isinstance(historical_result_sha256, str)
+            or re.fullmatch(r"[a-f0-9]{64}", historical_result_sha256) is None
+        ):
+            raise ControllerError(
+                "The prepared historical Claude result has no valid integrity digest."
+            )
+        for selected_model, prepared in preparations.items():
+            model_historical_digest = prepared.get("historical_result_sha256")
+            if not isinstance(model_historical_digest, str) or not secrets.compare_digest(
+                model_historical_digest, historical_result_sha256
+            ):
+                raise ControllerError(
+                    "The historical Claude result changed between selected models. "
+                    "Prepare the replay again."
+                )
+            model_configuration_digest = prepared.get("prepared_configuration_sha256")
+            if (
+                not isinstance(model_configuration_digest, str)
+                or re.fullmatch(r"[a-f0-9]{64}", model_configuration_digest) is None
+            ):
+                raise ControllerError(
+                    "The prepared replay configuration has no valid integrity digest."
+                )
+            prepared_configuration_digests[selected_model] = model_configuration_digest
     prepare_token: str | None = None
     if ready:
         prepare_token = secrets.token_urlsafe(32)
@@ -1673,20 +1612,58 @@ def _prepare_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
             while len(_prepared_runs) >= MAX_PREPARE_TOKENS:
                 _prepared_runs.pop(next(iter(_prepared_runs)))
             _prepared_runs[prepare_token] = {
+                "controller_session_id": CONTROLLER_SESSION_ID,
                 "fingerprint": _configuration_fingerprint(configuration),
                 "historical_result_sha256": historical_result_sha256,
                 "prepared_configuration_sha256": prepared_configuration_sha256,
+                "prepared_configuration_sha256_by_model": prepared_configuration_digests,
+                "models": selected_models,
                 "run_id": None,
+                "run_ids": [],
+                "errors": [],
                 "starting": False,
             }
+    blockers: list[Any] = []
+    questions: list[Any] = []
+    for prepared in preparations.values():
+        for blocker in prepared.get("blocking_reasons") or []:
+            if blocker not in blockers:
+                blockers.append(blocker)
+        for question in prepared.get("questions") or []:
+            if question not in questions:
+                questions.append(question)
+    approval_prompt = payload.get("approval_prompt") if ready else None
+    if ready and len(selected_models) > 1:
+        approval_prompt = (
+            f"Approve {len(selected_models)} parallel Codex implementations "
+            "using this configuration?"
+        )
+    status = payload.get("status")
+    if not ready:
+        status = next(
+            (
+                prepared.get("status")
+                for prepared in preparations.values()
+                if prepared.get("status") != "ready_for_approval"
+            ),
+            "blocked",
+        )
     return {
         **payload,
+        "controller_session_id": CONTROLLER_SESSION_ID,
+        "model": selected_models[0],
+        "models": selected_models,
+        "status": status,
+        "can_run": ready,
         "ready": ready,
-        "blockers": list(payload.get("blocking_reasons") or []),
+        "blocking_reasons": blockers,
+        "blockers": blockers,
+        "questions": questions,
+        "approval_prompt": approval_prompt,
         "prepare_token": prepare_token,
         "approval": {
             "required": True,
-            "prompt": payload.get("approval_prompt"),
+            "prompt": approval_prompt,
             "prepare_token": prepare_token,
         },
         "run_config": configuration,
@@ -1700,8 +1677,27 @@ def _safe_run_directory(run_id: str) -> Path:
     if path.parent != RUN_ROOT:
         raise ControllerError("The run directory is outside the configured run root.")
     if not path.is_dir():
-        raise ControllerError("The bakeoff run is unavailable.")
+        raise ControllerError("The replay run is unavailable.")
     return path
+
+
+def _ensure_controller_owns_run(
+    run_directory: Path,
+    *,
+    require_state: bool = True,
+) -> dict[str, Any] | None:
+    state_path = _state_path(run_directory)
+    if not state_path.is_file():
+        if require_state:
+            raise ControllerError("The replay run state is unavailable.")
+        return None
+    state = _read_json(state_path)
+    owner = state.get("controller_session_id")
+    if owner is None and not require_state:
+        return state
+    if owner != CONTROLLER_SESSION_ID:
+        raise ControllerError("The replay belongs to a different controller session.")
+    return state
 
 
 def _state_path(run_directory: Path) -> Path:
@@ -1732,6 +1728,23 @@ def _read_json(path: Path, *, maximum: int = MAX_STATE_BYTES) -> dict[str, Any]:
     return payload
 
 
+@contextmanager
+def _state_guard(run_directory: Path) -> Iterator[None]:
+    """Serialize durable state updates across MCP and coordinator processes."""
+    with _jobs_lock:
+        descriptor = os.open(
+            run_directory / ".controller-state.lock",
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
 def _initial_state(
     run_directory: Path,
     *,
@@ -1753,11 +1766,13 @@ def _initial_state(
     _append_run_log(log_path, "controller", "run approved")
     return {
         "schema_version": 2,
+        "controller_session_id": CONTROLLER_SESSION_ID,
         "id": run_directory.name,
         "run_id": run_directory.name,
         "run_directory": str(run_directory),
         "log_path": str(log_path),
         "controller_pid": os.getpid(),
+        "coordinator_pid": None,
         "prepare_token_hash": (
             hashlib.sha256(prepare_token.encode("utf-8")).hexdigest()
             if prepare_token is not None
@@ -1786,14 +1801,17 @@ def _update_state(
     *,
     phase: str | None = None,
     status: str | None = None,
+    expected_status: str | None = None,
     summary: str | None = None,
     details: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = _state_path(run_directory)
-    with _jobs_lock:
+    with _state_guard(run_directory):
         state = _read_json(path)
+        if expected_status is not None and state.get("status") != expected_status:
+            raise StateTransitionConflict(state)
         if state.get("status") == "cancelled" and status != "cancelled":
-            raise RunCancelled("The bakeoff was cancelled.")
+            raise RunCancelled("The replay was cancelled.")
         if phase is not None:
             previous = str(state.get("phase") or "")
             rows = state.get("phases")
@@ -1888,7 +1906,7 @@ def _materialize_workspace(run_directory: Path, target: Mapping[str, Any]) -> Pa
         workspace.mkdir()
         return workspace.resolve()
     if target_type != "project":
-        raise ControllerError("The bakeoff task has an unsupported workspace target.")
+        raise ControllerError("The replay task has an unsupported workspace target.")
     repository_raw = target.get("project")
     if not isinstance(repository_raw, str) or not repository_raw:
         raise ControllerError("The historical Git repository is missing.")
@@ -1966,6 +1984,8 @@ def _worker_request(
     expected_schema = request.get("expected_schema")
     if isinstance(expected_schema, Mapping):
         payload["outputSchema"] = dict(expected_schema)
+    if read_only and request.get("purpose") in {"evaluation", "review_normalization"}:
+        payload["reasoningEffort"] = "medium"
     return payload
 
 
@@ -2070,208 +2090,6 @@ def _run_worker(
     }
 
 
-def _claude_command(
-    executable: str,
-    *,
-    model: str,
-    schema: Mapping[str, Any] | None = None,
-    tools: str = "",
-) -> list[str]:
-    command = [
-        executable,
-        "--print",
-        "--output-format",
-        "json",
-        "--model",
-        model,
-        "--safe-mode",
-        "--no-session-persistence",
-        "--permission-mode",
-        "dontAsk",
-        "--tools",
-        tools,
-    ]
-    if tools:
-        command.extend(("--allowedTools", tools))
-    if schema is not None:
-        command.extend(
-            ("--json-schema", json.dumps(dict(schema), ensure_ascii=False, separators=(",", ":")))
-        )
-    return command
-
-
-def _parse_claude_envelope(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise ControllerError("The Claude CLI returned invalid JSON.") from error
-    if not isinstance(payload, Mapping):
-        raise ControllerError("The Claude CLI returned an invalid response.")
-    if completed.returncode != 0 or payload.get("is_error") is True:
-        raise ControllerError("The Claude CLI request failed.")
-    return dict(payload)
-
-
-def _claude_final_output(payload: Mapping[str, Any]) -> str:
-    structured = payload.get("structured_output")
-    if structured is not None:
-        return json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
-    result = payload.get("result")
-    if not isinstance(result, str) or not result.strip():
-        raise ControllerError("The Claude CLI returned no final response.")
-    return result
-
-
-def _claude_model_and_usage(
-    payload: Mapping[str, Any],
-    requested_model: str,
-) -> tuple[str, dict[str, Any]]:
-    usage = payload.get("usage")
-    normalized_usage = dict(usage) if isinstance(usage, Mapping) else {}
-    model_usage = payload.get("modelUsage")
-    if isinstance(model_usage, Mapping):
-        models = [str(model) for model in model_usage if str(model)]
-        if len(models) == 1:
-            model = models[0]
-            model_record = model_usage.get(model)
-            if not normalized_usage and isinstance(model_record, Mapping):
-                fields = {
-                    "input_tokens": ("input_tokens", "inputTokens"),
-                    "output_tokens": ("output_tokens", "outputTokens"),
-                    "cache_read_input_tokens": (
-                        "cache_read_input_tokens",
-                        "cacheReadInputTokens",
-                    ),
-                    "cache_creation_input_tokens": (
-                        "cache_creation_input_tokens",
-                        "cacheCreationInputTokens",
-                    ),
-                }
-                normalized_usage = {
-                    target: next(
-                        (model_record[source] for source in sources if source in model_record),
-                        0,
-                    )
-                    for target, sources in fields.items()
-                }
-            return model, normalized_usage
-    return requested_model, normalized_usage
-
-
-def _probe_claude_availability(run_directory: Path) -> dict[str, Any]:
-    executable = _claude_runtime()
-    if executable is None:
-        return {
-            "id": "claude",
-            "provider": "claude",
-            "model": CLAUDE_REVIEW_MODEL,
-            "available": False,
-            "reason_code": "not_installed",
-            "reason": "Claude CLI is not installed or executable.",
-        }
-    with tempfile.TemporaryDirectory(prefix="claude-probe-", dir=run_directory) as temporary:
-        try:
-            completed = _run_process(
-                _claude_command(executable, model=CLAUDE_REVIEW_MODEL),
-                cwd=Path(temporary),
-                timeout=CLAUDE_PROBE_TIMEOUT,
-                input_text="Reply with exactly READY. Do not use tools.",
-                stream_log_path=_run_log_path(run_directory),
-                stream_log_label="review-probe:claude",
-                run_id=run_directory.name,
-                env=dict(os.environ),
-            )
-            payload = _parse_claude_envelope(completed)
-            _claude_final_output(payload)
-        except subprocess.TimeoutExpired:
-            return {
-                "id": "claude",
-                "provider": "claude",
-                "model": CLAUDE_REVIEW_MODEL,
-                "available": False,
-                "executable": executable,
-                "reason_code": "probe_timed_out",
-                "reason": "Claude CLI API probe timed out.",
-            }
-        except ControllerError:
-            return {
-                "id": "claude",
-                "provider": "claude",
-                "model": CLAUDE_REVIEW_MODEL,
-                "available": False,
-                "executable": executable,
-                "reason_code": "api_unreachable",
-                "reason": "Claude CLI could not complete an API request.",
-            }
-    return {
-        "id": "claude",
-        "provider": "claude",
-        "model": CLAUDE_REVIEW_MODEL,
-        "available": True,
-        "executable": executable,
-        "reason_code": "available",
-        "reason": "Claude CLI completed an API request.",
-    }
-
-
-def _run_claude_review(
-    request: Mapping[str, Any],
-    *,
-    run_directory: Path,
-    working_directory: Path,
-    executable: str,
-    log_label: str,
-) -> dict[str, Any]:
-    model = request.get("model")
-    prompt = request.get("prompt")
-    schema = request.get("expected_schema")
-    if not isinstance(model, str) or not model:
-        raise ControllerError("The Claude review request has no model.")
-    if not isinstance(prompt, str) or not prompt:
-        raise ControllerError("The Claude review request has no prompt.")
-    if not isinstance(schema, Mapping):
-        raise ControllerError("The Claude review request has no output schema.")
-    timeout = _request_timeout_seconds(request, default=600)
-    started = time.monotonic()
-    try:
-        completed = _run_process(
-            _claude_command(executable, model=model, schema=schema, tools="Read"),
-            cwd=working_directory,
-            timeout=timeout,
-            input_text=prompt,
-            stream_log_path=_run_log_path(run_directory),
-            stream_log_label=log_label,
-            run_id=run_directory.name,
-            env=dict(os.environ),
-        )
-    except subprocess.TimeoutExpired as error:
-        raise ControllerError("The Claude reviewer timed out.") from error
-    payload = _parse_claude_envelope(completed)
-    final_output = _claude_final_output(payload)
-    actual_model, usage = _claude_model_and_usage(payload, model)
-    session_id = payload.get("session_id")
-    if not isinstance(session_id, str) or not session_id:
-        session_id = f"claude-{secrets.token_hex(8)}"
-    duration_ms = payload.get("duration_ms")
-    elapsed = (
-        float(duration_ms) / 1000
-        if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool)
-        else time.monotonic() - started
-    )
-    return {
-        "status": "completed",
-        "thread_id": session_id,
-        "worktree": str(working_directory),
-        "requested_worktree": str(working_directory),
-        "model": actual_model,
-        "elapsed_seconds": round(max(elapsed, 0.0), 6),
-        "usage": usage,
-        "final_output": final_output,
-        "final_response": final_output,
-        "evaluator": "claude",
-    }
-
-
 def _run_controller_smoke_test() -> None:
     try:
         with tempfile.TemporaryDirectory(prefix="codex-bakeoff-smoke-") as temporary:
@@ -2300,9 +2118,8 @@ def _request_synthesis_available(
         for item in model_options
         if isinstance(item, Mapping) and isinstance(item.get("id"), str)
     }
-    return (
-        REQUEST_SYNTHESIS_MODEL in available_models
-        and _request_synthesis_context_available(replay)
+    return REQUEST_SYNTHESIS_MODEL in available_models and _request_synthesis_context_available(
+        replay
     )
 
 
@@ -2623,7 +2440,7 @@ def _run_review_requests(
         evaluator = raw.get("normalization_for") if normalization else raw.get("evaluator")
         if not isinstance(evaluator, str) or not evaluator:
             raise ControllerError("A review request has no evaluator.")
-        if not normalization and evaluator not in {"codex", "claude"}:
+        if evaluator != "codex":
             raise ControllerError(f"Unsupported review evaluator: {evaluator}")
         request = dict(raw)
         with tempfile.TemporaryDirectory(
@@ -2659,52 +2476,26 @@ def _run_review_requests(
                 request["prompt"] = prompt
                 request["candidate_paths"] = isolated_paths
             log_label = (
-                f"normalization:codex-for-{evaluator}"
-                if normalization
-                else f"review:{evaluator}"
+                f"normalization:codex-for-{evaluator}" if normalization else f"review:{evaluator}"
             )
-            if normalization or evaluator == "codex":
-                worker = _run_worker(
-                    request,
-                    run_directory=run_directory,
-                    working_directory=workspace,
-                    read_only=True,
-                    log_label=log_label,
-                )
-                collected = _collect_result(
-                    run_directory,
-                    worker,
-                    evaluator=None if normalization else evaluator,
-                    normalization_for=evaluator if normalization else None,
-                    timeout=_long_command_timeout(raw, default=600),
-                )
-                path = collected.get("native_result_path")
-                if not isinstance(path, str):
-                    raise ControllerError("A reviewer result was not recorded.")
-                results.append(Path(path).resolve())
-                continue
-
-            executable = _claude_runtime()
-            try:
-                if executable is None:
-                    raise ControllerError("The Claude CLI became unavailable after its probe.")
-                result = _run_claude_review(
-                    request,
-                    run_directory=run_directory,
-                    working_directory=workspace,
-                    executable=executable,
-                    log_label=log_label,
-                )
-            except ControllerError as error:
-                result = {
-                    "status": "failed",
-                    "evaluator": "claude",
-                    "model": str(request.get("model") or CLAUDE_REVIEW_MODEL),
-                    "error": str(error)[:2_000],
-                }
-            path = run_directory / "reviews" / f"claude-{secrets.token_hex(8)}.json"
-            _write_json(path, result)
-            results.append(path.resolve())
+            worker = _run_worker(
+                request,
+                run_directory=run_directory,
+                working_directory=workspace,
+                read_only=True,
+                log_label=log_label,
+            )
+            collected = _collect_result(
+                run_directory,
+                worker,
+                evaluator=None if normalization else evaluator,
+                normalization_for=evaluator if normalization else None,
+                timeout=_long_command_timeout(raw, default=600),
+            )
+            path = collected.get("native_result_path")
+            if not isinstance(path, str):
+                raise ControllerError("A reviewer result was not recorded.")
+            results.append(Path(path).resolve())
     return results
 
 
@@ -2719,7 +2510,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
         target = task_request.get("target")
         if not isinstance(target, Mapping):
             raise ControllerError("The implementation task has no workspace target.")
-        workspace, worker = _run_implementation(run_directory, task_request, target)
+        _workspace, worker = _run_implementation(run_directory, task_request, target)
         _update_state(
             run_directory,
             phase="collecting",
@@ -2742,18 +2533,6 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             ["--run-dir", str(run_directory), "--native-result", native_result],
             run_directory=run_directory,
         )
-        _update_state(
-            run_directory,
-            phase="verifying",
-            summary="Running identical baseline-owned checks.",
-        )
-        verification = _engine(
-            "verify",
-            ["--run-dir", str(run_directory)],
-            timeout=long_timeout,
-            run_directory=run_directory,
-        )
-        claude_availability = _probe_claude_availability(run_directory)
         evaluator_availability = [
             {
                 "id": "codex",
@@ -2763,31 +2542,21 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
                 "reason_code": "available",
                 "reason": "Native Codex review is available through the app.",
             },
-            claude_availability,
         ]
-        selected_evaluators = ["codex"]
-        if claude_availability.get("available") is True:
-            selected_evaluators.append("claude")
         _update_state(
             run_directory,
             phase="reviewing",
-            summary=f"Running blinded review with {', '.join(selected_evaluators)}.",
+            summary="Running blinded review with Codex.",
             details={
-                "verification_status": verification.get("status"),
-                "selected_evaluators": selected_evaluators,
+                "selected_evaluators": ["codex"],
                 "evaluator_availability": evaluator_availability,
             },
         )
         evaluation_arguments = [
             "--run-dir",
             str(run_directory),
-            *[
-                argument
-                for evaluator in selected_evaluators
-                for argument in ("--evaluator", evaluator)
-            ],
-            "--claude-model",
-            CLAUDE_REVIEW_MODEL,
+            "--evaluator",
+            "codex",
             "--evaluator-availability-json",
             json.dumps(evaluator_availability, ensure_ascii=False),
         ]
@@ -2874,7 +2643,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             run_directory,
             phase="reporting",
             status="completed",
-            summary="The bakeoff report is ready.",
+            summary="The replay report is ready.",
             details={
                 "report_html": report_paths.get("report_html"),
                 "report_json": report_paths.get("report_json"),
@@ -2891,7 +2660,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             _update_state(
                 run_directory,
                 status="failed",
-                summary=f"Bakeoff stopped: {error}",
+                summary=f"Replay stopped: {error}",
                 details={"error": str(error)[:2_000]},
             )
         except Exception as state_error:  # noqa: BLE001
@@ -2900,20 +2669,41 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
                 file=sys.stderr,
             )
     finally:
-        with _jobs_lock:
-            _jobs.pop(run_directory.name, None)
         with _active_processes_lock:
             _run_processes.pop(run_directory.name, None)
             _run_cancellations.pop(run_directory.name, None)
 
 
-def _persisted_run_for_token(
+def _spawn_coordinator(run_directory: Path) -> subprocess.Popen[bytes]:
+    environment = _worker_environment()
+    environment["CODEX_BAKEOFF_RUN_ROOT"] = str(RUN_ROOT)
+    with _run_log_path(run_directory).open("ab", buffering=0) as log:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--run-coordinator",
+                run_directory.name,
+            ],
+            cwd=PLUGIN_ROOT,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+def _persisted_runs_for_token(
     prepare_token: str,
     configuration_fingerprint: str,
-) -> dict[str, Any] | None:
+    selected_models: Sequence[str],
+) -> list[dict[str, Any]]:
     if not RUN_ROOT.is_dir():
-        return None
+        return []
     token_hash = hashlib.sha256(prepare_token.encode("utf-8")).hexdigest()
+    states: dict[str, dict[str, Any]] = {}
     for run_directory in RUN_ROOT.iterdir():
         state_path = _state_path(run_directory)
         if not run_directory.is_dir() or not state_path.is_file():
@@ -2922,51 +2712,177 @@ def _persisted_run_for_token(
             state = _read_json(state_path)
         except ControllerError:
             continue
+        if state.get("controller_session_id") != CONTROLLER_SESSION_ID:
+            continue
         if state.get("prepare_token_hash") != token_hash:
             continue
         if state.get("configuration_fingerprint") != configuration_fingerprint:
             raise ControllerError(
                 "The approved configuration changed. Prepare and approve it again."
             )
-        return state
-    return None
+        if state.get("launch_failed") is True:
+            continue
+        model = state.get("model")
+        if not isinstance(model, str) and len(selected_models) == 1:
+            model = selected_models[0]
+        if isinstance(model, str) and model in selected_models:
+            states[model] = state
+    return [states[model] for model in selected_models if model in states]
+
+
+def _started_runs_response(
+    states: Sequence[Mapping[str, Any]],
+    selected_models: Sequence[str],
+    *,
+    errors: Sequence[Mapping[str, Any]] = (),
+    idempotent: bool,
+) -> dict[str, Any]:
+    runs: list[dict[str, Any]] = []
+    for state in states:
+        run_id = state.get("run_id")
+        if not isinstance(run_id, str):
+            raise ControllerError("The replay run state has no run ID.")
+        run_directory = _safe_run_directory(run_id)
+        model = state.get("model")
+        if not isinstance(model, str) and len(selected_models) == 1:
+            model = selected_models[0]
+        runs.append(
+            {
+                "run_id": run_id,
+                "model": model,
+                "run": _run_snapshot(run_directory, state),
+            }
+        )
+    if not runs:
+        raise ControllerError("None of the selected Codex model variants could start.")
+    first = runs[0]
+    return {
+        "run_id": first["run_id"],
+        "run": first["run"],
+        "model": first["model"],
+        "models": list(selected_models),
+        "runs": runs,
+        "errors": [dict(error) for error in errors],
+        "idempotent": idempotent,
+    }
+
+
+def _start_prepared_model(
+    configuration: Mapping[str, Any],
+    model: str,
+    *,
+    prepare_token: str,
+    fingerprint: str,
+    historical_result_sha256: str,
+    prepared_configuration_sha256: str,
+    selected_models: Sequence[str],
+) -> dict[str, Any]:
+    model_configuration = {key: value for key, value in configuration.items() if key != "models"}
+    model_configuration["model"] = model
+    payload = _engine(
+        "run",
+        [
+            *_configuration_arguments(model_configuration),
+            "--expected-historical-result-sha256",
+            historical_result_sha256,
+            "--expected-prepared-configuration-sha256",
+            prepared_configuration_sha256,
+            "--approve",
+            "--run-root",
+            str(RUN_ROOT),
+        ],
+        input_text=configuration["request"],
+    )
+    run_directory_raw = payload.get("run_directory")
+    task_request = payload.get("task_request")
+    if not isinstance(run_directory_raw, str) or not isinstance(task_request, Mapping):
+        raise ControllerError("The replay engine did not return an implementation task.")
+    run_directory = Path(run_directory_raw).resolve()
+    if run_directory.parent != RUN_ROOT:
+        raise ControllerError("The replay engine returned an unexpected run directory.")
+    state = _initial_state(
+        run_directory,
+        prepare_token=prepare_token,
+        configuration_fingerprint=fingerprint,
+    )
+    state["model"] = model
+    state["models"] = list(selected_models)
+    _write_json(_state_path(run_directory), state)
+    _write_private_json(run_directory / COORDINATOR_REQUEST_NAME, dict(task_request))
+    try:
+        coordinator = _spawn_coordinator(run_directory)
+    except OSError as error:
+        _update_state(
+            run_directory,
+            status="failed",
+            summary=f"The replay coordinator could not start: {error}",
+            details={"error": str(error)[:2_000], "launch_failed": True},
+        )
+        raise ControllerError("The replay coordinator could not start.") from error
+    return _update_state(
+        run_directory,
+        details={"coordinator_pid": coordinator.pid, "controller_pid": coordinator.pid},
+    )
 
 
 def _start_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
     if arguments.get("approved") is not True:
-        raise ControllerError("Explicit approval is required before starting a bakeoff.")
+        raise ControllerError("Explicit approval is required before starting a replay.")
     prepare_token = arguments.get("prepare_token")
     if not isinstance(prepare_token, str) or len(prepare_token) < 32:
         raise ControllerError("Prepare and approve this exact configuration before starting.")
     configuration = _normalized_configuration(arguments)
     fingerprint = _configuration_fingerprint(configuration)
+    selected_models = list(configuration.get("models") or [configuration["model"]])
     with _jobs_lock:
         receipt = _prepared_runs.get(prepare_token)
         if receipt is None:
-            persisted = _persisted_run_for_token(prepare_token, fingerprint)
-            if persisted is not None:
-                persisted_directory = _safe_run_directory(str(persisted["run_id"]))
-                return {
-                    "run_id": persisted["run_id"],
-                    "run": _run_snapshot(persisted_directory, persisted),
-                    "idempotent": True,
-                }
+            persisted = _persisted_runs_for_token(prepare_token, fingerprint, selected_models)
+            if persisted:
+                errors = next(
+                    (
+                        state_errors
+                        for state in persisted
+                        if isinstance(state_errors := state.get("run_group_errors"), list)
+                    ),
+                    [],
+                )
+                return _started_runs_response(
+                    persisted,
+                    selected_models,
+                    errors=errors,
+                    idempotent=True,
+                )
             raise ControllerError(
                 "The prepare token is missing or expired. Prepare and approve the run again."
             )
+        if receipt.get("controller_session_id") != CONTROLLER_SESSION_ID:
+            raise ControllerError("The prepared replay belongs to a different controller session.")
         if receipt.get("fingerprint") != fingerprint:
             raise ControllerError(
                 "The approved configuration changed. Prepare and approve it again."
+            )
+        run_ids = receipt.get("run_ids")
+        if isinstance(run_ids, list) and run_ids:
+            states = []
+            for run_id in run_ids:
+                if not isinstance(run_id, str):
+                    raise ControllerError("The approved replay has an invalid run ID.")
+                run_directory = _safe_run_directory(run_id)
+                states.append(_read_json(_state_path(run_directory)))
+            receipt_errors = receipt.get("errors")
+            errors = receipt_errors if isinstance(receipt_errors, list) else []
+            return _started_runs_response(
+                states,
+                selected_models,
+                errors=errors,
+                idempotent=True,
             )
         run_id = receipt.get("run_id")
         if isinstance(run_id, str):
             run_directory = _safe_run_directory(run_id)
             state = _read_json(_state_path(run_directory))
-            return {
-                "run_id": run_id,
-                "run": _run_snapshot(run_directory, state),
-                "idempotent": True,
-            }
+            return _started_runs_response([state], selected_models, idempotent=True)
         if receipt.get("starting") is True:
             raise ControllerError("This approved run is already being started. Retry shortly.")
         historical_result_sha256 = receipt.get("historical_result_sha256")
@@ -2977,74 +2893,81 @@ def _start_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
             raise ControllerError(
                 "The approved historical Claude result has no valid integrity digest."
             )
-        prepared_configuration_sha256 = receipt.get("prepared_configuration_sha256")
-        if (
-            not isinstance(prepared_configuration_sha256, str)
-            or re.fullmatch(r"[a-f0-9]{64}", prepared_configuration_sha256) is None
-        ):
-            raise ControllerError(
-                "The approved bakeoff configuration has no valid integrity digest."
-            )
+        prepared_digests = receipt.get("prepared_configuration_sha256_by_model")
+        if not isinstance(prepared_digests, Mapping):
+            prepared_digests = {selected_models[0]: receipt.get("prepared_configuration_sha256")}
+        model_digests: dict[str, str] = {}
+        for selected_model in selected_models:
+            prepared_configuration_sha256 = prepared_digests.get(selected_model)
+            if (
+                not isinstance(prepared_configuration_sha256, str)
+                or re.fullmatch(r"[a-f0-9]{64}", prepared_configuration_sha256) is None
+            ):
+                raise ControllerError(
+                    "The approved replay configuration has no valid integrity digest."
+                )
+            model_digests[selected_model] = prepared_configuration_sha256
         receipt["starting"] = True
 
     try:
-        command_arguments = _configuration_arguments(configuration)
-        payload = _engine(
-            "run",
-            [
-                *command_arguments,
-                "--expected-historical-result-sha256",
-                historical_result_sha256,
-                "--expected-prepared-configuration-sha256",
-                prepared_configuration_sha256,
-                "--approve",
-                "--run-root",
-                str(RUN_ROOT),
-            ],
-            input_text=configuration["request"],
-        )
+        states: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        if len(selected_models) == 1:
+            selected_model = selected_models[0]
+            states.append(
+                _start_prepared_model(
+                    configuration,
+                    selected_model,
+                    prepare_token=prepare_token,
+                    fingerprint=fingerprint,
+                    historical_result_sha256=historical_result_sha256,
+                    prepared_configuration_sha256=model_digests[selected_model],
+                    selected_models=selected_models,
+                )
+            )
+        else:
+            with ThreadPoolExecutor(max_workers=len(selected_models)) as executor:
+                futures = {
+                    selected_model: executor.submit(
+                        _start_prepared_model,
+                        configuration,
+                        selected_model,
+                        prepare_token=prepare_token,
+                        fingerprint=fingerprint,
+                        historical_result_sha256=historical_result_sha256,
+                        prepared_configuration_sha256=model_digests[selected_model],
+                        selected_models=selected_models,
+                    )
+                    for selected_model in selected_models
+                }
+                for selected_model in selected_models:
+                    try:
+                        states.append(futures[selected_model].result())
+                    except Exception as error:  # noqa: BLE001 - preserve other selected runs.
+                        errors.append({"model": selected_model, "error": str(error)[:2_000]})
+        if not states:
+            detail = "; ".join(f"{error['model']}: {error['error']}" for error in errors)
+            raise ControllerError(
+                f"None of the selected Codex model variants could start. {detail}".strip()
+            )
+        if errors:
+            states = [
+                _update_state(
+                    _safe_run_directory(str(state["run_id"])),
+                    details={"run_group_errors": errors},
+                )
+                for state in states
+            ]
     except Exception:
         with _jobs_lock:
             receipt["starting"] = False
         raise
-    run_directory_raw = payload.get("run_directory")
-    task_request = payload.get("task_request")
-    if not isinstance(run_directory_raw, str) or not isinstance(task_request, Mapping):
-        with _jobs_lock:
-            receipt["starting"] = False
-        raise ControllerError("The bakeoff engine did not return an implementation task.")
-    run_directory = Path(run_directory_raw).resolve()
-    if run_directory.parent != RUN_ROOT:
-        with _jobs_lock:
-            receipt["starting"] = False
-        raise ControllerError("The bakeoff engine returned an unexpected run directory.")
     with _jobs_lock:
-        receipt["run_id"] = run_directory.name
+        receipt["run_id"] = states[0]["run_id"]
+        receipt["run_ids"] = [state["run_id"] for state in states]
+        receipt["errors"] = errors
         receipt["starting"] = False
-    state = _initial_state(
-        run_directory,
-        prepare_token=prepare_token,
-        configuration_fingerprint=fingerprint,
-    )
-    _write_json(_state_path(run_directory), state)
-    thread = threading.Thread(
-        target=_coordinator,
-        args=(run_directory, dict(task_request)),
-        name=f"codex-bakeoff-{run_directory.name}",
-        daemon=True,
-    )
-    with _jobs_lock:
-        if run_directory.name in _jobs:
-            raise ControllerError("This bakeoff run is already active.")
-        _jobs[run_directory.name] = thread
-    with _active_processes_lock:
-        _run_cancellations[run_directory.name] = threading.Event()
-    thread.start()
-    return {
-        "run_id": run_directory.name,
-        "run": _run_snapshot(run_directory, state),
-        "idempotent": False,
-    }
+    return _started_runs_response(states, selected_models, errors=errors, idempotent=False)
 
 
 def _cancel_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -3052,23 +2975,33 @@ def _cancel_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(run_id, str):
         raise ControllerError("run_id is required.")
     run_directory = _safe_run_directory(run_id)
-    state = _read_json(_state_path(run_directory))
+    state = _ensure_controller_owns_run(run_directory)
+    if state is None:
+        raise ControllerError("The replay run state is unavailable.")
     if state.get("status") in {"completed", "failed", "cancelled"}:
         return {
             "run_id": run_id,
             "run": _run_snapshot(run_directory, state),
             "idempotent": True,
         }
-    state = _update_state(
-        run_directory,
-        status="cancelled",
-        summary="The run was cancelled by the user.",
-        details={
-            "error": "Cancelled by user.",
-            "cancelled": True,
-            "cancellation_reason": "user_requested",
-        },
-    )
+    try:
+        state = _update_state(
+            run_directory,
+            status="cancelled",
+            expected_status="running",
+            summary="The run was cancelled by the user.",
+            details={
+                "error": "Cancelled by user.",
+                "cancelled": True,
+                "cancellation_reason": "user_requested",
+            },
+        )
+    except StateTransitionConflict as conflict:
+        return {
+            "run_id": run_id,
+            "run": _run_snapshot(run_directory, conflict.state),
+            "idempotent": True,
+        }
     with _active_processes_lock:
         cancellation = _run_cancellations.get(run_id)
         if cancellation is not None:
@@ -3076,6 +3009,19 @@ def _cancel_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
         processes = list(_run_processes.get(run_id, ()))
     for process in processes:
         _terminate_process_group(process)
+    coordinator_pid = state.get("coordinator_pid")
+    if (
+        isinstance(coordinator_pid, int)
+        and not isinstance(coordinator_pid, bool)
+        and coordinator_pid > 0
+        and coordinator_pid not in {os.getpid(), os.getpgrp()}
+    ):
+        try:
+            os.killpg(coordinator_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            raise ControllerError("The replay coordinator could not be stopped.") from error
     return {
         "run_id": run_id,
         "run": _run_snapshot(run_directory, state),
@@ -3096,6 +3042,8 @@ def _recent_runs(limit: int = 12) -> list[dict[str, Any]]:
         try:
             state = _read_json(state_path)
         except ControllerError:
+            continue
+        if state.get("controller_session_id") != CONTROLLER_SESSION_ID:
             continue
         results.append(state)
         if len(results) >= limit:
@@ -3142,9 +3090,7 @@ def _inspect_thread(arguments: Mapping[str, Any]) -> dict[str, Any]:
     baseline_record = baseline_value if isinstance(baseline_value, Mapping) else {}
     thread = replay.get("replay")
     raw_thread_record = (
-        dict(thread)
-        if isinstance(thread, Mapping)
-        else {"imported_thread_id": thread_id}
+        dict(thread) if isinstance(thread, Mapping) else {"imported_thread_id": thread_id}
     )
     model_options = list(models.get("options") or [])
     thread_record = dict(raw_thread_record)
@@ -3175,11 +3121,65 @@ def _inspect_thread(arguments: Mapping[str, Any]) -> dict[str, Any]:
         },
         "models": model_options,
         "questions": list(baseline.get("questions") or []),
-        "repository_blockers": list(
-            baseline.get("repository_blocking_reasons") or []
-        ),
+        "repository_blockers": list(baseline.get("repository_blocking_reasons") or []),
         "blockers": list(baseline.get("blocking_reasons") or []),
         "diagnostics": diagnostics,
+    }
+
+
+def _state_payload() -> dict[str, Any]:
+    diagnostics: list[dict[str, str]] = []
+    try:
+        models = _engine("models")
+    except Exception as error:  # noqa: BLE001 - model can be entered in Review.
+        models = {}
+        diagnostics.append({"step": "models", "message": str(error)[:2_000]})
+    return {
+        "plugin_version": SERVER_VERSION,
+        "controller_session_id": CONTROLLER_SESSION_ID,
+        "models": list(models.get("options") or []),
+        "diagnostics": diagnostics,
+        "recent_runs": _recent_runs(),
+        "run_root": str(RUN_ROOT),
+    }
+
+
+def _thread_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    offset = _bounded_int(arguments.get("offset"), default=0, minimum=0, maximum=100_000)
+    limit = _bounded_int(arguments.get("limit"), default=20, minimum=1, maximum=100)
+    query = arguments.get("query")
+    if query is not None and not isinstance(query, str):
+        raise ControllerError("query must be a string.")
+    if isinstance(query, str) and query.strip():
+        response = _engine("sessions", ["--limit", "100", "--offset", "0"])
+        needle = query.casefold().strip()
+        raw = response.get("sessions")
+        sessions = raw if isinstance(raw, list) else []
+        filtered = [
+            item
+            for item in sessions
+            if isinstance(item, Mapping)
+            and needle
+            in " ".join(
+                str(item.get(key) or "") for key in ("title", "project_dir", "claude_model")
+            ).casefold()
+        ]
+        threads = filtered[offset : offset + limit]
+        response = {
+            **response,
+            "offset": offset,
+            "total": len(filtered),
+            "has_more": offset + len(threads) < len(filtered),
+        }
+    else:
+        response = _engine(
+            "sessions",
+            ["--limit", str(limit), "--offset", str(offset)],
+        )
+        sessions = response.get("sessions")
+        threads = list(sessions) if isinstance(sessions, list) else []
+    return {key: value for key, value in response.items() if key != "sessions"} | {
+        "threads": threads
     }
 
 
@@ -3192,71 +3192,14 @@ def _call_tool(params: Any) -> dict[str, Any]:
         runtime_error = _python_runtime_error_result()
         if runtime_error is not None:
             return runtime_error
-        return _open_external_controller(codex_cli_path=arguments.get("codex_cli_path"))
-    if name == "stop_port_process_and_open_controller":
-        runtime_error = _python_runtime_error_result()
-        if runtime_error is not None:
-            return runtime_error
-        if arguments.get("confirmed") is not True:
-            raise ControllerError("Explicit user confirmation is required.")
-        token = arguments.get("confirmation_token")
-        if not isinstance(token, str) or len(token) < 32:
-            raise ControllerError("A valid port-process confirmation token is required.")
-        return _open_external_controller(confirmation_token=token)
+        return _open_controller(codex_cli_path=arguments.get("codex_cli_path"))
     if name == "get_state":
-        diagnostics: list[dict[str, str]] = []
-        try:
-            models = _engine("models")
-        except Exception as error:  # noqa: BLE001 - model can be entered in Review.
-            models = {}
-            diagnostics.append({"step": "models", "message": str(error)[:2_000]})
-        state = {
-            "plugin_version": SERVER_VERSION,
-            "models": list(models.get("options") or []),
-            "diagnostics": diagnostics,
-            "recent_runs": _recent_runs(),
-            "run_root": str(RUN_ROOT),
-            "controller_log_path": str(CONTROLLER_LOG_PATH),
-        }
-        return _text_result("Codex Bakeoff is ready.", {"state": state})
+        return _text_result("Codex Bakeoff is ready.", {"state": _state_payload()})
     if name == "list_threads":
-        offset = _bounded_int(arguments.get("offset"), default=0, minimum=0, maximum=100_000)
-        limit = _bounded_int(arguments.get("limit"), default=20, minimum=1, maximum=100)
-        query = arguments.get("query")
-        if query is not None and not isinstance(query, str):
-            raise ControllerError("query must be a string.")
-        if isinstance(query, str) and query.strip():
-            payload = _engine("sessions", ["--limit", "100", "--offset", "0"])
-            needle = query.casefold().strip()
-            raw = payload.get("sessions")
-            sessions = raw if isinstance(raw, list) else []
-            filtered = [
-                item
-                for item in sessions
-                if isinstance(item, Mapping)
-                and needle
-                in " ".join(
-                    str(item.get(key) or "") for key in ("title", "project_dir", "claude_model")
-                ).casefold()
-            ]
-            threads = filtered[offset : offset + limit]
-            response = {
-                **payload,
-                "offset": offset,
-                "total": len(filtered),
-                "has_more": offset + len(threads) < len(filtered),
-                "sessions": threads,
-            }
-        else:
-            response = _engine(
-                "sessions",
-                ["--limit", str(limit), "--offset", str(offset)],
-            )
-        sessions = response.get("sessions")
-        threads = list(sessions) if isinstance(sessions, list) else []
+        payload = _thread_payload(arguments)
         return _text_result(
-            f"Loaded {len(threads)} imported Claude thread(s).",
-            {**response, "threads": threads},
+            f"Loaded {len(payload['threads'])} imported Claude thread(s).",
+            payload,
         )
     if name == "inspect_thread":
         return _text_result("Imported thread inspected.", _inspect_thread(arguments))
@@ -3271,22 +3214,22 @@ def _call_tool(params: Any) -> dict[str, Any]:
             _synthesize_request_payload(arguments),
         )
     if name == "prepare_run":
-        return _text_result("Bakeoff configuration prepared.", _prepare_payload(arguments))
+        return _text_result("Replay configuration prepared.", _prepare_payload(arguments))
     if name == "start_run":
-        return _text_result("The approved bakeoff started.", _start_run(arguments))
+        return _text_result("The approved replay started.", _start_run(arguments))
     if name == "cancel_run":
-        return _text_result("The bakeoff was cancelled.", _cancel_run(arguments))
+        return _text_result("The replay was cancelled.", _cancel_run(arguments))
     if name == "get_run":
         run_id = arguments.get("run_id")
         if not isinstance(run_id, str):
             raise ControllerError("run_id is required.")
         run_directory = _safe_run_directory(run_id)
-        state = _run_snapshot(
-            run_directory,
-            _read_json(_state_path(run_directory)),
-        )
+        owned_state = _ensure_controller_owns_run(run_directory)
+        if owned_state is None:
+            raise ControllerError("The replay run state is unavailable.")
+        state = _run_snapshot(run_directory, owned_state)
         return _text_result(
-            f"Bakeoff {run_id} is {state.get('status', 'unknown')}.",
+            f"Replay {run_id} is {state.get('status', 'unknown')}.",
             {"run": state},
         )
     if name == "get_report":
@@ -3294,12 +3237,46 @@ def _call_tool(params: Any) -> dict[str, Any]:
         if not isinstance(run_id, str):
             raise ControllerError("run_id is required.")
         run_directory = _safe_run_directory(run_id)
+        _ensure_controller_owns_run(run_directory, require_state=False)
         report_path = run_directory / "report.json"
+        if report_path.resolve().parent != run_directory:
+            raise ControllerError("The replay report is outside its run directory.")
         if not report_path.is_file():
-            raise ControllerError("The bakeoff report is not ready.")
+            raise ControllerError("The replay report is not ready.")
+        artifact_format = arguments.get("format")
+        if artifact_format is not None:
+            if not isinstance(artifact_format, str) or artifact_format not in {
+                "json",
+                "html",
+            }:
+                raise ControllerError("Report format must be json or html.")
+            artifact_path = run_directory / f"report.{artifact_format}"
+            try:
+                if artifact_path.resolve().parent != run_directory:
+                    raise ControllerError("The replay report is outside its run directory.")
+                if artifact_path.stat().st_size > MAX_REPORT_BYTES:
+                    raise ControllerError(f"report.{artifact_format} is too large to display.")
+                artifact_content = artifact_path.read_text(encoding="utf-8")
+            except ControllerError:
+                raise
+            except (OSError, UnicodeError) as error:
+                raise ControllerError(
+                    f"The {artifact_format.upper()} replay report is unavailable."
+                ) from error
+            return _text_result(
+                f"The {artifact_format.upper()} replay report is ready.",
+                {
+                    "artifact_content": artifact_content,
+                    "artifact_format": artifact_format,
+                    "artifact_mime_type": (
+                        "application/json" if artifact_format == "json" else "text/html"
+                    ),
+                    "artifact_file_name": (f"codex-bakeoff-{run_id}-report.{artifact_format}"),
+                },
+            )
         report = _read_json(report_path, maximum=MAX_REPORT_BYTES)
         return _text_result(
-            "The bakeoff report is ready.",
+            "The replay report is ready.",
             {
                 "report": report,
                 "report_json": str(report_path),
@@ -3336,6 +3313,9 @@ def _handle_request(method: Any, params: Any) -> tuple[Any, dict[str, Any] | Non
         return {"tools": tool_definitions()}, None
     if method == "tools/call":
         try:
+            name = params.get("name") if isinstance(params, Mapping) else None
+            if not isinstance(name, str) or name not in PUBLIC_TOOL_NAMES:
+                raise ControllerError(f"Unknown Codex Bakeoff tool: {name}")
             return _call_tool(params), None
         except Exception as error:  # noqa: BLE001 - always answer an MCP tool request.
             return {
@@ -3346,9 +3326,6 @@ def _handle_request(method: Any, params: Any) -> tuple[Any, dict[str, Any] | Non
         return {"resources": []}, None
     if method == "resources/templates/list":
         return {"resourceTemplates": []}, None
-    if method == "resources/read":
-        uri = params.get("uri") if isinstance(params, Mapping) else None
-        return None, {"code": -32602, "message": f"Unknown resource: {uri}"}
     if method == "prompts/list":
         return {"prompts": []}, None
     return None, {"code": -32601, "message": f"Method not found: {method}"}
@@ -3357,7 +3334,7 @@ def _handle_request(method: Any, params: Any) -> tuple[Any, dict[str, Any] | Non
 def _handle_rpc_line(line: str) -> dict[str, Any] | None:
     request = json.loads(line)
     if not isinstance(request, Mapping):
-        raise ValueError("MCP request must be an object.")
+        raise TypeError("MCP request must be an object.")
     if request.get("id") is None:
         return None
     result, error = _handle_request(request.get("method"), request.get("params"))
@@ -3381,6 +3358,59 @@ def _pid_is_alive(raw_pid: Any) -> bool:
     return True
 
 
+def _controller_session_is_live(controller_session_id: str) -> bool:
+    runtime = _read_controller_runtime(controller_session_id)
+    if not runtime:
+        return False
+    process_id = runtime.get("pid")
+    if not _pid_is_alive(process_id):
+        return False
+    if runtime.get("controller_session_id") != controller_session_id:
+        return True
+    port = runtime.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65_535:
+        return True
+    status, health = _probe_controller(port, controller_session_id=controller_session_id)
+    if (
+        status == "compatible"
+        and health.get("controller_session_id") == controller_session_id
+        and health.get("pid") == process_id
+    ):
+        return True
+    return _pid_is_alive(process_id)
+
+
+def _adopt_orphaned_runs(*, controller_session_id: str | None = None) -> None:
+    owner = controller_session_id or CONTROLLER_SESSION_ID
+    if not RUN_ROOT.is_dir():
+        return
+    try:
+        run_directories = list(RUN_ROOT.iterdir())
+    except OSError:
+        return
+    for run_directory in run_directories:
+        state_path = _state_path(run_directory)
+        if not run_directory.is_dir() or not state_path.is_file():
+            continue
+        try:
+            with _state_guard(run_directory):
+                state = _read_json(state_path)
+                previous_owner = state.get("controller_session_id")
+                if (
+                    state.get("status") != "running"
+                    or not isinstance(previous_owner, str)
+                    or re.fullmatch(r"[a-f0-9]{32}", previous_owner) is None
+                    or previous_owner == owner
+                    or _controller_session_is_live(previous_owner)
+                ):
+                    continue
+                state["controller_session_id"] = owner
+                state["updated_at"] = _utc_now()
+                _write_json(state_path, state)
+        except (ControllerError, OSError):
+            continue
+
+
 def _mark_interrupted(run_directory: Path, summary: str) -> None:
     try:
         state = _read_json(_state_path(run_directory))
@@ -3389,18 +3419,20 @@ def _mark_interrupted(run_directory: Path, summary: str) -> None:
         _update_state(
             run_directory,
             status="failed",
+            expected_status="running",
             summary=summary,
             details={
                 "error": summary,
                 "interrupted": True,
-                "interruption_reason": "controller_stopped",
+                "interruption_reason": "coordinator_stopped",
             },
         )
-    except ControllerError:
+    except (ControllerError, StateTransitionConflict):
         return
 
 
-def _reconcile_interrupted_runs() -> None:
+def _reconcile_interrupted_runs(*, controller_session_id: str | None = None) -> None:
+    owner = controller_session_id or CONTROLLER_SESSION_ID
     if not RUN_ROOT.is_dir():
         return
     for run_directory in RUN_ROOT.iterdir():
@@ -3411,13 +3443,16 @@ def _reconcile_interrupted_runs() -> None:
             state = _read_json(state_path)
         except ControllerError:
             continue
+        if state.get("controller_session_id") != owner:
+            continue
         if state.get("status") != "running":
             continue
-        if _pid_is_alive(state.get("controller_pid")):
+        coordinator_pid = state.get("coordinator_pid") or state.get("controller_pid")
+        if _pid_is_alive(coordinator_pid):
             continue
         _mark_interrupted(
             run_directory,
-            "The controller stopped before this bakeoff finished.",
+            "The coordinator stopped before this replay finished.",
         )
 
 
@@ -3427,14 +3462,12 @@ def _stop_jobs() -> None:
         processes = list(_active_processes)
     for process in processes:
         _terminate_process_group(process)
-    with _jobs_lock:
-        run_ids = list(_jobs)
-    for run_id in run_ids:
-        run_directory = RUN_ROOT / run_id
+    if _coordinator_run_id is not None:
+        run_directory = RUN_ROOT / _coordinator_run_id
         if run_directory.is_dir():
             _mark_interrupted(
                 run_directory,
-                "The controller shut down before this bakeoff finished.",
+                "The coordinator shut down before this replay finished.",
             )
 
 
@@ -3442,6 +3475,7 @@ atexit.register(_stop_jobs)
 
 
 def _handle_shutdown(_signum: int, _frame: Any) -> None:
+    _stop_jobs()
     raise SystemExit(0)
 
 
@@ -3449,6 +3483,7 @@ signal.signal(signal.SIGTERM, _handle_shutdown)
 
 
 def run_stdio() -> None:
+    _reconcile_interrupted_runs()
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -3461,11 +3496,37 @@ def run_stdio() -> None:
             print(json.dumps(response, separators=(",", ":")), flush=True)
 
 
+def _run_detached_coordinator(run_id: str) -> int:
+    global _coordinator_run_id
+    try:
+        run_directory = _safe_run_directory(run_id)
+        _coordinator_run_id = run_id
+        task_request = _read_json(
+            run_directory / COORDINATOR_REQUEST_NAME,
+            maximum=MAX_REPORT_BYTES,
+        )
+        with _active_processes_lock:
+            _run_cancellations[run_id] = threading.Event()
+        _update_state(
+            run_directory,
+            details={"coordinator_pid": os.getpid(), "controller_pid": os.getpid()},
+        )
+        _coordinator(run_directory, task_request)
+    except RunCancelled:
+        return 0
+    except ControllerError as error:
+        print(f"Codex Bakeoff coordinator failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     if sys.argv[1:] == ["--http"]:
         return run_http()
+    if len(sys.argv) == 3 and sys.argv[1] == "--run-coordinator":
+        return _run_detached_coordinator(sys.argv[2])
     if sys.argv[1:]:
-        print("Usage: server.py [--http]", file=sys.stderr)
+        print("Usage: server.py [--http | --run-coordinator RUN_ID]", file=sys.stderr)
         return 2
     try:
         run_stdio()
