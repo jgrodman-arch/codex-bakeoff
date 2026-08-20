@@ -1874,6 +1874,69 @@ class LeanReplayTests(unittest.TestCase):
         self.assertEqual(restored.diff, candidate.diff)
         self.assertEqual(restored.final_response, "historical response")
 
+    def test_completion_preserves_recorded_claude_code_cost_estimate(self) -> None:
+        run_directory = self.root / "recorded-cost-run"
+        run_directory.mkdir()
+        captured_metrics = {
+            "duration_ms": 24_321,
+            "duration_api_ms": 17_402,
+            "total_cost_usd": 0.1827364,
+        }
+        replay_engine._write_json(
+            run_directory / "run.json",
+            {
+                "replay": {
+                    "request": "fix the jq parser",
+                    "session_id": "claude-session",
+                    "recorded_claude_result": captured_metrics,
+                },
+                "baseline": {"kind": "git_commit"},
+                "capabilities": {},
+                "model": "gpt-test",
+            },
+        )
+        native_path = self.root / "recorded-cost-native.json"
+        replay_engine._write_json(native_path, {"model": "gpt-test"})
+        historical = replay_engine._execution().CandidateSolution(
+            provider="claude", diff="historical patch", model="claude-opus-5"
+        )
+        codex = replay_engine._execution().CandidateSolution(
+            provider="codex", diff="codex patch", model="gpt-test"
+        )
+        report = {
+            "estimated_cost": {
+                "claude": {"status": "estimated", "usd": 0.25},
+                "codex": {"status": "estimated", "usd": 0.05},
+            }
+        }
+        with (
+            mock.patch.object(
+                replay_engine,
+                "_historical_candidate_for_completion",
+                return_value=(historical, {"limitations": []}, "done"),
+            ),
+            mock.patch.object(
+                replay_engine,
+                "_codex_candidate",
+                return_value=(codex, "codex patch", ("src/main.c",)),
+            ),
+            mock.patch.object(replay_engine, "_usage_records", return_value=((), ())),
+            mock.patch.object(replay_engine._execution(), "generate_report", return_value=report),
+            mock.patch.object(replay_engine, "_write_report") as write_report,
+        ):
+            completed = replay_engine._command_complete_run(
+                argparse.Namespace(run_dir=run_directory, native_result=native_path)
+            )
+
+        self.assertEqual(completed["status"], "completed")
+        saved = write_report.call_args.args[1]
+        self.assertEqual(saved["estimated_cost"]["claude"]["usd"], 0.1827364)
+        self.assertEqual(
+            saved["estimated_cost"]["claude"]["basis"],
+            "recorded Claude Code API-equivalent estimate",
+        )
+        self.assertEqual(saved["recorded_claude_result"], captured_metrics)
+
     def test_completion_rejects_a_tampered_historical_artifact(self) -> None:
         run_directory = self.root / "tampered-run"
         run_directory.mkdir()
@@ -2138,6 +2201,41 @@ class LeanReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(replay_engine.ReplayError, "only the Codex reviewer"):
             replay_engine._evaluator_availability(json.dumps([{"id": "claude", "available": True}]))
 
+    def test_reviewer_discovery_prefers_sol_then_best_available_model(self) -> None:
+        cases = (
+            (["gpt-custom", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"], "gpt-5.6-sol"),
+            (["gpt-5.6-luna", "gpt-5.6-terra"], "gpt-5.6-terra"),
+            (["gpt-custom", "gpt-5.6-luna"], "gpt-5.6-luna"),
+            (["gpt-custom", "gpt-another"], "gpt-custom"),
+        )
+        catalog = self.root / "review-models.json"
+        for models, expected in cases:
+            with self.subTest(models=models):
+                catalog.write_text(
+                    json.dumps(
+                        {
+                            "models": [
+                                {
+                                    "slug": model,
+                                    "visibility": "list",
+                                    "supported_in_api": True,
+                                }
+                                for model in models
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                discovered = replay_engine._command_reviewers(
+                    argparse.Namespace(model_cache=catalog)
+                )
+                self.assertEqual(discovered["status"], "available")
+                self.assertEqual(discovered["evaluators"][0]["model"], expected)
+
+        catalog.write_text('{"models":[]}', encoding="utf-8")
+        unavailable = replay_engine._command_reviewers(argparse.Namespace(model_cache=catalog))
+        self.assertEqual(unavailable, {"status": "unavailable", "evaluators": []})
+
     def test_evaluation_blinds_both_candidates_for_one_codex_reviewer(self) -> None:
         run_directory = self.root / "run"
         run_directory.mkdir()
@@ -2160,7 +2258,7 @@ class LeanReplayTests(unittest.TestCase):
                 },
             },
         )
-        availability = [{"id": "codex", "model": "gpt-review", "available": True}]
+        availability = [{"id": "codex", "model": "gpt-5.6-sol", "available": True}]
 
         evaluation = replay_engine._command_evaluate(
             argparse.Namespace(
@@ -2174,7 +2272,7 @@ class LeanReplayTests(unittest.TestCase):
         self.assertEqual(len(evaluation["task_requests"]), 1)
         request = evaluation["task_requests"][0]
         self.assertEqual(request["evaluator"], "codex")
-        self.assertEqual(request["model"], "gpt-review")
+        self.assertEqual(request["model"], "gpt-5.6-sol")
         self.assertEqual(request["purpose"], "evaluation")
         candidates = [
             json.loads(Path(path).read_text(encoding="utf-8"))
@@ -2187,6 +2285,100 @@ class LeanReplayTests(unittest.TestCase):
         stored = json.loads((run_directory / "review.json").read_text(encoding="utf-8"))
         self.assertEqual(stored["evaluator_availability"], availability)
         self.assertEqual(len(stored["task_requests"]), 1)
+
+    def test_shared_evaluation_freezes_claude_checks_and_common_score_dimensions(self) -> None:
+        shared_path = self.root / "shared" / "historical-evaluation.json"
+        digest = "a" * 64
+        reports: list[Path] = []
+        first_checks: dict[str, dict[str, int | None]] | None = None
+
+        for index, model in enumerate(("gpt-5.6-terra", "gpt-5.6-luna")):
+            run_directory = self.root / f"run-{index}"
+            run_directory.mkdir()
+            reports.append(run_directory / "report.json")
+            replay_engine._write_json(
+                run_directory / "run.json",
+                {"model": model, "historical_result": {"sha256": digest}},
+            )
+            replay_engine._write_json(
+                run_directory / "report.json",
+                {
+                    "status": "completed",
+                    "original_request": "Build the requested behavior",
+                    "candidates": {
+                        "claude": {"diff": "+historical implementation", "model": "claude"},
+                        "codex": {"diff": "+replayed implementation", "model": model},
+                    },
+                },
+            )
+            evaluation = replay_engine._command_evaluate(
+                argparse.Namespace(
+                    run_dir=run_directory,
+                    evaluator=["codex"],
+                    evaluator_availability_json=None,
+                    evaluator_model="gpt-5.6-terra",
+                    historical_evaluation=shared_path,
+                )
+            )
+            request = evaluation["task_requests"][0]
+            self.assertEqual(request["model"], "gpt-5.6-terra")
+            if index:
+                self.assertIn("Do not evaluate Candidate A again", request["prompt"])
+                self.assertIn("Frozen Candidate A checks", request["prompt"])
+            else:
+                self.assertNotIn("Frozen Candidate A checks", request["prompt"])
+
+            ballot = json.loads(_review_ballot())
+            if index:
+                for dimension in ballot["dimensions"].values():
+                    dimension["candidates"]["A"]["checks"] = {
+                        check: 0 for check in dimension["candidates"]["A"]["checks"]
+                    }
+                scope = ballot["dimensions"]["change_scope"]["candidates"]["B"]["checks"]
+                ballot["dimensions"]["change_scope"]["candidates"]["B"]["checks"] = {
+                    check: None for check in scope
+                }
+            else:
+                first_checks = {
+                    name: dict(dimension["candidates"]["A"]["checks"])
+                    for name, dimension in ballot["dimensions"].items()
+                }
+            native_results = run_directory / "reviews" / "results.json"
+            replay_engine._write_json(
+                native_results,
+                {
+                    "results": [
+                        {
+                            "evaluator": "codex",
+                            "model": "gpt-5.6-terra",
+                            "final_output": json.dumps(ballot),
+                        }
+                    ]
+                },
+            )
+            replay_engine._command_complete_evaluation(
+                argparse.Namespace(
+                    run_dir=run_directory,
+                    native_results=native_results,
+                    normalized_result=None,
+                    historical_evaluation=shared_path,
+                )
+            )
+
+        evaluations = [json.loads(path.read_text())["evaluation"] for path in reports]
+        self.assertEqual(json.loads(shared_path.read_text())["evaluator_model"], "gpt-5.6-terra")
+        self.assertEqual(evaluations[0]["totals"]["A"], evaluations[1]["totals"]["A"])
+        self.assertNotIn("change_scope", evaluations[0]["comparable_dimensions"])
+        self.assertEqual(
+            evaluations[0]["comparable_dimensions"],
+            evaluations[1]["comparable_dimensions"],
+        )
+        for evaluation in evaluations:
+            actual_checks = {
+                name: dimension["candidates"]["A"]["checks"]
+                for name, dimension in evaluation["reviews"][0]["ballot"]["dimensions"].items()
+            }
+            self.assertEqual(actual_checks, first_checks)
 
     def test_invalid_review_requests_one_schema_normalization_task(self) -> None:
         run_directory = self.root / "run"
@@ -2643,6 +2835,271 @@ class LeanReplayTests(unittest.TestCase):
         self.assertNotIn("final_response", combined)
         self.assertNotIn("explanation", combined)
         self.assertIn("ballot", combined)
+
+    def test_collected_review_preserves_redacted_check_explanations_end_to_end(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        replay_engine._write_json(run_directory / "run.json", {"model": "gpt-test"})
+        replay_engine._write_json(
+            run_directory / "report.json",
+            {"status": "completed", "original_request": "Build the thing"},
+        )
+        private_reasoning = "PRIVATE_REVIEWER_REASONING_MUST_NOT_BE_PERSISTED"
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz"
+        private_path = "/Users/alice/private/repository.py"
+        ballot = json.loads(_review_ballot())
+        for dimension, decision in ballot["dimensions"].items():
+            for label, candidate in decision["candidates"].items():
+                candidate["explanations"] = {
+                    check: f"Observed {dimension}.{check} evidence for candidate {label}."
+                    for check in candidate["checks"]
+                }
+        candidates = ballot["dimensions"]["request_fulfillment"]["candidates"]
+        candidates["A"]["explanations"]["required_behavior"] = (
+            "Observed the requested behavior in candidate A's patch."
+        )
+        candidates["B"]["explanations"]["required_behavior"] = (
+            f"Codex exposed credential {secret} in {private_path} while integrating."
+        )
+        result = {
+            "status": "completed",
+            "evaluator": "codex",
+            "model": "gpt-test",
+            "thread_id": "review-thread",
+            "worktree": str(self.root),
+            "final_output": json.dumps(ballot),
+            "final_response": private_reasoning,
+            "explanation": private_reasoning,
+        }
+
+        with mock.patch.object(
+            replay_engine._execution(),
+            "collect_native_task_result",
+            return_value=result,
+        ):
+            collected = replay_engine._command_collect_native_result(
+                argparse.Namespace(
+                    run_dir=run_directory,
+                    thread_id="review-thread",
+                    worktree=self.root,
+                    rollout=None,
+                    evaluator="codex",
+                    normalization_for=None,
+                )
+            )
+
+        reviewer_artifact = Path(collected["native_result_path"])
+        stored = json.loads(reviewer_artifact.read_text(encoding="utf-8"))
+        stored_candidates = stored["ballot"]["dimensions"]["request_fulfillment"]["candidates"]
+        self.assertEqual(
+            stored_candidates["A"]["explanations"]["required_behavior"],
+            "Observed the requested behavior in candidate A's patch.",
+        )
+        self.assertEqual(
+            stored_candidates["B"]["explanations"]["required_behavior"],
+            "[REDACTED_AGENT] exposed credential [REDACTED_TOKEN] in "
+            "[REDACTED_PATH] while integrating.",
+        )
+        self.assertNotIn("score", stored_candidates["A"])
+        self.assertNotIn("explanation", stored)
+        self.assertNotIn("final_output", stored)
+        self.assertNotIn("final_response", stored)
+
+        combined = replay_engine._command_collect_native_results(
+            argparse.Namespace(run_dir=run_directory, native_result=[reviewer_artifact])
+        )
+        native_results = Path(combined["native_results_path"])
+        completed = replay_engine._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=None,
+            )
+        )
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["evaluation"]["totals"], {"A": 11 / 12, "B": 23 / 24})
+        completed_candidates = completed["evaluation"]["reviews"][0]["ballot"]["dimensions"][
+            "request_fulfillment"
+        ]["candidates"]
+        self.assertEqual(
+            completed_candidates["A"]["explanations"],
+            stored_candidates["A"]["explanations"],
+        )
+        self.assertEqual(
+            completed_candidates["B"]["explanations"],
+            stored_candidates["B"]["explanations"],
+        )
+        for artifact in (
+            reviewer_artifact,
+            native_results,
+            run_directory / "review.json",
+            run_directory / "report.json",
+            run_directory / "report.html",
+        ):
+            persisted = artifact.read_text(encoding="utf-8")
+            self.assertNotIn(private_reasoning, persisted, msg=str(artifact))
+            self.assertNotIn(secret, persisted, msg=str(artifact))
+            self.assertNotIn(private_path, persisted, msg=str(artifact))
+            self.assertNotIn("Codex exposed credential", persisted, msg=str(artifact))
+
+    def test_malformed_review_keeps_only_complete_safe_check_explanations(self) -> None:
+        run_directory = self.root / "run"
+        run_directory.mkdir()
+        replay_engine._write_json(run_directory / "run.json", {"model": "gpt-test"})
+        replay_engine._write_json(
+            run_directory / "report.json",
+            {"status": "completed", "original_request": "Build the thing"},
+        )
+        private_reasoning = "PRIVATE_MALFORMED_REVIEW_REASONING_MUST_NOT_BE_PERSISTED"
+        unknown_evidence = "UNRECOGNIZED_CHECK_EVIDENCE_MUST_NOT_BE_PERSISTED"
+        secret = "sk-abcdefghijklmnopqrstuvwxyz"
+        private_path = "/Users/alice/private/malformed.py"
+        ballot = json.loads(
+            _review_ballot(invalid_check=True, reviewer_explanation=private_reasoning)
+        )
+        expected_checks = replay_engine._execution().REVIEW_DIMENSION_CHECKS
+        candidates = ballot["dimensions"]["request_fulfillment"]["candidates"]
+        candidates["A"]["explanations"] = {
+            check: f"Observed evidence for {check}."
+            for check in expected_checks["request_fulfillment"]
+        }
+        candidates["A"]["explanations"]["required_behavior"] = (
+            f"OpenAI observed exposed credential {secret} in {private_path} while grading."
+        )
+        candidates["A"]["explanations"]["private_reviewer_notes"] = unknown_evidence
+        candidates["B"]["explanations"] = {
+            check: f"Observed evidence for {check}."
+            for check in expected_checks["request_fulfillment"][1:]
+        }
+        quality = ballot["dimensions"]["code_quality"]["candidates"]
+        quality["A"]["explanations"] = {
+            check: f"Observed evidence for {check}." for check in expected_checks["code_quality"]
+        }
+        quality["A"]["explanations"]["clear_naming"] = "x" * (
+            replay_engine._execution().MAX_REVIEW_CHECK_EXPLANATION_LENGTH + 1
+        )
+        quality["B"]["explanations"] = {
+            check: f"Observed evidence for {check}." for check in expected_checks["code_quality"]
+        }
+        quality["B"]["explanations"]["clear_naming"] = "   "
+        result = {
+            "status": "completed",
+            "evaluator": "codex",
+            "model": "gpt-test",
+            "thread_id": "review-thread",
+            "worktree": str(self.root),
+            "final_output": json.dumps(ballot),
+            "final_response": private_reasoning,
+            "explanation": private_reasoning,
+        }
+
+        with mock.patch.object(
+            replay_engine._execution(),
+            "collect_native_task_result",
+            return_value=result,
+        ):
+            collected = replay_engine._command_collect_native_result(
+                argparse.Namespace(
+                    run_dir=run_directory,
+                    thread_id="review-thread",
+                    worktree=self.root,
+                    rollout=None,
+                    evaluator="codex",
+                    normalization_for=None,
+                )
+            )
+
+        reviewer_artifact = Path(collected["native_result_path"])
+        stored = json.loads(reviewer_artifact.read_text(encoding="utf-8"))
+        self.assertTrue(stored["normalization_required"])
+        stored_candidates = stored["ballot"]["dimensions"]["request_fulfillment"]["candidates"]
+        approved_explanations = stored_candidates["A"]["explanations"]
+        self.assertEqual(set(approved_explanations), set(expected_checks["request_fulfillment"]))
+        self.assertEqual(
+            approved_explanations["required_behavior"],
+            "[REDACTED_AGENT] observed exposed credential [REDACTED_API_KEY] in "
+            "[REDACTED_PATH] while grading.",
+        )
+        self.assertNotIn("explanations", stored_candidates["B"])
+        stored_quality = stored["ballot"]["dimensions"]["code_quality"]["candidates"]
+        self.assertNotIn("explanations", stored_quality["A"])
+        self.assertNotIn("explanations", stored_quality["B"])
+        persisted = reviewer_artifact.read_text(encoding="utf-8")
+        self.assertNotIn(secret, persisted)
+        self.assertNotIn(private_path, persisted)
+        self.assertNotIn("OpenAI observed", persisted)
+        self.assertNotIn(private_reasoning, persisted)
+        self.assertNotIn(unknown_evidence, persisted)
+        self.assertNotIn("private_reviewer_notes", persisted)
+
+        combined = replay_engine._command_collect_native_results(
+            argparse.Namespace(run_dir=run_directory, native_result=[reviewer_artifact])
+        )
+        native_results = Path(combined["native_results_path"])
+        pending = replay_engine._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=None,
+            )
+        )
+
+        self.assertEqual(pending["status"], "native_task_required")
+        normalization_prompt = pending["task_requests"][0]["prompt"]
+        self.assertIn(
+            "[REDACTED_AGENT] observed exposed credential [REDACTED_API_KEY] in "
+            "[REDACTED_PATH] while grading.",
+            normalization_prompt,
+        )
+        self.assertNotIn(secret, normalization_prompt)
+        self.assertNotIn(private_path, normalization_prompt)
+        self.assertNotIn("OpenAI observed", normalization_prompt)
+        self.assertNotIn(private_reasoning, normalization_prompt)
+        self.assertNotIn(unknown_evidence, normalization_prompt)
+
+        normalized_ballot = json.loads(_review_ballot())
+        normalized_ballot["dimensions"]["request_fulfillment"]["candidates"]["A"][
+            "explanations"
+        ] = approved_explanations
+        normalized_result = run_directory / "reviews" / "normalized.json"
+        replay_engine._write_json(
+            normalized_result,
+            {
+                "normalization_for": "codex",
+                "model": "gpt-test",
+                "thread_id": "normalizer-thread",
+                "final_output": json.dumps(normalized_ballot),
+            },
+        )
+        completed = replay_engine._command_complete_evaluation(
+            argparse.Namespace(
+                run_dir=run_directory,
+                native_results=native_results,
+                normalized_result=[normalized_result],
+            )
+        )
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["evaluation"]["totals"], {"A": 11 / 12, "B": 23 / 24})
+        completed_candidate = completed["evaluation"]["reviews"][0]["ballot"]["dimensions"][
+            "request_fulfillment"
+        ]["candidates"]["A"]
+        self.assertEqual(completed_candidate["explanations"], approved_explanations)
+        for artifact in (
+            reviewer_artifact,
+            native_results,
+            normalized_result,
+            run_directory / "review.json",
+            run_directory / "report.json",
+            run_directory / "report.html",
+        ):
+            persisted = artifact.read_text(encoding="utf-8")
+            self.assertNotIn(secret, persisted, msg=str(artifact))
+            self.assertNotIn(private_path, persisted, msg=str(artifact))
+            self.assertNotIn("OpenAI observed", persisted, msg=str(artifact))
+            self.assertNotIn(private_reasoning, persisted, msg=str(artifact))
+            self.assertNotIn(unknown_evidence, persisted, msg=str(artifact))
 
     def test_reviewer_collection_never_persists_free_text_or_unrecognized_identifiers(self) -> None:
         run_directory = self.root / "run"

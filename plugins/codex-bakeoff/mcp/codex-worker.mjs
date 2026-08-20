@@ -541,7 +541,7 @@ var MAX_PROMPT_CHARS = 2e6;
 var MAX_SCHEMA_CHARS = 2e5;
 var MAX_FINAL_RESPONSE_CHARS = 2e5;
 var MAX_LIFECYCLE_EVENTS = 128;
-var MAX_TIMEOUT_MS = 24 * 60 * 60 * 1e3;
+var MAX_PROVIDER_ERROR_CHARS = 1e3;
 var CLI_WRAPPER_MODE_ENV = "CODEX_BAKEOFF_CODEX_WRAPPER";
 var CLI_WRAPPER_TARGET_ENV = "CODEX_BAKEOFF_CODEX_TARGET";
 var CLI_WRAPPER_OWNER_ENV = "CODEX_BAKEOFF_CODEX_OWNER_PID";
@@ -617,13 +617,6 @@ function normalizeRunRequest(input) {
       "networkAccessEnabled or networkAccess must be a boolean."
     );
   }
-  const timeoutMsValue = resolveTimeoutMs(input);
-  if (!Number.isInteger(timeoutMsValue) || timeoutMsValue < 1e3 || timeoutMsValue > MAX_TIMEOUT_MS) {
-    throw new SafeWorkerError(
-      "invalid_request",
-      `timeoutMs must be an integer from 1000 through ${MAX_TIMEOUT_MS}.`
-    );
-  }
   if (input.reasoningEffort !== void 0 && !REASONING_EFFORTS.has(input.reasoningEffort)) {
     throw new SafeWorkerError("invalid_request", "reasoningEffort is not supported.");
   }
@@ -650,7 +643,6 @@ function normalizeRunRequest(input) {
     model: input.model,
     prompt: input.prompt,
     workingDirectory: input.workingDirectory,
-    timeoutMs: timeoutMsValue,
     sandboxMode: input.sandboxMode,
     networkAccessEnabled,
     ...input.reasoningEffort === void 0 ? {} : { reasoningEffort: input.reasoningEffort },
@@ -666,10 +658,6 @@ async function executeRunRequest(request, {
   }
 } = {}) {
   const lifecycle = createLifecycleEmitter(request.id, emit);
-  const timeout = setTimeout(() => {
-    abortController.abort({ kind: "timeout" });
-  }, request.timeoutMs);
-  timeout.unref?.();
   let threadId = null;
   let finalResponse = "";
   let finalResponseTruncated = false;
@@ -726,13 +714,18 @@ async function executeRunRequest(request, {
         usage = normalizeUsage(event.usage);
         turnCompleted = true;
       } else if (event.type === "turn.failed") {
-        diagnostic(`Codex turn failed: ${event.error?.message ?? "No detail provided."}`);
-        throw new SafeWorkerError("turn_failed", "Codex turn failed.");
+        const message = safeProviderErrorMessage(event.error?.message, "Codex turn failed.");
+        diagnostic(`Codex turn failed: ${message}`);
+        throw new SafeWorkerError("turn_failed", message);
       } else if (event.type === "error") {
-        diagnostic(`Codex stream error: ${event.message ?? "No detail provided."}`);
+        const message = safeProviderErrorMessage(
+          event.message,
+          "Codex reported an unrecoverable stream error."
+        );
+        diagnostic(`Codex stream error: ${message}`);
         throw new SafeWorkerError(
           "stream_error",
-          "Codex reported an unrecoverable stream error.",
+          message,
           { retryable: isRetryableStreamError(event.message) }
         );
       }
@@ -753,12 +746,6 @@ async function executeRunRequest(request, {
     };
   } catch (error) {
     if (abortController.signal.aborted) {
-      const reason = abortController.signal.reason;
-      if (isRecord(reason) && reason.kind === "timeout") {
-        throw new SafeWorkerError("timeout", "Codex run exceeded its configured timeout.", {
-          cause: error
-        });
-      }
       throw new SafeWorkerError("canceled", "Codex run was canceled.", { cause: error });
     }
     if (error instanceof SafeWorkerError) throw error;
@@ -770,8 +757,6 @@ async function executeRunRequest(request, {
       );
     }
     throw new SafeWorkerError("worker_failed", "Codex worker failed.", { cause: error });
-  } finally {
-    clearTimeout(timeout);
   }
 }
 function startStdioWorker({
@@ -860,7 +845,7 @@ function startStdioWorker({
         message: safeError.message,
         retryable: safeError.retryable
       });
-      finish(safeError.code === "timeout" ? 124 : 1);
+      finish(1);
     });
   };
   readline2.on("line", (line) => {
@@ -1140,26 +1125,6 @@ function resolveAlias(input, canonical, alias) {
   }
   return input[canonical] ?? input[alias];
 }
-function resolveTimeoutMs(input) {
-  if (input.timeoutMs !== void 0 && (!Number.isInteger(input.timeoutMs) || input.timeoutMs < 0)) {
-    throw new SafeWorkerError("invalid_request", "timeoutMs must be a positive integer.");
-  }
-  if (input.timeoutSeconds !== void 0 && (typeof input.timeoutSeconds !== "number" || !Number.isFinite(input.timeoutSeconds) || input.timeoutSeconds <= 0)) {
-    throw new SafeWorkerError(
-      "invalid_request",
-      "timeoutSeconds must be a positive number."
-    );
-  }
-  if (input.timeoutMs !== void 0 && input.timeoutSeconds !== void 0) {
-    if (input.timeoutMs !== input.timeoutSeconds * 1e3) {
-      throw new SafeWorkerError(
-        "invalid_request",
-        "timeoutMs and timeoutSeconds must match when both are provided."
-      );
-    }
-  }
-  return input.timeoutMs ?? input.timeoutSeconds * 1e3;
-}
 function safeItemType(value) {
   return typeof value === "string" && SAFE_ITEM_TYPES.has(value) ? value : "other";
 }
@@ -1170,6 +1135,20 @@ function safeRequestId(value) {
   if (!isRecord(value)) return null;
   const id = value.id ?? value.requestId;
   return typeof id === "string" && SAFE_ID.test(id) ? id : null;
+}
+function safeProviderErrorMessage(value, fallback) {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  let message = value;
+  try {
+    const parsed = JSON.parse(value);
+    if (isRecord(parsed?.error) && typeof parsed.error.message === "string") {
+      message = parsed.error.message;
+    } else if (isRecord(parsed) && typeof parsed.message === "string") {
+      message = parsed.message;
+    }
+  } catch {
+  }
+  return message.replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]").replace(/\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{12,}/g, "[REDACTED]").replace(/\b(api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, MAX_PROVIDER_ERROR_CHARS) || fallback;
 }
 function isRetryableStreamError(message) {
   if (typeof message !== "string") return false;

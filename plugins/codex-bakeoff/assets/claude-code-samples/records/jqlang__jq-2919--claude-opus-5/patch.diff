@@ -1,0 +1,96 @@
+diff --git a/docs/content/manual/manual.yml b/docs/content/manual/manual.yml
+index 242cf51..be67994 100644
+--- a/docs/content/manual/manual.yml
++++ b/docs/content/manual/manual.yml
+@@ -314,8 +314,10 @@ sections:
+       * `--`:
+ 
+         Terminates argument processing.  Remaining arguments are
+-        positional, either strings, JSON texts, or input filenames,
+-        according to whether `--args` or `--jsonargs` were given.
++        positional: the first one is taken as the filter if it has not
++        been given yet, and the rest are either strings, JSON texts, or
++        input filenames, according to whether `--args` or `--jsonargs`
++        were given.
+ 
+       * `--run-tests [filename]`:
+ 
+diff --git a/jq.1.prebuilt b/jq.1.prebuilt
+index 1f604e2..a77ffe6 100644
+--- a/jq.1.prebuilt
++++ b/jq.1.prebuilt
+@@ -250,7 +250,7 @@ Output the jq help and exit with zero\.
+ \fB\-\-\fR:
+ .
+ .IP
+-Terminates argument processing\. Remaining arguments are positional, either strings, JSON texts, or input filenames, according to whether \fB\-\-args\fR or \fB\-\-jsonargs\fR were given\.
++Terminates argument processing\. Remaining arguments are positional: the first one is taken as the filter if it has not been given yet, and the rest are either strings, JSON texts, or input filenames, according to whether \fB\-\-args\fR or \fB\-\-jsonargs\fR were given\.
+ .
+ .TP
+ \fB\-\-run\-tests [filename]\fR:
+diff --git a/src/main.c b/src/main.c
+index 6d857c3..226c926 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -353,8 +353,10 @@ int main(int argc, char* argv[]) {
+   size_t short_opts = 0;
+   jv lib_search_paths = jv_null();
+   for (int i=1; i<argc; i++, short_opts = 0) {
+-    if (args_done) {
+-      if (further_args_are_strings) {
++    if (args_done || !isoptish(argv[i])) {
++      if (!program) {
++        program = argv[i];
++      } else if (further_args_are_strings) {
+         ARGS = jv_array_append(ARGS, jv_string(argv[i]));
+       } else if (further_args_are_json) {
+         jv v =  jv_parse(argv[i]);
+@@ -368,26 +370,7 @@ int main(int argc, char* argv[]) {
+         nfiles++;
+       }
+     } else if (!strcmp(argv[i], "--")) {
+-      if (!program) usage(2, 1);
+       args_done = 1;
+-    } else if (!isoptish(argv[i])) {
+-      if (program) {
+-        if (further_args_are_strings) {
+-          ARGS = jv_array_append(ARGS, jv_string(argv[i]));
+-        } else if (further_args_are_json) {
+-          jv v =  jv_parse(argv[i]);
+-          if (!jv_is_valid(v)) {
+-            fprintf(stderr, "%s: invalid JSON text passed to --jsonargs\n", progname);
+-            die();
+-          }
+-          ARGS = jv_array_append(ARGS, v);
+-        } else {
+-          jq_util_input_add_input(input_state, argv[i]);
+-          nfiles++;
+-        }
+-      } else {
+-        program = argv[i];
+-      }
+     } else {
+       if (argv[i][1] == 'L') {
+         if (jv_get_kind(lib_search_paths) == JV_KIND_NULL)
+diff --git a/tests/shtest b/tests/shtest
+index 8a7ba07..51b0c07 100755
+--- a/tests/shtest
++++ b/tests/shtest
+@@ -320,6 +320,17 @@ $VALGRIND $JQ -n -c '$ARGS.positional' --args --jsonargs > $d/out
+ printf '[]\n' > $d/expected
+ cmp $d/out $d/expected
+ 
++# The filter can also be given after "--"
++$VALGRIND $JQ -n -c -- '$ARGS.positional' > $d/out
++printf '[]\n' > $d/expected
++cmp $d/out $d/expected
++$VALGRIND $JQ -n -c --args -- '$ARGS.positional' foo -n --args > $d/out
++printf '["foo","-n","--args"]\n' > $d/expected
++cmp $d/out $d/expected
++$VALGRIND $JQ -n -c --args -- '$ARGS.positional' -- > $d/out
++printf '["--"]\n' > $d/expected
++cmp $d/out $d/expected
++
+ ## Regression test for issue #2572 assert when using --jsonargs and invalid JSON
+ $VALGRIND $JQ -n --jsonargs null invalid && EC=$? || EC=$?
+ if [ "$EC" -ne 2 ]; then

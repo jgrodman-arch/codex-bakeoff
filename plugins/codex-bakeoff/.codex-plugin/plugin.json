@@ -1,7 +1,7 @@
 {
   "name": "codex-bakeoff",
-  "version": "1.0.54",
-  "description": "Run independent Codex replays in the Codex in-app browser, with an external browser fallback.",
+  "version": "1.0.74",
+  "description": "Run independent Codex replays in the in-app browser or your system browser.",
   "author": {
     "name": "OpenAI",
     "url": "https://github.com/jgrodman-arch/codex-bakeoff"
@@ -18,8 +18,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Codex Bakeoff",
-    "shortDescription": "Run independent replays in the Codex in-app browser or an external browser.",
-    "longDescription": "Start an independent Codex Bakeoff controller on an available loopback port in the Codex in-app browser, falling back to an external browser when unavailable. Select one imported historical Claude thread, choose one or more available Codex models, define the beginning and end states, approve their parallel isolated implementations, follow live progress, and review each blinded comparison. Available GPT-5.6 Sol, Terra, and Luna models are selected by default. Multiple replay sessions can run in parallel. Selection, execution, verification, evaluation, and results stay in the browser controller instead of a guided chat workflow.",
+    "shortDescription": "Run independent replays in the in-app or system browser.",
+    "longDescription": "Start an independent Codex Bakeoff controller on an available loopback port in the Codex in-app browser, or in your system browser when using Codex CLI. Select one imported historical Claude thread, choose one or more available Codex models, define the beginning and end states, approve their parallel isolated implementations, follow live progress, and review each blinded comparison. Available GPT-5.6 Sol, Terra, and Luna models are selected by default. Multiple replay sessions can run in parallel. Selection, execution, verification, evaluation, and results stay in the browser controller instead of a guided chat workflow.",
     "developerName": "OpenAI",
     "category": "Productivity",
     "websiteURL": "https://github.com/jgrodman-arch/codex-bakeoff",
@@ -32,7 +32,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Open an independent Codex Bakeoff controller in the Codex in-app browser.",
+      "Open an independent Codex Bakeoff controller in the available browser.",
       "Open a new Codex Bakeoff session so I can select and run a historical replay.",
       "Open Codex Bakeoff so I can review my replay runs."
     ]

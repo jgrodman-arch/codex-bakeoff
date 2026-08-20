@@ -1,0 +1,349 @@
+{
+  "samples": [
+    {
+      "baseline_commit": "f88c4e5888d6d125695444d044df4bb55ad75888",
+      "duration_api_ms": 323598,
+      "duration_ms": 327332,
+      "id": "jqlang__jq-2157--claude-fable-5",
+      "model": "claude-fable-5",
+      "model_label": "Claude Fable 5",
+      "original_repository_path_marker": "__CODEX_BAKEOFF_SAMPLE_REPOSITORY__",
+      "patch_path": "records/jqlang__jq-2157--claude-fable-5/patch.diff",
+      "prompt": "Fix uri format to follow RFC 3986\n\nIt seems that the current implementation is based on [RFC 2396 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc2396#section-2.3). However, this RFC is obsoleted by [RFC 3986](https://tools.ietf.org/html/rfc3986). At [RFC 3986 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc3986#section-2.3), the unreserved characters are defined as follows.\r\n\r\n    unreserved  = ALPHA / DIGIT / \"-\" / \".\" / \"_\" / \"~\"\r\n\r\nThus we should update the implementation to follow the RFC 3986.\r\n\r\n```sh\r\n % echo \"-_.~\\!'()\" | jq -R @uri\r\n\"-_.~!'()\"\r\n % echo \"-_.~\\!'()\" | ./jq  -R @uri\r\n\"-_.~%21%27%28%29\"\r\n```\r\n\r\nResolves  #1506.",
+      "recorded_at": "2026-08-11T22:27:35.831088+00:00",
+      "repository": "jqlang/jq",
+      "result_path": "records/jqlang__jq-2157--claude-fable-5/result.json",
+      "session_id": "61eec016-e315-4c68-bbcc-949c3d7553e2",
+      "source_url": "https://github.com/jqlang/jq/pull/2157",
+      "task_id": "jqlang__jq-2157",
+      "title": "Fix uri format to follow RFC 3986",
+      "total_cost_usd": 1.970546,
+      "transcript_parts": [
+        "records/jqlang__jq-2157--claude-fable-5/transcript.000.jsonl",
+        "records/jqlang__jq-2157--claude-fable-5/transcript.001.jsonl"
+      ],
+      "verification": {
+        "checks": [
+          {
+            "name": "rfc3986_reserved_characters",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "unicode_remains_percent_encoded",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "spaces_remain_percent_encoded",
+            "passed": true,
+            "returncode": 0
+          }
+        ],
+        "passed": true
+      }
+    },
+    {
+      "baseline_commit": "f88c4e5888d6d125695444d044df4bb55ad75888",
+      "duration_api_ms": 168660,
+      "duration_ms": 169613,
+      "id": "jqlang__jq-2157--claude-opus-5",
+      "model": "claude-opus-5",
+      "model_label": "Claude Opus 5",
+      "original_repository_path_marker": "__CODEX_BAKEOFF_SAMPLE_REPOSITORY__",
+      "patch_path": "records/jqlang__jq-2157--claude-opus-5/patch.diff",
+      "prompt": "Fix uri format to follow RFC 3986\n\nIt seems that the current implementation is based on [RFC 2396 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc2396#section-2.3). However, this RFC is obsoleted by [RFC 3986](https://tools.ietf.org/html/rfc3986). At [RFC 3986 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc3986#section-2.3), the unreserved characters are defined as follows.\r\n\r\n    unreserved  = ALPHA / DIGIT / \"-\" / \".\" / \"_\" / \"~\"\r\n\r\nThus we should update the implementation to follow the RFC 3986.\r\n\r\n```sh\r\n % echo \"-_.~\\!'()\" | jq -R @uri\r\n\"-_.~!'()\"\r\n % echo \"-_.~\\!'()\" | ./jq  -R @uri\r\n\"-_.~%21%27%28%29\"\r\n```\r\n\r\nResolves  #1506.",
+      "recorded_at": "2026-08-11T22:44:10.615471+00:00",
+      "repository": "jqlang/jq",
+      "result_path": "records/jqlang__jq-2157--claude-opus-5/result.json",
+      "session_id": "a0db12e1-6603-4706-92f6-cf2a8c61912c",
+      "source_url": "https://github.com/jqlang/jq/pull/2157",
+      "task_id": "jqlang__jq-2157",
+      "title": "Fix uri format to follow RFC 3986",
+      "total_cost_usd": 0.7904525,
+      "transcript_parts": [
+        "records/jqlang__jq-2157--claude-opus-5/transcript.000.jsonl",
+        "records/jqlang__jq-2157--claude-opus-5/transcript.001.jsonl"
+      ],
+      "verification": {
+        "checks": [
+          {
+            "name": "rfc3986_reserved_characters",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "unicode_remains_percent_encoded",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "spaces_remain_percent_encoded",
+            "passed": true,
+            "returncode": 0
+          }
+        ],
+        "passed": true
+      }
+    },
+    {
+      "baseline_commit": "f88c4e5888d6d125695444d044df4bb55ad75888",
+      "duration_api_ms": 110021,
+      "duration_ms": 110688,
+      "id": "jqlang__jq-2157--claude-sonnet-5",
+      "model": "claude-sonnet-5",
+      "model_label": "Claude Sonnet 5",
+      "original_repository_path_marker": "__CODEX_BAKEOFF_SAMPLE_REPOSITORY__",
+      "patch_path": "records/jqlang__jq-2157--claude-sonnet-5/patch.diff",
+      "prompt": "Fix uri format to follow RFC 3986\n\nIt seems that the current implementation is based on [RFC 2396 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc2396#section-2.3). However, this RFC is obsoleted by [RFC 3986](https://tools.ietf.org/html/rfc3986). At [RFC 3986 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc3986#section-2.3), the unreserved characters are defined as follows.\r\n\r\n    unreserved  = ALPHA / DIGIT / \"-\" / \".\" / \"_\" / \"~\"\r\n\r\nThus we should update the implementation to follow the RFC 3986.\r\n\r\n```sh\r\n % echo \"-_.~\\!'()\" | jq -R @uri\r\n\"-_.~!'()\"\r\n % echo \"-_.~\\!'()\" | ./jq  -R @uri\r\n\"-_.~%21%27%28%29\"\r\n```\r\n\r\nResolves  #1506.",
+      "recorded_at": "2026-08-11T22:44:10.875480+00:00",
+      "repository": "jqlang/jq",
+      "result_path": "records/jqlang__jq-2157--claude-sonnet-5/result.json",
+      "session_id": "4c7ed7ad-e18b-4686-b2db-2e136e7acb1c",
+      "source_url": "https://github.com/jqlang/jq/pull/2157",
+      "task_id": "jqlang__jq-2157",
+      "title": "Fix uri format to follow RFC 3986",
+      "total_cost_usd": 0.3769256,
+      "transcript_parts": [
+        "records/jqlang__jq-2157--claude-sonnet-5/transcript.000.jsonl"
+      ],
+      "verification": {
+        "checks": [
+          {
+            "name": "rfc3986_reserved_characters",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "unicode_remains_percent_encoded",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "spaces_remain_percent_encoded",
+            "passed": true,
+            "returncode": 0
+          }
+        ],
+        "passed": true
+      }
+    },
+    {
+      "baseline_commit": "f88c4e5888d6d125695444d044df4bb55ad75888",
+      "duration_api_ms": 86447,
+      "duration_ms": 87009,
+      "id": "jqlang__jq-2157--claude-haiku-4-5-20251001",
+      "model": "claude-haiku-4-5-20251001",
+      "model_label": "Claude Haiku 4.5",
+      "original_repository_path_marker": "__CODEX_BAKEOFF_SAMPLE_REPOSITORY__",
+      "patch_path": "records/jqlang__jq-2157--claude-haiku-4-5-20251001/patch.diff",
+      "prompt": "Fix uri format to follow RFC 3986\n\nIt seems that the current implementation is based on [RFC 2396 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc2396#section-2.3). However, this RFC is obsoleted by [RFC 3986](https://tools.ietf.org/html/rfc3986). At [RFC 3986 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc3986#section-2.3), the unreserved characters are defined as follows.\r\n\r\n    unreserved  = ALPHA / DIGIT / \"-\" / \".\" / \"_\" / \"~\"\r\n\r\nThus we should update the implementation to follow the RFC 3986.\r\n\r\n```sh\r\n % echo \"-_.~\\!'()\" | jq -R @uri\r\n\"-_.~!'()\"\r\n % echo \"-_.~\\!'()\" | ./jq  -R @uri\r\n\"-_.~%21%27%28%29\"\r\n```\r\n\r\nResolves  #1506.",
+      "recorded_at": "2026-08-11T22:44:10.743432+00:00",
+      "repository": "jqlang/jq",
+      "result_path": "records/jqlang__jq-2157--claude-haiku-4-5-20251001/result.json",
+      "session_id": "7ababab7-8ffb-4f9f-9d7c-baf2b6f28de1",
+      "source_url": "https://github.com/jqlang/jq/pull/2157",
+      "task_id": "jqlang__jq-2157",
+      "title": "Fix uri format to follow RFC 3986",
+      "total_cost_usd": 0.1402416,
+      "transcript_parts": [
+        "records/jqlang__jq-2157--claude-haiku-4-5-20251001/transcript.000.jsonl"
+      ],
+      "verification": {
+        "checks": [
+          {
+            "name": "rfc3986_reserved_characters",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "unicode_remains_percent_encoded",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "spaces_remain_percent_encoded",
+            "passed": true,
+            "returncode": 0
+          }
+        ],
+        "passed": true
+      }
+    },
+    {
+      "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
+      "duration_api_ms": 712643,
+      "duration_ms": 718158,
+      "id": "jqlang__jq-2919--claude-fable-5",
+      "model": "claude-fable-5",
+      "model_label": "Claude Fable 5",
+      "original_repository_path_marker": "__CODEX_BAKEOFF_SAMPLE_REPOSITORY__",
+      "patch_path": "records/jqlang__jq-2919--claude-fable-5/patch.diff",
+      "prompt": "Allow passing the inline jq script after --\n\njq previously only allowed passing the inline script before `--` (as if they were options) even though one would expect the inline script to be a positional argument.\r\n\r\nSince jq previously also refused to run with a usage error if the script was passed after `--` (It was not assuming `.` as script as it does when no arguments are passed), and positional arguments are allowed before `--` and even before other options, it should not be a breaking change to change that weird behaviour, and allow the script to appear after `--`.\r\n\r\nIt also simplifies the option parsing code a bunch.\r\n\r\nFixes #2918\r\n",
+      "recorded_at": "2026-08-11T22:44:11.598333+00:00",
+      "repository": "jqlang/jq",
+      "result_path": "records/jqlang__jq-2919--claude-fable-5/result.json",
+      "session_id": "de1866ba-d64a-4d15-ad96-ff65b13739f6",
+      "source_url": "https://github.com/jqlang/jq/pull/2919",
+      "task_id": "jqlang__jq-2919",
+      "title": "Allow passing the inline jq script after --",
+      "total_cost_usd": 6.675114999999999,
+      "transcript_parts": [
+        "records/jqlang__jq-2919--claude-fable-5/transcript.000.jsonl",
+        "records/jqlang__jq-2919--claude-fable-5/transcript.001.jsonl",
+        "records/jqlang__jq-2919--claude-fable-5/transcript.002.jsonl",
+        "records/jqlang__jq-2919--claude-fable-5/transcript.003.jsonl"
+      ],
+      "verification": {
+        "checks": [
+          {
+            "name": "script_after_separator",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "script_before_separator",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "plain_filter_after_separator",
+            "passed": true,
+            "returncode": 0
+          }
+        ],
+        "passed": true
+      }
+    },
+    {
+      "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
+      "duration_api_ms": 292368,
+      "duration_ms": 292372,
+      "id": "jqlang__jq-2919--claude-opus-5",
+      "model": "claude-opus-5",
+      "model_label": "Claude Opus 5",
+      "original_repository_path_marker": "__CODEX_BAKEOFF_SAMPLE_REPOSITORY__",
+      "patch_path": "records/jqlang__jq-2919--claude-opus-5/patch.diff",
+      "prompt": "Allow passing the inline jq script after --\n\njq previously only allowed passing the inline script before `--` (as if they were options) even though one would expect the inline script to be a positional argument.\r\n\r\nSince jq previously also refused to run with a usage error if the script was passed after `--` (It was not assuming `.` as script as it does when no arguments are passed), and positional arguments are allowed before `--` and even before other options, it should not be a breaking change to change that weird behaviour, and allow the script to appear after `--`.\r\n\r\nIt also simplifies the option parsing code a bunch.\r\n\r\nFixes #2918\r\n",
+      "recorded_at": "2026-08-11T22:44:11.760614+00:00",
+      "repository": "jqlang/jq",
+      "result_path": "records/jqlang__jq-2919--claude-opus-5/result.json",
+      "session_id": "79d31d5a-62c1-4ff7-81b6-0ab0c8853bd3",
+      "source_url": "https://github.com/jqlang/jq/pull/2919",
+      "task_id": "jqlang__jq-2919",
+      "title": "Allow passing the inline jq script after --",
+      "total_cost_usd": 1.4952379999999996,
+      "transcript_parts": [
+        "records/jqlang__jq-2919--claude-opus-5/transcript.000.jsonl",
+        "records/jqlang__jq-2919--claude-opus-5/transcript.001.jsonl"
+      ],
+      "verification": {
+        "checks": [
+          {
+            "name": "script_after_separator",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "script_before_separator",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "plain_filter_after_separator",
+            "passed": true,
+            "returncode": 0
+          }
+        ],
+        "passed": true
+      }
+    },
+    {
+      "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
+      "duration_api_ms": 264495,
+      "duration_ms": 265561,
+      "id": "jqlang__jq-2919--claude-sonnet-5",
+      "model": "claude-sonnet-5",
+      "model_label": "Claude Sonnet 5",
+      "original_repository_path_marker": "__CODEX_BAKEOFF_SAMPLE_REPOSITORY__",
+      "patch_path": "records/jqlang__jq-2919--claude-sonnet-5/patch.diff",
+      "prompt": "Allow passing the inline jq script after --\n\njq previously only allowed passing the inline script before `--` (as if they were options) even though one would expect the inline script to be a positional argument.\r\n\r\nSince jq previously also refused to run with a usage error if the script was passed after `--` (It was not assuming `.` as script as it does when no arguments are passed), and positional arguments are allowed before `--` and even before other options, it should not be a breaking change to change that weird behaviour, and allow the script to appear after `--`.\r\n\r\nIt also simplifies the option parsing code a bunch.\r\n\r\nFixes #2918\r\n",
+      "recorded_at": "2026-08-11T22:44:11.950136+00:00",
+      "repository": "jqlang/jq",
+      "result_path": "records/jqlang__jq-2919--claude-sonnet-5/result.json",
+      "session_id": "100ced16-5cf6-4e41-ba6d-0dd7e8d8c0c1",
+      "source_url": "https://github.com/jqlang/jq/pull/2919",
+      "task_id": "jqlang__jq-2919",
+      "title": "Allow passing the inline jq script after --",
+      "total_cost_usd": 1.0765673999999998,
+      "transcript_parts": [
+        "records/jqlang__jq-2919--claude-sonnet-5/transcript.000.jsonl",
+        "records/jqlang__jq-2919--claude-sonnet-5/transcript.001.jsonl"
+      ],
+      "verification": {
+        "checks": [
+          {
+            "name": "script_after_separator",
+            "passed": false,
+            "returncode": 2
+          },
+          {
+            "name": "script_before_separator",
+            "passed": false,
+            "returncode": 2
+          },
+          {
+            "name": "plain_filter_after_separator",
+            "passed": true,
+            "returncode": 0
+          }
+        ],
+        "passed": false
+      }
+    },
+    {
+      "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
+      "duration_api_ms": 85124,
+      "duration_ms": 85433,
+      "id": "jqlang__jq-2919--claude-haiku-4-5-20251001",
+      "model": "claude-haiku-4-5-20251001",
+      "model_label": "Claude Haiku 4.5",
+      "original_repository_path_marker": "__CODEX_BAKEOFF_SAMPLE_REPOSITORY__",
+      "patch_path": "records/jqlang__jq-2919--claude-haiku-4-5-20251001/patch.diff",
+      "prompt": "Allow passing the inline jq script after --\n\njq previously only allowed passing the inline script before `--` (as if they were options) even though one would expect the inline script to be a positional argument.\r\n\r\nSince jq previously also refused to run with a usage error if the script was passed after `--` (It was not assuming `.` as script as it does when no arguments are passed), and positional arguments are allowed before `--` and even before other options, it should not be a breaking change to change that weird behaviour, and allow the script to appear after `--`.\r\n\r\nIt also simplifies the option parsing code a bunch.\r\n\r\nFixes #2918\r\n",
+      "recorded_at": "2026-08-11T22:44:12.168227+00:00",
+      "repository": "jqlang/jq",
+      "result_path": "records/jqlang__jq-2919--claude-haiku-4-5-20251001/result.json",
+      "session_id": "0f7a3bc7-2822-4916-969e-3678e6587c71",
+      "source_url": "https://github.com/jqlang/jq/pull/2919",
+      "task_id": "jqlang__jq-2919",
+      "title": "Allow passing the inline jq script after --",
+      "total_cost_usd": 0.168709,
+      "transcript_parts": [
+        "records/jqlang__jq-2919--claude-haiku-4-5-20251001/transcript.000.jsonl",
+        "records/jqlang__jq-2919--claude-haiku-4-5-20251001/transcript.001.jsonl"
+      ],
+      "verification": {
+        "checks": [
+          {
+            "name": "script_after_separator",
+            "passed": false,
+            "returncode": 2
+          },
+          {
+            "name": "script_before_separator",
+            "passed": true,
+            "returncode": 0
+          },
+          {
+            "name": "plain_filter_after_separator",
+            "passed": true,
+            "returncode": 0
+          }
+        ],
+        "passed": false
+      }
+    }
+  ],
+  "schema_version": 1
+}

@@ -149,13 +149,12 @@ test("normalizes server aliases and keeps SDK events sanitized", async () => {
     model: "gpt-5.6-sol",
     prompt: "private prompt",
     workingDirectory: "/private/fixture",
-    timeoutSeconds: 30,
     sandboxMode: "workspace-write",
     networkAccess: false,
     outputSchema: { type: "object" }
   });
   assert.equal(request.id, "fixture-1");
-  assert.equal(request.timeoutMs, 30_000);
+  assert.equal(request.timeoutMs, undefined);
   assert.equal(request.networkAccessEnabled, false);
 
   const emitted = [];
@@ -218,7 +217,7 @@ test("normalizes server aliases and keeps SDK events sanitized", async () => {
   assert.match(serializedEvents, /thread_started|item_completed/);
 });
 
-test("logs an SDK stream error without exposing its detail in the protocol error", async () => {
+test("preserves actionable SDK stream errors while redacting credentials", async () => {
   const request = normalizeRunRequest({
     type: "run",
     id: "stream-error",
@@ -244,7 +243,7 @@ test("logs an SDK stream error without exposing its detail in the protocol error
                   yield { type: "thread.started", thread_id: "fixture-thread" };
                   yield {
                     type: "error",
-                    message: "connection reset: sensitive provider detail"
+                    message: "connection reset: api_key=sk-proj-abcdefghijklmnopqrst"
                   };
                   yield {
                     type: "turn.completed",
@@ -266,15 +265,59 @@ test("logs an SDK stream error without exposing its detail in the protocol error
       error instanceof Error &&
       error.code === "stream_error" &&
       error.retryable === true &&
-      error.message === "Codex reported an unrecoverable stream error." &&
-      !error.message.includes("sensitive provider detail")
+      error.message === "connection reset: api_key=[REDACTED]" &&
+      !error.message.includes("abcdefghijklmnopqrst")
   );
   assert.deepEqual(diagnostics, [
-    "Codex stream error: connection reset: sensitive provider detail"
+    "Codex stream error: connection reset: api_key=[REDACTED]"
   ]);
 });
 
-test("logs an SDK turn failure without exposing its detail in the protocol error", async () => {
+test("extracts actionable provider errors from JSON stream events", async () => {
+  const request = normalizeRunRequest({
+    type: "run",
+    id: "outdated-codex",
+    model: "gpt-5.6-sol",
+    prompt: "private prompt",
+    workingDirectory: "/private/fixture",
+    timeoutMs: 30_000,
+    sandboxMode: "read-only",
+    networkAccessEnabled: false
+  });
+  const providerMessage =
+    "The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.";
+
+  await assert.rejects(
+    executeRunRequest(request, {
+      codexFactory: () => ({
+        startThread() {
+          return {
+            async runStreamed() {
+              return {
+                events: (async function* () {
+                  yield {
+                    type: "error",
+                    message: JSON.stringify({
+                      type: "error",
+                      status: 400,
+                      error: { type: "invalid_request_error", message: providerMessage }
+                    })
+                  };
+                })()
+              };
+            }
+          };
+        }
+      })
+    }),
+    (error) =>
+      error.code === "stream_error" &&
+      error.retryable === false &&
+      error.message === providerMessage
+  );
+});
+
+test("preserves actionable SDK turn failures while redacting bearer tokens", async () => {
   const request = normalizeRunRequest({
     type: "run",
     id: "turn-failure",
@@ -300,7 +343,7 @@ test("logs an SDK turn failure without exposing its detail in the protocol error
                   yield { type: "thread.started", thread_id: "fixture-thread" };
                   yield {
                     type: "turn.failed",
-                    error: { message: "sensitive turn detail" }
+                    error: { message: "authentication failed: Bearer sensitive-token-value" }
                   };
                 })()
               };
@@ -313,13 +356,15 @@ test("logs an SDK turn failure without exposing its detail in the protocol error
       error instanceof Error &&
       error.code === "turn_failed" &&
       error.retryable === false &&
-      error.message === "Codex turn failed." &&
-      !error.message.includes("sensitive turn detail")
+      error.message === "authentication failed: Bearer [REDACTED]" &&
+      !error.message.includes("sensitive-token-value")
   );
-  assert.deepEqual(diagnostics, ["Codex turn failed: sensitive turn detail"]);
+  assert.deepEqual(diagnostics, [
+    "Codex turn failed: authentication failed: Bearer [REDACTED]"
+  ]);
 });
 
-test("writes SDK error detail only to worker stderr", async () => {
+test("returns actionable SDK stream errors through the worker protocol", async () => {
   const fixture = await fakeCodexFixture();
   const child = spawn(process.execPath, [builtWorkerPath], {
     env: {
@@ -350,8 +395,7 @@ test("writes SDK error detail only to worker stderr", async () => {
   const failure = messages.at(-1);
   assert.equal(failure.type, "failed");
   assert.equal(failure.retryable, true);
-  assert.equal(failure.message, "Codex reported an unrecoverable stream error.");
-  assert.doesNotMatch(JSON.stringify(messages), /fixture provider detail/);
+  assert.equal(failure.message, "connection reset: fixture provider detail");
   assert.match(await stderr, /Codex stream error: connection reset: fixture provider detail/);
 });
 
@@ -450,38 +494,38 @@ test("SIGTERM cancels the active SDK run without retrying", async () => {
   await waitForFile(fixture.terminationPath);
 });
 
-test("timeout terminates the active Codex process tree", async () => {
-  const fixture = await fakeCodexFixture();
-  const child = spawn(process.execPath, [builtWorkerPath], {
-    env: {
-      ...process.env,
-      CODEX_CLI_PATH: fixture.executablePath,
-      FAKE_TREE_TERMINATED_FILE: fixture.terminationPath
-    },
-    stdio: ["pipe", "pipe", "pipe"]
+test("legacy timeout fields do not limit Codex execution", async () => {
+  const request = normalizeRunRequest({
+    type: "run",
+    id: "unlimited-run",
+    model: "gpt-5.6-sol",
+    prompt: "Continue until complete.",
+    workingDirectory: "/private/fixture",
+    timeoutMs: 1,
+    sandboxMode: "workspace-write",
+    networkAccessEnabled: false
   });
-  const stdout = collectLines(child.stdout);
-  const stderr = collectText(child.stderr);
-  child.stdin.end(
-    `${JSON.stringify({
-      type: "run",
-      id: "stdio-timeout",
-      model: "gpt-5.6-sol",
-      prompt: "HANG",
-      workingDirectory: fixture.root,
-      timeoutMs: 1_000,
-      sandboxMode: "workspace-write",
-      networkAccessEnabled: false
-    })}\n`
-  );
+  assert.equal(request.timeoutMs, undefined);
 
-  const [code, signal] = await once(child, "exit");
-  assert.equal(code, 124, await stderr);
-  assert.equal(signal, null);
-  const messages = await stdout;
-  assert.equal(messages.at(-1)?.type, "failed");
-  assert.equal(messages.at(-1)?.code, "timeout");
-  await waitForFile(fixture.terminationPath);
+  const result = await executeRunRequest(request, {
+    codexFactory: () => ({
+      startThread() {
+        return {
+          id: "unlimited-thread",
+          async runStreamed() {
+            return {
+              events: (async function* () {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                yield { type: "turn.completed", usage: {} };
+              })()
+            };
+          }
+        };
+      }
+    })
+  });
+
+  assert.equal(result.threadId, "unlimited-thread");
 });
 
 async function fakeCodexFixture() {

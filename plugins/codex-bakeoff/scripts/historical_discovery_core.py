@@ -614,7 +614,7 @@ def _summarize_session(record: dict[str, Any], source_path: Path) -> dict[str, A
     }
     score = _complexity_score(evidence)
     project_dir = min(project_dirs) if project_dirs else None
-    return {
+    summary = {
         "session_id": session_id,
         "imported_thread_id": record["imported_thread_id"],
         "source_path": str(source_path),
@@ -635,6 +635,10 @@ def _summarize_session(record: dict[str, Any], source_path: Path) -> dict[str, A
         "source_modified_at": record.get("source_modified_at"),
         "claude_model": claude_model,
     }
+    recorded_result = record.get("recorded_claude_result")
+    if isinstance(recorded_result, Mapping):
+        summary["recorded_claude_result"] = dict(recorded_result)
+    return summary
 
 
 def list_imported_sessions(
@@ -646,6 +650,8 @@ def list_imported_sessions(
     try:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
+    except FileNotFoundError:
+        return []
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise LedgerError(
             f"Cannot read the external-agent import ledger {path}: {type(error).__name__}"
@@ -686,7 +692,8 @@ def list_imported_sessions(
                 candidate[0],
             ),
         )
-        sessions.append(selected)
+        if selected["task_count"] > 0:
+            sessions.append(selected)
 
     sessions.sort(
         key=lambda session: (
@@ -1337,7 +1344,14 @@ def _task_observations(
                     if not isinstance(file_path, str) or not file_path.strip():
                         continue
                     if name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
-                        changed_files.add(file_path)
+                        changed_path = Path(file_path).expanduser()
+                        if (
+                            not changed_path.is_absolute()
+                            and isinstance(cwd, str)
+                            and Path(cwd).expanduser().is_absolute()
+                        ):
+                            changed_path = Path(cwd).expanduser() / changed_path
+                        changed_files.add(str(changed_path))
                     if Path(file_path).name in ("CLAUDE.md", "AGENTS.md"):
                         instruction_paths.add(file_path)
 
@@ -1573,6 +1587,36 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
                 "message_uuids": thread_message_uuids,
             }
         )
+    recorded_result = session.get("recorded_claude_result")
+    if isinstance(recorded_result, Mapping):
+        replay["recorded_claude_result"] = dict(recorded_result)
+        for result_key, replay_keys in (
+            ("duration_ms", ("historical_elapsed_seconds", "historical_wall_clock_seconds")),
+            ("duration_api_ms", ("historical_model_request_seconds",)),
+        ):
+            duration_ms = recorded_result.get(result_key)
+            if (
+                not isinstance(duration_ms, (int, float))
+                or isinstance(duration_ms, bool)
+                or not math.isfinite(duration_ms)
+                or duration_ms < 0
+            ):
+                continue
+            duration_seconds = round(duration_ms / 1_000, 3)
+            for replay_key in replay_keys:
+                replay[replay_key] = duration_seconds
+            if result_key == "duration_api_ms":
+                replay["historical_model_request_timing"] = {
+                    **replay["historical_model_request_timing"],
+                    "status": "observed",
+                    "seconds": duration_seconds,
+                    "basis": "recorded_claude_code_api_duration",
+                    "includes": "Claude Code-reported aggregate API request duration",
+                    "limitation": (
+                        "Captured from Claude Code's final result; server-side "
+                        "inference duration is not reported."
+                    ),
+                }
     return replay
 
 

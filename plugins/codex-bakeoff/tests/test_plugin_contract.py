@@ -30,10 +30,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(payload["mcpServers"], "./.mcp.json")
         self.assertTrue((PLUGIN_ROOT / payload["mcpServers"]).is_file())
         self.assertEqual(payload["interface"]["displayName"], "Codex Bakeoff")
-        self.assertIn("in-app browser", payload["interface"]["shortDescription"])
+        self.assertIn("in-app or system browser", payload["interface"]["shortDescription"])
         self.assertIn("in-app browser", payload["description"])
-        self.assertIn("external browser", payload["interface"]["shortDescription"])
-        self.assertIn("external browser fallback", payload["description"])
+        self.assertIn("system browser", payload["description"])
+        self.assertIn("Codex CLI", payload["interface"]["longDescription"])
         self.assertIn("available loopback port", payload["interface"]["longDescription"])
         self.assertIn(
             "Multiple replay sessions can run in parallel",
@@ -42,7 +42,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertNotIn("embedded", json.dumps(payload).lower())
         self.assertNotIn("MCP App", json.dumps(payload))
 
-    def test_skill_opens_the_controller_in_the_codex_in_app_browser(self) -> None:
+    def test_skill_opens_the_controller_in_the_available_browser(self) -> None:
         text = SKILL.read_text(encoding="utf-8")
         flat = " ".join(text.split())
         self.assertIn("mcp__codex_bakeoff.open_controller", text)
@@ -56,12 +56,14 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn('{ target: { type: "browser", url: launch_url } }', flat)
         self.assertIn("Do not provide `threadId`", flat)
         self.assertIn("native call explicitly succeeds", flat)
-        self.assertIn("`open_in_codex` is unavailable or the native call fails", flat)
-        self.assertIn('`open "$launch_url"`', flat)
-        self.assertIn('`xdg-open "$launch_url"`', flat)
-        self.assertIn('`Start-Process "$launch_url"`', flat)
-        self.assertIn("opened in an external browser only after that command succeeds", flat)
-        self.assertNotIn("Never open an external browser automatically", flat)
+        self.assertIn("If `open_in_codex` is unavailable, as in Codex CLI", flat)
+        self.assertIn('`open "$launch_url"` on macOS', flat)
+        self.assertIn('`xdg-open "$launch_url"` on Linux', flat)
+        self.assertIn("verify the command exits successfully", flat)
+        self.assertIn("If the native call exists but fails", flat)
+        self.assertIn("do not fall back to an external browser", flat)
+        self.assertIn("report that the controller could not be opened", flat)
+        self.assertNotIn('`Start-Process "$launch_url"`', flat)
         self.assertNotIn("short-lived", text)
         self.assertNotIn("authenticated", text)
         self.assertNotIn("open_replay_app", text)
@@ -148,19 +150,19 @@ class PluginContractTests(unittest.TestCase):
                 self.assertIn(f'"{field}"', source)
         self.assertIn("A Git beginning state requires a Git end state.", source)
 
-    def test_agent_prompt_opens_the_codex_in_app_browser(self) -> None:
+    def test_agent_prompt_opens_the_available_browser(self) -> None:
         text = AGENT.read_text(encoding="utf-8")
-        self.assertIn("open Codex Bakeoff in the Codex in-app browser now", text)
-        self.assertIn("falling back to an external browser when unavailable", text)
+        self.assertIn("open Codex Bakeoff in the Codex in-app browser", text)
+        self.assertIn("system browser in Codex CLI", text)
         self.assertIn("independent session on an automatically available loopback port", text)
         self.assertIn("Do not run the workflow in chat", text)
         self.assertNotIn("embedded", text)
 
-    def test_readme_describes_the_codex_in_app_browser_controller(self) -> None:
+    def test_readme_describes_desktop_and_cli_browser_controllers(self) -> None:
         text = " ".join(README.read_text(encoding="utf-8").split())
         self.assertIn("local browser controller", text)
         self.assertIn("Codex in-app browser", text)
-        self.assertIn("external browser when the in-app browser is unavailable", text)
+        self.assertIn("In Codex CLI, it opens in the system browser", text)
         self.assertIn("independent controller on an automatically available loopback port", text)
         self.assertIn("Multiple replay sessions can run in parallel", text)
         self.assertIn("each controller resumes only its own runs", text)
@@ -180,6 +182,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(server["args"], ["./mcp/server.py"])
         self.assertEqual(server["cwd"], ".")
         self.assertIn("CODEX_MCP_NODE_PATH", server["env_vars"])
+        self.assertIn("CODEX_BROWSER_USE_NODE_PATH", server["env_vars"])
+        self.assertIn("CODEX_ELECTRON_RESOURCES_PATH", server["env_vars"])
+        self.assertIn("XDG_CACHE_HOME", server["env_vars"])
+        self.assertIn("HOME", server["env_vars"])
         self.assertIn("PATH", server["env_vars"])
         self.assertIn("CODEX_BAKEOFF_CONTROLLER_PORT", server["env_vars"])
         self.assertTrue(MCP_SERVER.is_file())

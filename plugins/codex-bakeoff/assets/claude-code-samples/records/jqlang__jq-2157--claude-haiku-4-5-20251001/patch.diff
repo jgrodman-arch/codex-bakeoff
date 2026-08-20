@@ -1,0 +1,26 @@
+diff --git a/src/builtin.c b/src/builtin.c
+index 9b2d9a2..79e9636 100644
+--- a/src/builtin.c
++++ b/src/builtin.c
+@@ -642,7 +642,7 @@ static jv f_format(jq_state *jq, jv input, jv fmt) {
+     input = f_tostring(jq, input);
+ 
+     int unreserved[128] = {0};
+-    const char* p = CHARS_ALPHANUM "-_.!~*'()";
++    const char* p = CHARS_ALPHANUM "-_.~";
+     while (*p) unreserved[(int)*p++] = 1;
+ 
+     jv line = jv_string("");
+diff --git a/tests/jq.test b/tests/jq.test
+index ca8e270..ae1aabd 100644
+--- a/tests/jq.test
++++ b/tests/jq.test
+@@ -68,7 +68,7 @@ null
+ "1,\"<>&'\"\"\t\""
+ "1\t<>&'\"\\t"
+ "&lt;&gt;&amp;&apos;&quot;\t"
+-"%3C%3E%26'%22%09"
++"%3C%3E%26%27%22%09"
+ "'<>&'\\''\"\t'"
+ "PD4mJyIJ"
+ "<>&'\"\t"

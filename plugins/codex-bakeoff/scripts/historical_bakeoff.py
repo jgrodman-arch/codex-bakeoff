@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import secrets
@@ -26,11 +27,11 @@ PLUGIN_ROOT = SCRIPT_ROOT.parent
 DEFAULT_LEDGER = Path.home() / ".codex" / "external_agent_session_imports.json"
 DEFAULT_MODEL_CACHE = Path.home() / ".codex" / "models_cache.json"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+REVIEW_MODEL_PREFERENCE = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 MODEL_LIST_PAGE_SIZE = 100
 MODEL_LIST_TIMEOUT_SECONDS = 15
 DEFAULT_RUN_ROOT = Path.home() / ".cache" / "codex-bakeoff" / "runs"
 PRICING_PATH = PLUGIN_ROOT / "assets" / "model-pricing.json"
-MAX_TIMEOUT_SECONDS = 14_400
 THREAD_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}\Z")
 COMMIT_PATTERN = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
 
@@ -1296,7 +1297,6 @@ def _configuration(
         "file_selection": context["file_selection"],
         "model": context["model"],
         "runtime": {
-            "timeout_seconds": context["timeout_seconds"],
             "sandbox_policy": context["sandbox_policy"],
         },
         "capabilities": {
@@ -1320,8 +1320,6 @@ def _configuration(
 
 
 def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
-    if args.timeout_seconds > MAX_TIMEOUT_SECONDS:
-        raise ReplayError("The execution timeout cannot exceed 14,400 seconds.")
     replay, repository_resolution, repository_blockers = _resolved_replay_repository(
         args,
         _selected_replay(args),
@@ -1349,7 +1347,6 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
         "model": model,
         "capabilities": capabilities,
         "prompt": _prompt(replay),
-        "timeout_seconds": args.timeout_seconds,
         "sandbox_policy": {"type": "workspaceWrite", "networkAccess": True},
     }
     questions = _selection_questions(file_selection)
@@ -1481,7 +1478,6 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
             "model",
             "capabilities",
             "prompt",
-            "timeout_seconds",
             "sandbox_policy",
         )
     }
@@ -1518,7 +1514,6 @@ def _command_run(args: argparse.Namespace) -> dict[str, Any]:
             "model": context["model"],
             "prompt": context["prompt"],
             "target": target,
-            "timeout_seconds": context["timeout_seconds"],
             "baseline_materialization": None,
         },
         "review_opened": False,
@@ -1894,6 +1889,24 @@ def _command_complete_run(args: argparse.Namespace) -> dict[str, Any]:
         codex_result=native,
         limitations=limitations,
     )
+    recorded_result = run["replay"].get("recorded_claude_result")
+    if isinstance(recorded_result, Mapping):
+        reported_cost = recorded_result.get("total_cost_usd")
+        if (
+            isinstance(reported_cost, (int, float))
+            and not isinstance(reported_cost, bool)
+            and math.isfinite(reported_cost)
+            and reported_cost >= 0
+        ):
+            report["estimated_cost"]["claude"] = {
+                "status": "estimated",
+                "usd": reported_cost,
+                "missing_models": [],
+                "dynamic_models": [],
+                "basis": "recorded Claude Code API-equivalent estimate",
+                "actual_charge": "not observed",
+            }
+        report["recorded_claude_result"] = dict(recorded_result)
     report.update(
         {
             "run_directory": str(run_directory),
@@ -1968,15 +1981,182 @@ def _evaluator_availability(raw: str | None) -> list[dict[str, Any]]:
 
 def _command_reviewers(args: argparse.Namespace) -> dict[str, Any]:
     catalog = discover_codex_models(args.model_cache)
-    recommended = next(
-        (item["id"] for item in catalog["options"] if item.get("recommended")),
-        catalog["options"][0]["id"] if catalog["options"] else "gpt-5.6-sol",
+    available = [
+        option
+        for option in catalog.get("options", [])
+        if isinstance(option, Mapping) and isinstance(option.get("id"), str)
+    ]
+    model = next(
+        (
+            preferred
+            for preferred in REVIEW_MODEL_PREFERENCE
+            if any(option["id"] == preferred for option in available)
+        ),
+        next(
+            (str(option["id"]) for option in available if option.get("recommended")),
+            str(available[0]["id"]) if available else None,
+        ),
     )
-    entries = _execution().check_evaluator_availability(codex_model=recommended)
+    entries = _execution().check_evaluator_availability(codex_model=model) if model else []
     return {
         "status": ("available" if any(item["available"] for item in entries) else "unavailable"),
         "evaluators": entries,
     }
+
+
+def _historical_evaluation_checks(
+    path: Path | None,
+    run: Mapping[str, Any],
+) -> dict[str, dict[str, int | None]] | None:
+    if path is None or not path.is_file():
+        return None
+    shared = _load_json(path, label="the shared historical evaluation")
+    historical_result = run.get("historical_result")
+    expected_digest = (
+        historical_result.get("sha256") if isinstance(historical_result, Mapping) else None
+    )
+    if shared.get("historical_result_sha256") != expected_digest:
+        raise ReplayError("The shared historical evaluation does not match the frozen artifact.")
+    raw_checks = shared.get("checks")
+    if not isinstance(raw_checks, Mapping):
+        raise ReplayError("The shared historical evaluation has invalid checks.")
+    try:
+        ballot = _execution().parse_review_ballot(
+            {
+                "dimensions": {
+                    name: {"candidates": {label: {"checks": checks} for label in ("A", "B")}}
+                    for name, checks in raw_checks.items()
+                }
+            }
+        )
+    except Exception as error:
+        raise ReplayError("The shared historical evaluation has invalid checks.") from error
+    return {
+        name: dict(dimension["candidates"]["A"]["checks"])
+        for name, dimension in ballot["dimensions"].items()
+    }
+
+
+def _with_historical_evaluation(
+    ballot: Mapping[str, Any],
+    historical_checks: Mapping[str, Mapping[str, int | None]],
+) -> dict[str, Any]:
+    return _execution().parse_review_ballot(
+        {
+            "dimensions": {
+                name: {
+                    "candidates": {
+                        "A": {"checks": historical_checks[name]},
+                        "B": {"checks": dimension["candidates"]["B"]["checks"]},
+                    }
+                }
+                for name, dimension in ballot["dimensions"].items()
+            }
+        }
+    )
+
+
+def _share_historical_evaluation(
+    path: Path,
+    run_directory: Path,
+    run: Mapping[str, Any],
+) -> dict[str, Any]:
+    report = _load_json(run_directory / "report.json", label="the replay report")
+    evaluation = report.get("evaluation")
+    if not isinstance(evaluation, Mapping):
+        raise ReplayError("The completed replay has no evaluation.")
+    reviews = evaluation.get("reviews")
+    valid = (
+        [
+            review
+            for review in reviews
+            if isinstance(review, Mapping) and review.get("status") == "completed"
+        ]
+        if isinstance(reviews, list)
+        else []
+    )
+    if not valid:
+        return dict(evaluation)
+    historical_result = run.get("historical_result")
+    digest = historical_result.get("sha256") if isinstance(historical_result, Mapping) else None
+    if not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+        raise ReplayError("The shared historical evaluation requires a frozen artifact digest.")
+    if path.is_file():
+        shared = _load_json(path, label="the shared historical evaluation")
+        historical_checks = _historical_evaluation_checks(path, run)
+        if historical_checks is None:
+            raise ReplayError("The shared historical evaluation is unavailable.")
+    else:
+        historical_checks = {
+            name: dict(dimension["candidates"]["A"]["checks"])
+            for name, dimension in valid[0]["ballot"]["dimensions"].items()
+        }
+        shared = {
+            "historical_result_sha256": digest,
+            "evaluator_model": str(valid[0].get("model") or DEFAULT_CODEX_MODEL),
+            "checks": historical_checks,
+            "run_directories": [],
+        }
+    raw_directories = shared.get("run_directories")
+    directories = list(raw_directories) if isinstance(raw_directories, list) else []
+    current = str(run_directory.resolve())
+    if current not in directories:
+        directories.append(current)
+    sibling_reports: list[tuple[Path, dict[str, Any], list[dict[str, Any]]]] = []
+    comparable = set(_execution().REVIEW_DIMENSION_CHECKS)
+    for raw_directory in directories:
+        sibling = Path(raw_directory).expanduser().resolve()
+        if sibling.parent != run_directory.parent:
+            raise ReplayError("A shared historical evaluation references an unrelated run.")
+        sibling_report = _load_json(sibling / "report.json", label="a sibling replay report")
+        sibling_evaluation = sibling_report.get("evaluation")
+        if not isinstance(sibling_evaluation, Mapping):
+            raise ReplayError("A sibling replay has no completed evaluation.")
+        sibling_reviews = sibling_evaluation.get("reviews")
+        sibling_valid = (
+            [
+                dict(review)
+                for review in sibling_reviews
+                if isinstance(review, Mapping) and review.get("status") == "completed"
+            ]
+            if isinstance(sibling_reviews, list)
+            else []
+        )
+        if not sibling_valid:
+            raise ReplayError("A sibling replay has no completed reviewer ballot.")
+        for review in sibling_valid:
+            review["ballot"] = _with_historical_evaluation(review["ballot"], historical_checks)
+            comparable.intersection_update(
+                name
+                for name, dimension in review["ballot"]["dimensions"].items()
+                if dimension["winner"] != "not_applicable"
+            )
+        sibling_reports.append((sibling, sibling_report, sibling_valid))
+    comparable_dimensions = [
+        name for name in _execution().REVIEW_DIMENSION_CHECKS if name in comparable
+    ]
+    shared["run_directories"] = directories
+    shared["comparable_dimensions"] = comparable_dimensions
+    _write_json(path, shared)
+    current_evaluation: dict[str, Any] | None = None
+    for sibling, sibling_report, sibling_valid in sibling_reports:
+        sibling_evaluation = dict(sibling_report["evaluation"])
+        aggregate = _execution().aggregate_reviews(
+            sibling_valid,
+            dimensions=comparable_dimensions,
+        )
+        sibling_evaluation["reviews"] = sibling_valid
+        sibling_evaluation["all_results"] = sibling_valid
+        sibling_evaluation["totals"] = aggregate["totals"]
+        sibling_evaluation["comparable_dimensions"] = comparable_dimensions
+        sibling_report["evaluation"] = sibling_evaluation
+        _write_report(sibling, sibling_report)
+        _write_json(sibling / "review.json", sibling_evaluation)
+        if sibling == run_directory:
+            current_evaluation = sibling_evaluation
+    if current_evaluation is None:
+        raise ReplayError("The current replay was missing from its shared evaluation.")
+    return current_evaluation
 
 
 def _command_evaluate(args: argparse.Namespace) -> dict[str, Any]:
@@ -1991,16 +2171,20 @@ def _command_evaluate(args: argparse.Namespace) -> dict[str, Any]:
         _write_report(run_directory, report)
         return {"status": "unavailable", "task_requests": []}
     run = _load_json(run_directory / "run.json", label="the replay run")
+    evaluator_model = str(getattr(args, "evaluator_model", None) or DEFAULT_CODEX_MODEL)
     evaluators = _selected_evaluators(
-        str(run.get("model") or "gpt-5.6-sol"),
+        evaluator_model,
         args.evaluator,
     )
+    shared_path = getattr(args, "historical_evaluation", None)
+    historical_checks = _historical_evaluation_checks(shared_path, run)
     availability = _evaluator_availability(args.evaluator_availability_json)
     requests = _execution().prepare_review(
         run_directory=run_directory,
         original_request=str(report.get("original_request") or ""),
         candidates=(claude, codex),
         evaluators=evaluators,
+        historical_checks=historical_checks,
     )
     _write_json(
         run_directory / "review.json",
@@ -2033,7 +2217,8 @@ def _reviewer_numeric_ballot(response: str | Mapping[str, Any]) -> dict[str, Any
         return None
 
     dimensions = {}
-    known_dimensions = _execution().REVIEW_DIMENSION_CHECKS
+    execution = _execution()
+    known_dimensions = execution.REVIEW_DIMENSION_CHECKS
     for dimension, decision in loaded["dimensions"].items():
         if not isinstance(dimension, str) or dimension not in known_dimensions:
             continue
@@ -2064,7 +2249,22 @@ def _reviewer_numeric_ballot(response: str | Mapping[str, Any]) -> dict[str, Any
                 )
                 and (value is None or (type(value) is int and value in (0, 1)))
             }
-            candidates[label] = {"checks": checks}
+            stored_candidate: dict[str, Any] = {"checks": checks}
+            raw_explanations = candidate.get("explanations")
+            if isinstance(raw_explanations, Mapping):
+                explanation_limit = execution.MAX_REVIEW_CHECK_EXPLANATION_LENGTH
+                explanations = {
+                    check: execution.sanitize_review_check_explanation(value)
+                    for check, value in raw_explanations.items()
+                    if isinstance(check, str)
+                    and check in expected_checks
+                    and isinstance(value, str)
+                    and value.strip()
+                    and len(value) <= explanation_limit
+                }
+                if set(explanations) == set(expected_checks):
+                    stored_candidate["explanations"] = explanations
+            candidates[label] = stored_candidate
         dimensions[dimension] = {"candidates": candidates}
     return {"dimensions": dimensions}
 
@@ -2102,7 +2302,14 @@ def _reviewer_result_for_storage(result: Mapping[str, Any]) -> dict[str, Any]:
         "dimensions": {
             dimension: {
                 "candidates": {
-                    label: {"checks": dict(candidate["checks"])}
+                    label: {
+                        "checks": dict(candidate["checks"]),
+                        **(
+                            {"explanations": dict(candidate["explanations"])}
+                            if "explanations" in candidate
+                            else {}
+                        ),
+                    }
                     for label, candidate in decision["candidates"].items()
                 }
             }
@@ -2238,7 +2445,7 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 normalization_requests.append(
                     _execution().prepare_review_normalization(
                         evaluator=evaluator,
-                        model=str(run.get("model") or model or "gpt-5.6-sol"),
+                        model=model or DEFAULT_CODEX_MODEL,
                         raw_ballot=raw_ballot,
                     )
                 )
@@ -2351,6 +2558,9 @@ def _command_complete_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     report["evaluation"] = aggregate
     _write_report(run_directory, report)
     _write_json(run_directory / "review.json", aggregate)
+    shared_path = getattr(args, "historical_evaluation", None)
+    if shared_path is not None and valid:
+        aggregate = _share_historical_evaluation(shared_path, run_directory, run)
     return {
         "status": aggregate["status"],
         "evaluation": aggregate,
@@ -2493,7 +2703,6 @@ def _add_preparation(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
-    parser.add_argument("--timeout-seconds", type=_positive_int, default=1800)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2570,7 +2779,9 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("--run-dir", type=Path, required=True)
     evaluate.add_argument("--evaluator", action="append", choices=("codex",))
+    evaluate.add_argument("--evaluator-model")
     evaluate.add_argument("--evaluator-availability-json")
+    evaluate.add_argument("--historical-evaluation", type=Path)
     _add_json(evaluate)
 
     collect_reviews = commands.add_parser("collect-native-results")
@@ -2581,6 +2792,7 @@ def build_parser() -> argparse.ArgumentParser:
     complete_reviews = commands.add_parser("complete-evaluation")
     complete_reviews.add_argument("--run-dir", type=Path, required=True)
     complete_reviews.add_argument("--native-results", type=Path, required=True)
+    complete_reviews.add_argument("--historical-evaluation", type=Path)
     complete_reviews.add_argument(
         "--normalized-result",
         type=Path,

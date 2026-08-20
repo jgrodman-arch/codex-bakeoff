@@ -134,6 +134,35 @@ class HistoricalDiscoveryTests(unittest.TestCase):
             result_event["timestamp"] = "2026-01-01T10:01:01Z"
         return [tool_event, result_event]
 
+    def test_missing_import_ledger_returns_no_sessions(self) -> None:
+        self.assertEqual(discovery.list_imported_sessions(self.ledger), [])
+
+    def test_malformed_import_ledger_remains_an_error(self) -> None:
+        self.ledger.write_text("not valid json", encoding="utf-8")
+
+        with self.assertRaisesRegex(discovery.LedgerError, "JSONDecodeError"):
+            discovery.list_imported_sessions(self.ledger)
+
+    def test_sessions_without_replayable_tasks_are_excluded(self) -> None:
+        cursor = self.write_transcript(
+            "cursor",
+            [{"role": "user", "message": {"content": "Cursor request"}}],
+        )
+        claude = self.write_transcript(
+            "claude",
+            [self.user("claude-task", "Claude request", "2026-01-01T10:00:00Z")],
+        )
+        self.write_ledger(
+            [
+                self.record(cursor, thread="cursor-thread", imported_at=200),
+                self.record(claude, thread="claude-thread", imported_at=100),
+            ]
+        )
+
+        sessions = discovery.list_imported_sessions(self.ledger)
+
+        self.assertEqual([session["imported_thread_id"] for session in sessions], ["claude-thread"])
+
     def test_sessions_sort_by_original_creation_time(self) -> None:
         older = self.write_transcript(
             "older",
@@ -172,6 +201,72 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         self.assertEqual(sessions[0]["imported_thread_id"], "newer")
         self.assertNotIn("source_hash_status", sessions[0])
         self.assertNotIn("source_sha256", sessions[0])
+
+    def test_recorded_claude_metrics_survive_authentic_thread_discovery(self) -> None:
+        source = self.write_transcript(
+            "recorded",
+            [
+                self.user("u1", "fix the argument parser", "2026-01-01T10:00:00Z"),
+                self.assistant("a1", "fixed", "2026-01-01T10:00:03Z"),
+            ],
+        )
+        record = self.record(source, thread="sample:jq-2919:claude-fable-5", imported_at=100)
+        record["recorded_claude_result"] = {
+            "duration_ms": 24_321,
+            "duration_api_ms": 17_402,
+            "total_cost_usd": 0.18273,
+        }
+        self.write_ledger([record])
+
+        session = discovery.list_imported_sessions(self.ledger)[0]
+        replay = discovery.build_replay_spec(session, discovery.build_thread_task(session))
+
+        self.assertEqual(replay["recorded_claude_result"]["total_cost_usd"], 0.18273)
+        self.assertEqual(replay["historical_model_request_seconds"], 17.402)
+        self.assertEqual(replay["historical_wall_clock_seconds"], 24.321)
+        self.assertEqual(replay["historical_elapsed_seconds"], 24.321)
+        self.assertEqual(replay["historical_model_request_timing"]["seconds"], 17.402)
+        self.assertEqual(
+            replay["historical_model_request_timing"]["basis"],
+            "recorded_claude_code_api_duration",
+        )
+
+    def test_invalid_recorded_duration_does_not_replace_authentic_transcript_timing(self) -> None:
+        source = self.write_transcript(
+            "recorded-invalid",
+            [
+                self.user("u1", "fix it", "2026-01-01T10:00:00Z"),
+                self.assistant("a1", "fixed", "2026-01-01T10:00:03Z"),
+            ],
+        )
+        record = self.record(source, thread="sample:invalid-duration", imported_at=100)
+        record["recorded_claude_result"] = {"duration_ms": -1}
+        self.write_ledger([record])
+
+        session = discovery.list_imported_sessions(self.ledger)[0]
+        replay = discovery.build_replay_spec(session, discovery.build_thread_task(session))
+
+        self.assertNotEqual(replay["historical_model_request_seconds"], -0.001)
+        self.assertEqual(replay["historical_wall_clock_seconds"], 3)
+
+    def test_missing_api_duration_preserves_authentic_transcript_request_timing(self) -> None:
+        source = self.write_transcript(
+            "recorded-wall-only",
+            [
+                self.user("u1", "fix it", "2026-01-01T10:00:00Z"),
+                self.assistant("a1", "fixed", "2026-01-01T10:00:03Z"),
+            ],
+        )
+        record = self.record(source, thread="sample:wall-only", imported_at=100)
+        record["recorded_claude_result"] = {"duration_ms": 24_321}
+        self.write_ledger([record])
+
+        session = discovery.list_imported_sessions(self.ledger)[0]
+        replay = discovery.build_replay_spec(session, discovery.build_thread_task(session))
+
+        self.assertEqual(replay["historical_wall_clock_seconds"], 24.321)
+        self.assertIsNone(replay["historical_model_request_seconds"])
+        self.assertEqual(replay["historical_model_request_timing"]["status"], "unavailable")
 
     def test_whole_thread_replay_combines_user_requests(self) -> None:
         session, task = self.select(
@@ -401,6 +496,35 @@ class HistoricalDiscoveryTests(unittest.TestCase):
                 whole_thread=True,
             ),
             "later observation",
+        )
+
+    def test_relative_changed_files_resolve_against_event_working_directory(self) -> None:
+        nested = self.project / "nested"
+        event = self.assistant("a1", "updated", "2026-01-01T10:01:00Z")
+        event["cwd"] = str(nested)
+        event["message"]["content"] = [
+            {
+                "type": "tool_use",
+                "id": "edit-1",
+                "name": "Edit",
+                "input": {"file_path": "src/builtin.c"},
+            },
+            {
+                "type": "tool_use",
+                "id": "write-1",
+                "name": "Write",
+                "input": {"file_path": str(self.project / "absolute.txt")},
+            },
+        ]
+        session, task = self.select(
+            [self.user("u1", "fix the project", "2026-01-01T10:00:00Z"), event]
+        )
+
+        replay = discovery.build_replay_spec(session, task)
+
+        self.assertEqual(
+            replay["historical_changed_files"],
+            sorted((str(self.project / "absolute.txt"), str(nested / "src/builtin.c"))),
         )
 
     def test_git_status_evidence_matches_selected_repository(self) -> None:

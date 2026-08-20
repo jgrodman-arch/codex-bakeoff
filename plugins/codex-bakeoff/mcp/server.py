@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import hmac
 import http.server
+import importlib.util
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -65,13 +67,13 @@ MAX_STATE_BYTES = 512 * 1024
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_HTTP_BODY_BYTES = 1024 * 1024
 MAX_SELECTION_ITEMS = 2_000
+MAX_REPLAY_MODELS = 8
 MAX_PREPARE_TOKENS = 256
-MAX_COMMAND_TIMEOUT = 14_700
 IMPLEMENTATION_RETRY_LIMIT = 3
 MAX_RUN_LOG_BYTES = 128 * 1024
 MAX_REQUEST_SYNTHESIS_BYTES = 256 * 1024
 REQUEST_SYNTHESIS_MODEL = "gpt-5.6-terra"
-CONTROLLER_SMOKE_TEST_MODEL = "gpt-5.6-sol"
+DEFAULT_IMPLEMENTATION_MODEL = "gpt-5.6-sol"
 REQUEST_SYNTHESIS_SCHEMA = {
     "type": "object",
     "properties": {"request": {"type": "string"}},
@@ -124,6 +126,18 @@ _coordinator_run_id: str | None = None
 
 class ControllerError(ValueError):
     """A safe user-facing controller error."""
+
+
+@lru_cache(maxsize=1)
+def _claude_code_sample_loader() -> Any:
+    module_path = PLUGIN_ROOT / "scripts" / "claude_code_sample_loader.py"
+    spec = importlib.util.spec_from_file_location("codex_bakeoff_claude_code_samples", module_path)
+    if spec is None or spec.loader is None:
+        raise ControllerError("The recorded Claude sample loader is unavailable.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class RunCancelled(RuntimeError):
@@ -183,6 +197,42 @@ def _node_runtime() -> str:
         candidate = Path(configured).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
+
+    configured_paths = [os.environ.get("CODEX_BROWSER_USE_NODE_PATH")]
+    resources_path = os.environ.get("CODEX_ELECTRON_RESOURCES_PATH")
+    if resources_path:
+        configured_paths.append(str(Path(resources_path) / "cua_node" / "bin" / "node"))
+    codex_cli_path = os.environ.get("CODEX_CLI_PATH")
+    if codex_cli_path:
+        configured_paths.append(str(Path(codex_cli_path).parent / "cua_node" / "bin" / "node"))
+
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    configured_paths.extend(
+        [
+            str(cache_root / "codex-runtimes/codex-primary-runtime/dependencies/node/bin/node"),
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+        ]
+    )
+    for configured in configured_paths:
+        if not configured:
+            continue
+        candidate = Path(configured).expanduser()
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        try:
+            version = subprocess.run(
+                [str(candidate), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        match = re.match(r"v(\d+)(?:\.|$)", version.stdout.strip())
+        if version.returncode == 0 and match is not None and int(match.group(1)) >= 18:
+            return str(candidate)
     executable = shutil.which("node")
     if executable is not None:
         return executable
@@ -208,6 +258,17 @@ def _installed_version() -> str:
 
 
 SERVER_VERSION = _installed_version()
+
+
+@lru_cache(maxsize=1)
+def _plugin_installations() -> Any:
+    module_path = PLUGIN_ROOT / "mcp" / "plugin_installations.py"
+    spec = importlib.util.spec_from_file_location("codex_bakeoff_plugin_installations", module_path)
+    if spec is None or spec.loader is None:
+        raise ControllerError("The Replay installation resolver is unavailable.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _object_schema(
@@ -242,11 +303,10 @@ def _configuration_schema(*, approval: bool = False) -> dict[str, Any]:
             "type": "array",
             "items": {"type": "string", "minLength": 1},
             "minItems": 1,
-            "maxItems": MAX_SELECTION_ITEMS,
+            "maxItems": MAX_REPLAY_MODELS,
             "uniqueItems": True,
             "description": "Selected available Codex models to replay in parallel.",
         },
-        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 14_400},
         "repo": {"type": ["string", "null"], "minLength": 1},
         "source_path": {"type": ["string", "null"], "minLength": 1},
         "message_uuid": {"type": ["string", "null"], "minLength": 1},
@@ -317,7 +377,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         _tool_definition(
             "open_controller",
             f"Open {APP_TITLE}",
-            "Prepare the local Codex Bakeoff controller URL for the in-app browser or external browser fallback.",
+            "Prepare the local Codex Bakeoff controller URL for the available browser.",
             _object_schema(
                 {
                     "codex_cli_path": {
@@ -543,8 +603,12 @@ def _spawn_controller_daemon(
     reservation: socket.socket,
     controller_session_id: str,
     codex_cli_path: str | None = None,
+    plugin_root: Path = PLUGIN_ROOT,
 ) -> subprocess.Popen[bytes]:
-    if not APP_HTML.is_file():
+    controller_html = (
+        APP_HTML if plugin_root == PLUGIN_ROOT else plugin_root / "mcp" / "controller.html"
+    )
+    if not controller_html.is_file():
         raise ControllerError("The local controller HTML is unavailable.")
     instance_directory = _controller_instance_directory(controller_session_id)
     instance_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -566,8 +630,8 @@ def _spawn_controller_daemon(
         _write_private_json(instance_directory / "codex-cli-path.json", {"path": codex_cli_path})
     with log_path.open("ab", buffering=0) as log:
         return subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--http"],
-            cwd=PLUGIN_ROOT,
+            [sys.executable, str(plugin_root / "mcp" / "server.py"), "--http"],
+            cwd=plugin_root,
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=log,
@@ -625,10 +689,54 @@ def _worker_environment() -> dict[str, str]:
     return environment
 
 
+def _retire_stale_idle_controllers(plugin_root: Path) -> None:
+    try:
+        payload = json.loads(
+            (plugin_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        current_version = (
+            _plugin_installations().semantic_version(payload.get("version"))
+            if isinstance(payload, Mapping)
+            else None
+        )
+        instances = list((RUN_ROOT.parent / "controllers").iterdir())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return
+    if current_version is None:
+        return
+
+    for instance in instances:
+        session = instance.name
+        if re.fullmatch(r"[a-f0-9]{32}", session) is None:
+            continue
+        runtime = _read_controller_runtime(session)
+        port = runtime.get("port")
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            continue
+        status, health = _probe_controller(port, controller_session_id=session)
+        version = _plugin_installations().semantic_version(health.get("version"))
+        if (
+            status != "compatible"
+            or health.get("controller_session_id") != session
+            or health.get("active_runs") != 0
+            or version is None
+            or version >= current_version
+        ):
+            continue
+        try:
+            _control_request(port, "/api/shutdown", controller_session_id=session)
+        except ControllerError:
+            continue
+
+
 def _ensure_controller_daemon(
     *,
     codex_cli_path: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
+    plugin_root = _plugin_installations().latest_enabled_plugin_root(
+        PLUGIN_ROOT, SERVER_NAME, SERVER_VERSION
+    )
+    _retire_stale_idle_controllers(plugin_root)
     preferred_port = _controller_port()
     controller_session_id = secrets.token_hex(16)
     instance_directory = _controller_instance_directory(controller_session_id)
@@ -648,6 +756,7 @@ def _ensure_controller_daemon(
                 reservation=reservation,
                 controller_session_id=controller_session_id,
                 codex_cli_path=codex_cli_path,
+                plugin_root=plugin_root,
             )
         except OSError as error:
             raise ControllerError("The local controller process could not start.") from error
@@ -673,11 +782,10 @@ def _open_controller(
 ) -> dict[str, Any]:
     if codex_cli_path is not None:
         _remember_codex_cli_path_hint(codex_cli_path)
-    _run_controller_smoke_test()
     port, health = _ensure_controller_daemon(codex_cli_path=codex_cli_path)
     launch_url = f"{_controller_origin(port)}/"
     return _text_result(
-        "Codex Bakeoff is ready to open in the in-app browser or an external browser.",
+        "Codex Bakeoff is ready to open in the available browser.",
         {
             "prepared": True,
             "opened": False,
@@ -1206,7 +1314,7 @@ def _run_process(
     command: Sequence[str],
     *,
     cwd: Path,
-    timeout: int,
+    timeout: int | None,
     input_text: str | None = None,
     stream_log_path: Path | None = None,
     stream_log_label: str = "process",
@@ -1339,32 +1447,43 @@ def _engine(
     command: str,
     arguments: Sequence[str] = (),
     *,
-    timeout: int = 180,
+    timeout: int | None = 180,
     run_directory: Path | None = None,
     input_text: str | None = None,
 ) -> dict[str, Any]:
-    bounded_timeout = _bounded_int(
-        timeout,
-        default=180,
-        minimum=1,
-        maximum=MAX_COMMAND_TIMEOUT,
-    )
+    command_arguments = list(arguments)
+    if "--imported-thread-id" in command_arguments:
+        thread_index = command_arguments.index("--imported-thread-id") + 1
+        if thread_index < len(command_arguments):
+            thread_id = command_arguments[thread_index]
+            loader = _claude_code_sample_loader()
+            if loader.is_sample_thread(thread_id):
+                try:
+                    loader.sample_id_from_thread(thread_id)
+                except loader.SampleError as error:
+                    raise ControllerError(str(error)) from error
+                private_ledger = loader.ledger_path(CONTROLLER_INSTANCE_ROOT)
+                if not private_ledger.is_file():
+                    raise ControllerError("The recorded Claude sample has not been loaded.")
+                if "--ledger" not in command_arguments:
+                    command_arguments.extend(("--ledger", str(private_ledger)))
+    effective_timeout = None if run_directory is not None else timeout
     log_path = _run_log_path(run_directory) if run_directory is not None else None
     label = f"engine:{command}"
     if log_path is not None:
         _append_run_log(log_path, label, "started")
     try:
         completed = _run_process(
-            [sys.executable, str(RUNNER), command, *arguments, "--json"],
+            [sys.executable, str(RUNNER), command, *command_arguments, "--json"],
             cwd=PLUGIN_ROOT,
-            timeout=bounded_timeout,
+            timeout=effective_timeout,
             input_text=input_text,
             run_id=run_directory.name if run_directory is not None else None,
             env=_worker_environment(),
         )
     except subprocess.TimeoutExpired:
         if log_path is not None:
-            _append_run_log(log_path, label, f"timed out after {bounded_timeout} seconds")
+            _append_run_log(log_path, label, f"timed out after {effective_timeout} seconds")
         raise
     if log_path is not None:
         _record_completed_process(log_path, label, completed)
@@ -1392,8 +1511,8 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
         raw_models = arguments.get("models")
         if not isinstance(raw_models, list) or not raw_models:
             raise ControllerError("Choose at least one Codex model.")
-        if len(raw_models) > MAX_SELECTION_ITEMS:
-            raise ControllerError("Choose a bounded number of Codex models.")
+        if len(raw_models) > MAX_REPLAY_MODELS:
+            raise ControllerError(f"Choose no more than {MAX_REPLAY_MODELS} Codex models.")
         selected_models = []
         for selected_model in raw_models:
             if (
@@ -1478,12 +1597,6 @@ def _normalized_configuration(arguments: Mapping[str, Any]) -> dict[str, Any]:
         "message_uuid": message_uuid,
         "request": request,
         "model": model,
-        "timeout_seconds": _bounded_int(
-            arguments.get("timeout_seconds"),
-            default=1800,
-            minimum=1,
-            maximum=14_400,
-        ),
         "repo": repo.strip() if isinstance(repo, str) else None,
         "beginning_kind": beginning_kind,
         "ending_kind": ending_kind,
@@ -1518,8 +1631,6 @@ def _configuration_arguments(arguments: Mapping[str, Any]) -> list[str]:
         str(configuration["thread_id"]),
         "--model",
         str(configuration["model"]),
-        "--timeout-seconds",
-        str(configuration["timeout_seconds"]),
     ]
     repo = configuration["repo"]
     if isinstance(repo, str):
@@ -1579,6 +1690,7 @@ def _prepare_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
     historical_result_sha256 = payload.get("historical_result_sha256")
     prepared_configuration_sha256 = payload.get("prepared_configuration_sha256")
     prepared_configuration_digests: dict[str, str] = {}
+    shared_prepared_configuration: dict[str, Any] | None = None
     if ready:
         if (
             not isinstance(historical_result_sha256, str)
@@ -1604,6 +1716,25 @@ def _prepare_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
                 raise ControllerError(
                     "The prepared replay configuration has no valid integrity digest."
                 )
+            if len(selected_models) > 1:
+                prepared_configuration = prepared.get("configuration")
+                if (
+                    not isinstance(prepared_configuration, Mapping)
+                    or prepared_configuration.get("model") != selected_model
+                ):
+                    raise ControllerError(
+                        "The selected model has no matching prepared replay configuration."
+                    )
+                model_independent_configuration = {
+                    key: value for key, value in prepared_configuration.items() if key != "model"
+                }
+                if shared_prepared_configuration is None:
+                    shared_prepared_configuration = model_independent_configuration
+                elif model_independent_configuration != shared_prepared_configuration:
+                    raise ControllerError(
+                        "The prepared replay baseline changed between selected models. "
+                        "Prepare the replay again."
+                    )
             prepared_configuration_digests[selected_model] = model_configuration_digest
     prepare_token: str | None = None
     if ready:
@@ -1743,6 +1874,38 @@ def _state_guard(run_directory: Path) -> Iterator[None]:
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
+
+
+@contextmanager
+def _historical_review_guard(run_directory: Path) -> Iterator[Path | None]:
+    state_path = _state_path(run_directory)
+    if not state_path.is_file():
+        yield None
+        return
+    state = _read_json(state_path)
+    models = state.get("models")
+    token_hash = state.get("prepare_token_hash")
+    fingerprint = state.get("configuration_fingerprint")
+    if (
+        not isinstance(models, list)
+        or len(models) < 2
+        or not isinstance(token_hash, str)
+        or re.fullmatch(r"[a-f0-9]{64}", token_hash) is None
+        or not isinstance(fingerprint, str)
+        or re.fullmatch(r"[a-f0-9]{64}", fingerprint) is None
+    ):
+        yield None
+        return
+    shared_directory = run_directory.parent / ".shared-reviews"
+    shared_directory.mkdir(parents=True, exist_ok=True)
+    path = shared_directory / f"{token_hash}-{fingerprint}.json"
+    descriptor = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield path
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _initial_state(
@@ -1965,19 +2128,12 @@ def _worker_request(
         raise ControllerError("The worker request has no model.")
     if not isinstance(prompt, str) or not prompt:
         raise ControllerError("The worker request has no prompt.")
-    timeout = request.get("timeout_seconds")
-    timeout_seconds = (
-        timeout
-        if isinstance(timeout, int) and not isinstance(timeout, bool)
-        else (600 if read_only else 1800)
-    )
     payload: dict[str, Any] = {
         "type": "run",
         "requestId": secrets.token_hex(8),
         "model": model,
         "prompt": prompt,
         "workingDirectory": str(working_directory),
-        "timeoutSeconds": min(max(timeout_seconds, 1), 14_400),
         "sandboxMode": "read-only" if read_only else "workspace-write",
         "networkAccess": not read_only,
     }
@@ -1989,30 +2145,6 @@ def _worker_request(
     return payload
 
 
-def _request_timeout_seconds(
-    request: Mapping[str, Any],
-    *,
-    default: int,
-) -> int:
-    return _bounded_int(
-        request.get("timeout_seconds"),
-        default=default,
-        minimum=1,
-        maximum=14_400,
-    )
-
-
-def _long_command_timeout(
-    request: Mapping[str, Any],
-    *,
-    default: int,
-) -> int:
-    return min(
-        _request_timeout_seconds(request, default=default) + 300,
-        MAX_COMMAND_TIMEOUT,
-    )
-
-
 def _run_worker(
     request: Mapping[str, Any],
     *,
@@ -2020,6 +2152,7 @@ def _run_worker(
     working_directory: Path,
     read_only: bool,
     log_label: str,
+    timeout: int | None = None,
 ) -> dict[str, Any]:
     if not WORKER.is_file():
         raise ControllerError("The packaged Codex worker is unavailable.")
@@ -2028,7 +2161,6 @@ def _run_worker(
         working_directory=working_directory,
         read_only=read_only,
     )
-    timeout = int(payload["timeoutSeconds"]) + 90
     completed = _run_process(
         [_node_runtime(), str(WORKER)],
         input_text=json.dumps(payload, ensure_ascii=False) + "\n",
@@ -2088,25 +2220,6 @@ def _run_worker(
         "worktree": str(working_directory),
         "events": records[-100:],
     }
-
-
-def _run_controller_smoke_test() -> None:
-    try:
-        with tempfile.TemporaryDirectory(prefix="codex-bakeoff-smoke-") as temporary:
-            workspace = Path(temporary).resolve()
-            _run_worker(
-                {
-                    "model": CONTROLLER_SMOKE_TEST_MODEL,
-                    "prompt": "Reply with exactly READY. Do not use tools.",
-                    "timeout_seconds": 60,
-                },
-                run_directory=workspace,
-                working_directory=workspace,
-                read_only=True,
-                log_label="smoke-test",
-            )
-    except ControllerError as error:
-        raise ControllerError(f"Codex smoke test failed: {error}") from error
 
 
 def _request_synthesis_available(
@@ -2174,12 +2287,12 @@ def _synthesize_request(
                 "model": REQUEST_SYNTHESIS_MODEL,
                 "prompt": prompt,
                 "expected_schema": REQUEST_SYNTHESIS_SCHEMA,
-                "timeout_seconds": 180,
             },
             run_directory=workspace,
             working_directory=workspace,
             read_only=True,
             log_label="prompt-synthesis",
+            timeout=180,
         )
     final_response = result.get("finalResponse")
     if not isinstance(final_response, str):
@@ -2310,12 +2423,12 @@ def _infer_working_directory(
                 "model": REQUEST_SYNTHESIS_MODEL,
                 "prompt": prompt,
                 "expected_schema": WORKING_DIRECTORY_SCHEMA,
-                "timeout_seconds": 180,
             },
             run_directory=workspace,
             working_directory=workspace,
             read_only=True,
             log_label="working-directory-inference",
+            timeout=180,
         )
     final_response = result.get("finalResponse")
     if not isinstance(final_response, str):
@@ -2356,7 +2469,7 @@ def _collect_result(
     *,
     evaluator: str | None = None,
     normalization_for: str | None = None,
-    timeout: int = 180,
+    timeout: int | None = None,
 ) -> dict[str, Any]:
     arguments = [
         "--run-dir",
@@ -2490,7 +2603,7 @@ def _run_review_requests(
                 worker,
                 evaluator=None if normalization else evaluator,
                 normalization_for=evaluator if normalization else None,
-                timeout=_long_command_timeout(raw, default=600),
+                timeout=None,
             )
             path = collected.get("native_result_path")
             if not isinstance(path, str):
@@ -2499,9 +2612,198 @@ def _run_review_requests(
     return results
 
 
+def _review_evaluator(
+    run_directory: Path,
+    *,
+    historical_evaluation: Path | None,
+    implementation_model: str,
+    timeout: int | None,
+) -> str:
+    if historical_evaluation is not None and historical_evaluation.is_file():
+        shared_model = _read_json(historical_evaluation).get("evaluator_model")
+        if isinstance(shared_model, str) and shared_model:
+            return shared_model
+        raise ControllerError("The shared historical evaluation has no reviewer model.")
+    reviewers = _engine("reviewers", timeout=timeout, run_directory=run_directory)
+    available = reviewers.get("evaluators")
+    if isinstance(available, list):
+        for reviewer in available:
+            if (
+                isinstance(reviewer, Mapping)
+                and reviewer.get("id") == "codex"
+                and reviewer.get("available") is True
+                and isinstance(reviewer.get("model"), str)
+            ):
+                return str(reviewer["model"])
+    return implementation_model
+
+
+def _sync_historical_review_summaries(historical_evaluation: Path) -> None:
+    shared = _read_json(historical_evaluation)
+    directories = shared.get("run_directories")
+    if not isinstance(directories, list):
+        return
+    for raw_directory in directories:
+        if not isinstance(raw_directory, str):
+            continue
+        sibling = Path(raw_directory).expanduser().resolve()
+        if sibling.parent != historical_evaluation.parent.parent:
+            continue
+        state_path = _state_path(sibling)
+        if not state_path.is_file() or _read_json(state_path).get("status") != "completed":
+            continue
+        report = _read_json(sibling / "report.json", maximum=MAX_REPORT_BYTES)
+        _update_state(
+            sibling,
+            details={
+                "report_summary": {
+                    "winner": report.get("winner"),
+                    "evaluation": report.get("evaluation"),
+                }
+            },
+        )
+
+
+def _run_replay_review(
+    run_directory: Path,
+    *,
+    timeout: int | None,
+    historical_evaluation: Path | None,
+    evaluator_model: str,
+    lock_held: bool,
+) -> None:
+    evaluator_availability = [
+        {
+            "id": "codex",
+            "provider": "codex",
+            "model": evaluator_model,
+            "available": True,
+            "reason_code": "available",
+            "reason": "Native Codex review is available through the app.",
+        },
+    ]
+    _update_state(
+        run_directory,
+        phase="reviewing",
+        summary="Running blinded review with Codex.",
+        details={
+            "selected_evaluators": ["codex"],
+            "evaluator_availability": evaluator_availability,
+        },
+    )
+    evaluation_arguments = [
+        "--run-dir",
+        str(run_directory),
+        "--evaluator",
+        "codex",
+        "--evaluator-availability-json",
+        json.dumps(evaluator_availability, ensure_ascii=False),
+        "--evaluator-model",
+        evaluator_model,
+    ]
+    if historical_evaluation is not None:
+        evaluation_arguments.extend(["--historical-evaluation", str(historical_evaluation)])
+    evaluation = _engine(
+        "evaluate",
+        evaluation_arguments,
+        timeout=timeout,
+        run_directory=run_directory,
+    )
+    requests = evaluation.get("task_requests")
+    if not isinstance(requests, list) or not requests:
+        return
+    review_paths = _run_review_requests(run_directory, requests)
+    combined = _engine(
+        "collect-native-results",
+        [
+            "--run-dir",
+            str(run_directory),
+            *[argument for path in review_paths for argument in ("--native-result", str(path))],
+        ],
+        timeout=timeout,
+        run_directory=run_directory,
+    )
+    combined_path = combined.get("native_results_path")
+    if not isinstance(combined_path, str):
+        raise ControllerError("The reviewer results were not combined.")
+    completion_arguments = [
+        "--run-dir",
+        str(run_directory),
+        "--native-results",
+        combined_path,
+    ]
+    if historical_evaluation is not None:
+        completion_arguments.extend(["--historical-evaluation", str(historical_evaluation)])
+
+    def complete(normalized: Sequence[Path] = ()) -> dict[str, Any]:
+        arguments = [
+            *completion_arguments,
+            *[argument for path in normalized for argument in ("--normalized-result", str(path))],
+        ]
+
+        def merge() -> dict[str, Any]:
+            result = _engine(
+                "complete-evaluation",
+                arguments,
+                timeout=timeout,
+                run_directory=run_directory,
+            )
+            if (
+                historical_evaluation is not None
+                and result.get("status") == "completed"
+                and historical_evaluation.is_file()
+            ):
+                _sync_historical_review_summaries(historical_evaluation)
+            return result
+
+        if historical_evaluation is not None and not lock_held:
+            with _historical_review_guard(run_directory):
+                return merge()
+        return merge()
+
+    completed = complete()
+    normalization_requests = completed.get("task_requests")
+    if (
+        completed.get("status") == "native_task_required"
+        and isinstance(normalization_requests, list)
+        and normalization_requests
+    ):
+        normalized = _run_review_requests(
+            run_directory,
+            normalization_requests,
+            normalization=True,
+        )
+        complete(normalized)
+
+
+def _review_replay(run_directory: Path, *, timeout: int | None, implementation_model: str) -> None:
+    with _historical_review_guard(run_directory) as historical_evaluation:
+        evaluator_model = _review_evaluator(
+            run_directory,
+            historical_evaluation=historical_evaluation,
+            implementation_model=implementation_model,
+            timeout=timeout,
+        )
+        if historical_evaluation is None or not historical_evaluation.is_file():
+            _run_replay_review(
+                run_directory,
+                timeout=timeout,
+                historical_evaluation=historical_evaluation,
+                evaluator_model=evaluator_model,
+                lock_held=True,
+            )
+            return
+    _run_replay_review(
+        run_directory,
+        timeout=timeout,
+        historical_evaluation=historical_evaluation,
+        evaluator_model=evaluator_model,
+        lock_held=False,
+    )
+
+
 def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
     try:
-        long_timeout = _long_command_timeout(task_request, default=1800)
         _update_state(
             run_directory,
             phase="creating_workspace",
@@ -2523,7 +2825,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
         collected = _collect_result(
             run_directory,
             worker,
-            timeout=long_timeout,
+            timeout=None,
         )
         native_result = collected.get("native_result_path")
         if not isinstance(native_result, str):
@@ -2533,97 +2835,11 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
             ["--run-dir", str(run_directory), "--native-result", native_result],
             run_directory=run_directory,
         )
-        evaluator_availability = [
-            {
-                "id": "codex",
-                "provider": "codex",
-                "model": str(task_request.get("model") or CONTROLLER_SMOKE_TEST_MODEL),
-                "available": True,
-                "reason_code": "available",
-                "reason": "Native Codex review is available through the app.",
-            },
-        ]
-        _update_state(
+        _review_replay(
             run_directory,
-            phase="reviewing",
-            summary="Running blinded review with Codex.",
-            details={
-                "selected_evaluators": ["codex"],
-                "evaluator_availability": evaluator_availability,
-            },
+            timeout=None,
+            implementation_model=str(task_request.get("model") or DEFAULT_IMPLEMENTATION_MODEL),
         )
-        evaluation_arguments = [
-            "--run-dir",
-            str(run_directory),
-            "--evaluator",
-            "codex",
-            "--evaluator-availability-json",
-            json.dumps(evaluator_availability, ensure_ascii=False),
-        ]
-        evaluation = _engine(
-            "evaluate",
-            evaluation_arguments,
-            timeout=long_timeout,
-            run_directory=run_directory,
-        )
-        requests = evaluation.get("task_requests")
-        if isinstance(requests, list) and requests:
-            review_paths = _run_review_requests(run_directory, requests)
-            combined = _engine(
-                "collect-native-results",
-                [
-                    "--run-dir",
-                    str(run_directory),
-                    *[
-                        argument
-                        for path in review_paths
-                        for argument in ("--native-result", str(path))
-                    ],
-                ],
-                timeout=long_timeout,
-                run_directory=run_directory,
-            )
-            combined_path = combined.get("native_results_path")
-            if not isinstance(combined_path, str):
-                raise ControllerError("The reviewer results were not combined.")
-            completed = _engine(
-                "complete-evaluation",
-                [
-                    "--run-dir",
-                    str(run_directory),
-                    "--native-results",
-                    combined_path,
-                ],
-                timeout=long_timeout,
-                run_directory=run_directory,
-            )
-            normalization_requests = completed.get("task_requests")
-            if (
-                completed.get("status") == "native_task_required"
-                and isinstance(normalization_requests, list)
-                and normalization_requests
-            ):
-                normalized = _run_review_requests(
-                    run_directory,
-                    normalization_requests,
-                    normalization=True,
-                )
-                _engine(
-                    "complete-evaluation",
-                    [
-                        "--run-dir",
-                        str(run_directory),
-                        "--native-results",
-                        combined_path,
-                        *[
-                            argument
-                            for path in normalized
-                            for argument in ("--normalized-result", str(path))
-                        ],
-                    ],
-                    timeout=long_timeout,
-                    run_directory=run_directory,
-                )
         _update_state(
             run_directory,
             phase="reporting",
@@ -2632,7 +2848,7 @@ def _coordinator(run_directory: Path, task_request: Mapping[str, Any]) -> None:
         report_paths = _engine(
             "report",
             ["--run-dir", str(run_directory)],
-            timeout=long_timeout,
+            timeout=None,
             run_directory=run_directory,
         )
         report = _read_json(
@@ -2847,6 +3063,18 @@ def _start_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
                     ),
                     [],
                 )
+                recovered_models = {
+                    state.get("model", selected_models[0] if len(selected_models) == 1 else None)
+                    for state in persisted
+                }
+                recovered_models.update(
+                    error.get("model") for error in errors if isinstance(error, Mapping)
+                )
+                if any(model not in recovered_models for model in selected_models):
+                    raise ControllerError(
+                        "The approved replay did not finish starting every selected model. "
+                        "Prepare and approve the run again."
+                    )
                 return _started_runs_response(
                     persisted,
                     selected_models,
@@ -2926,7 +3154,9 @@ def _start_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
                 )
             )
         else:
-            with ThreadPoolExecutor(max_workers=len(selected_models)) as executor:
+            with ThreadPoolExecutor(
+                max_workers=min(len(selected_models), MAX_REPLAY_MODELS)
+            ) as executor:
                 futures = {
                     selected_model: executor.submit(
                         _start_prepared_model,
@@ -3029,9 +3259,19 @@ def _cancel_run(arguments: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _recent_runs(limit: int = 12) -> list[dict[str, Any]]:
+def _recent_runs(limit: int = 12, *, run_id: str | None = None) -> list[dict[str, Any]]:
     if not RUN_ROOT.is_dir():
         return []
+    prepare_token_hash: str | None = None
+    if run_id:
+        try:
+            active = _ensure_controller_owns_run(_safe_run_directory(run_id))
+        except ControllerError:
+            run_id = None
+        else:
+            candidate = active.get("prepare_token_hash") if active is not None else None
+            if isinstance(candidate, str) and candidate:
+                prepare_token_hash = candidate
     results: list[dict[str, Any]] = []
     for path in sorted(RUN_ROOT.iterdir(), reverse=True):
         if not path.is_dir():
@@ -3045,18 +3285,53 @@ def _recent_runs(limit: int = 12) -> list[dict[str, Any]]:
             continue
         if state.get("controller_session_id") != CONTROLLER_SESSION_ID:
             continue
-        results.append(state)
-        if len(results) >= limit:
+        if (
+            len(results) < limit
+            or state.get("run_id") == run_id
+            or prepare_token_hash is not None
+            and state.get("prepare_token_hash") == prepare_token_hash
+        ):
+            results.append(state)
+        if len(results) >= limit and run_id is None:
             break
     return results
 
 
 def _inspect_thread(arguments: Mapping[str, Any]) -> dict[str, Any]:
     thread_id = _thread_id(arguments)
+    loader = _claude_code_sample_loader()
+    sample: dict[str, Any] | None = None
+    if loader.is_sample_thread(thread_id):
+        try:
+            sample_id = loader.sample_id_from_thread(thread_id)
+            sample = loader.materialize_sample(sample_id, CONTROLLER_INSTANCE_ROOT)
+        except loader.SampleError as error:
+            raise ControllerError(str(error)) from error
     session_args = ["--imported-thread-id", thread_id]
     repo = arguments.get("repo")
     baseline_args = list(session_args)
-    if repo is not None:
+    if sample is not None:
+        sample_repository = str(sample["repository_path"])
+        if repo is not None:
+            if not isinstance(repo, str) or not repo.strip():
+                raise ControllerError("repo must be a non-empty path.")
+            if Path(repo).expanduser().resolve() != Path(sample_repository).resolve():
+                raise ControllerError("The recorded Claude sample repository cannot be changed.")
+        baseline_args.extend(
+            (
+                "--repo",
+                sample_repository,
+                "--beginning-kind",
+                "git",
+                "--ending-kind",
+                "git",
+                "--baseline-commit",
+                str(sample["baseline_commit"]),
+                "--ending-commit",
+                str(sample["ending_commit"]),
+            )
+        )
+    elif repo is not None:
         if not isinstance(repo, str) or not repo.strip():
             raise ControllerError("repo must be a non-empty path.")
         baseline_args.extend(("--repo", repo.strip()))
@@ -3096,6 +3371,9 @@ def _inspect_thread(arguments: Mapping[str, Any]) -> dict[str, Any]:
     thread_record = dict(raw_thread_record)
     thread_record["request_generation"] = {"method": "concatenated_fallback"}
     direct_request = _single_user_prompt(raw_thread_record)
+    recorded_request = raw_thread_record.get("request") if sample is not None else None
+    if isinstance(recorded_request, str) and recorded_request.strip():
+        direct_request = recorded_request
     if direct_request is not None:
         thread_record["request"] = direct_request
         thread_record["request_generation"] = {"method": "single_user_prompt"}
@@ -3127,7 +3405,10 @@ def _inspect_thread(arguments: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _state_payload() -> dict[str, Any]:
+def _state_payload(arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    run_id = arguments.get("run_id") if arguments is not None else None
+    if run_id is not None and not isinstance(run_id, str):
+        raise ControllerError("run_id must be a string.")
     diagnostics: list[dict[str, str]] = []
     try:
         models = _engine("models")
@@ -3139,7 +3420,7 @@ def _state_payload() -> dict[str, Any]:
         "controller_session_id": CONTROLLER_SESSION_ID,
         "models": list(models.get("options") or []),
         "diagnostics": diagnostics,
-        "recent_runs": _recent_runs(),
+        "recent_runs": _recent_runs(run_id=run_id),
         "run_root": str(RUN_ROOT),
     }
 
@@ -3150,36 +3431,54 @@ def _thread_payload(arguments: Mapping[str, Any]) -> dict[str, Any]:
     query = arguments.get("query")
     if query is not None and not isinstance(query, str):
         raise ControllerError("query must be a string.")
-    if isinstance(query, str) and query.strip():
-        response = _engine("sessions", ["--limit", "100", "--offset", "0"])
+    source = arguments.get("source")
+    if source is not None and (not isinstance(source, str) or source not in {"imported", "sample"}):
+        raise ControllerError("source must be imported or sample.")
+    loader = _claude_code_sample_loader()
+    try:
+        samples = loader.list_sample_threads()
+    except loader.SampleError as error:
+        raise ControllerError(str(error)) from error
+    searching = isinstance(query, str) and bool(query.strip())
+    imported_limit = 100 if searching and source != "sample" else limit
+    imported_offset = 0 if searching or source == "sample" else offset
+    response = _engine(
+        "sessions",
+        ["--limit", str(imported_limit), "--offset", str(imported_offset)],
+    )
+    raw_sessions = response.get("sessions")
+    imported = list(raw_sessions) if isinstance(raw_sessions, list) else []
+    raw_total = response.get("total")
+    imported_total = (
+        raw_total
+        if isinstance(raw_total, int) and not isinstance(raw_total, bool)
+        else len(imported)
+    )
+    selected_source = source or ("imported" if imported_total else "sample")
+    selected = samples if selected_source == "sample" else imported
+    if searching:
+        assert isinstance(query, str)
         needle = query.casefold().strip()
-        raw = response.get("sessions")
-        sessions = raw if isinstance(raw, list) else []
-        filtered = [
+        selected = [
             item
-            for item in sessions
+            for item in selected
             if isinstance(item, Mapping)
             and needle
             in " ".join(
                 str(item.get(key) or "") for key in ("title", "project_dir", "claude_model")
             ).casefold()
         ]
-        threads = filtered[offset : offset + limit]
-        response = {
-            **response,
-            "offset": offset,
-            "total": len(filtered),
-            "has_more": offset + len(threads) < len(filtered),
-        }
-    else:
-        response = _engine(
-            "sessions",
-            ["--limit", str(limit), "--offset", str(offset)],
-        )
-        sessions = response.get("sessions")
-        threads = list(sessions) if isinstance(sessions, list) else []
+    paginated_locally = searching or selected_source == "sample"
+    threads = selected[offset : offset + limit] if paginated_locally else selected[:limit]
+    total = len(selected) if paginated_locally else imported_total
     return {key: value for key, value in response.items() if key != "sessions"} | {
-        "threads": threads
+        "threads": threads,
+        "source": selected_source,
+        "sample_total": len(samples),
+        "imported_total": imported_total,
+        "offset": offset,
+        "total": total,
+        "has_more": offset + len(threads) < total,
     }
 
 
@@ -3194,7 +3493,7 @@ def _call_tool(params: Any) -> dict[str, Any]:
             return runtime_error
         return _open_controller(codex_cli_path=arguments.get("codex_cli_path"))
     if name == "get_state":
-        return _text_result("Codex Bakeoff is ready.", {"state": _state_payload()})
+        return _text_result("Codex Bakeoff is ready.", {"state": _state_payload(arguments)})
     if name == "list_threads":
         payload = _thread_payload(arguments)
         return _text_result(

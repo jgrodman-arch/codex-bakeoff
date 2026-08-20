@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "claude-fable-5",
+      "label": "Claude Fable 5"
+    },
+    {
+      "id": "claude-opus-5",
+      "label": "Claude Opus 5"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "label": "Claude Sonnet 5"
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "label": "Claude Haiku 4.5"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "jqlang__jq-2157",
+      "title": "Fix uri format to follow RFC 3986",
+      "repository": "jqlang/jq",
+      "baseline_commit": "f88c4e5888d6d125695444d044df4bb55ad75888",
+      "prompt": "Fix uri format to follow RFC 3986\n\nIt seems that the current implementation is based on [RFC 2396 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc2396#section-2.3). However, this RFC is obsoleted by [RFC 3986](https://tools.ietf.org/html/rfc3986). At [RFC 3986 - 2.3. Unreserved Characters](https://tools.ietf.org/html/rfc3986#section-2.3), the unreserved characters are defined as follows.\r\n\r\n    unreserved  = ALPHA / DIGIT / \"-\" / \".\" / \"_\" / \"~\"\r\n\r\nThus we should update the implementation to follow the RFC 3986.\r\n\r\n```sh\r\n % echo \"-_.~\\!'()\" | jq -R @uri\r\n\"-_.~!'()\"\r\n % echo \"-_.~\\!'()\" | ./jq  -R @uri\r\n\"-_.~%21%27%28%29\"\r\n```\r\n\r\nResolves  #1506.",
+      "source_url": "https://github.com/jqlang/jq/pull/2157"
+    },
+    {
+      "id": "jqlang__jq-2919",
+      "title": "Allow passing the inline jq script after --",
+      "repository": "jqlang/jq",
+      "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
+      "prompt": "Allow passing the inline jq script after --\n\njq previously only allowed passing the inline script before `--` (as if they were options) even though one would expect the inline script to be a positional argument.\r\n\r\nSince jq previously also refused to run with a usage error if the script was passed after `--` (It was not assuming `.` as script as it does when no arguments are passed), and positional arguments are allowed before `--` and even before other options, it should not be a breaking change to change that weird behaviour, and allow the script to appear after `--`.\r\n\r\nIt also simplifies the option parsing code a bunch.\r\n\r\nFixes #2918\r\n",
+      "source_url": "https://github.com/jqlang/jq/pull/2919"
+    }
+  ]
+}

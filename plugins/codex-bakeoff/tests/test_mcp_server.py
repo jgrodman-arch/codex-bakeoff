@@ -73,7 +73,7 @@ const extract = (start, end) => {
 """
 
 
-def _render_evaluation_table(evaluation: dict[str, object]) -> str:
+def render_evaluation_table(evaluation: dict[str, object]) -> str:
     harness = (
         _CONTROLLER_HARNESS
         + r"""
@@ -131,8 +131,7 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(tuple(item["name"] for item in tools), PUBLIC_TOOL_NAMES)
         (opener,) = tools
         self.assertIn("codex_cli_path", opener["inputSchema"]["properties"])
-        self.assertIn("in-app browser", opener["description"])
-        self.assertIn("external browser fallback", opener["description"])
+        self.assertIn("available browser", opener["description"])
         self.assertTrue(opener["annotations"]["readOnlyHint"])
         for tool in tools:
             with self.subTest(name=tool["name"]):
@@ -265,10 +264,11 @@ class McpServerTests(unittest.TestCase):
                 "_ensure_controller_daemon",
                 return_value=(43117, {"version": "test-version"}),
             ),
-            mock.patch.object(server, "_run_controller_smoke_test"),
+            mock.patch.object(server, "_run_worker") as run_worker,
         ):
             result = server._call_tool({"name": "open_controller", "arguments": {}})
 
+        run_worker.assert_not_called()
         structured = result["structuredContent"]
         self.assertTrue(structured["prepared"])
         self.assertFalse(structured["opened"])
@@ -300,7 +300,6 @@ class McpServerTests(unittest.TestCase):
                     "_ensure_controller_daemon",
                     return_value=(43117, {"version": "test-version"}),
                 ) as ensure,
-                mock.patch.object(server, "_run_controller_smoke_test"),
             ):
                 result = server._call_tool(
                     {
@@ -356,7 +355,6 @@ class McpServerTests(unittest.TestCase):
                     (43119, {"version": "test-version", "controller_session_id": "second"}),
                 ),
             ) as ensure,
-            mock.patch.object(server, "_run_controller_smoke_test"),
             mock.patch.object(server.os, "kill") as kill,
         ):
             first = server._call_tool({"name": "open_controller", "arguments": {}})
@@ -681,11 +679,13 @@ class McpServerTests(unittest.TestCase):
                         reservation: socket.socket,
                         controller_session_id: str,
                         codex_cli_path: str | None = None,
+                        plugin_root: Path = PLUGIN_ROOT,
                     ) -> subprocess.Popen[bytes]:
                         process = original_spawn(
                             reservation=reservation,
                             controller_session_id=controller_session_id,
                             codex_cli_path=codex_cli_path,
+                            plugin_root=plugin_root,
                         )
                         spawned.append(process)
                         return process
@@ -937,6 +937,7 @@ class McpServerTests(unittest.TestCase):
         server = load_server()
         with (
             mock.patch.dict(os.environ, {"PATH": ""}, clear=True),
+            mock.patch.object(server.Path, "is_file", return_value=False),
             mock.patch.object(server.shutil, "which", return_value=None),
         ):
             with self.assertRaisesRegex(server.ControllerError, "Node.js 18 or newer"):
@@ -986,7 +987,6 @@ class McpServerTests(unittest.TestCase):
             "selectedThreadNumber",
             "model",
             "selectedModels",
-            "timeoutSeconds",
             "classifications",
             "reviewDraft",
             "configurationStep",
@@ -1276,6 +1276,8 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("review.ballot?.dimensions", controller)
         self.assertIn("decision.candidates.A", controller)
         self.assertIn("decision.candidates.B", controller)
+        self.assertIn("first.explanations?.[check]", controller)
+        self.assertIn("second.explanations?.[check]", controller)
         self.assertIn('codex:"Codex replay"', controller)
         self.assertIn('claude:"Historical Claude"', controller)
         self.assertNotIn("decision.explanation", controller)
@@ -1381,7 +1383,7 @@ class McpServerTests(unittest.TestCase):
             ],
         }
 
-        rendered = _render_evaluation_table(evaluation)
+        rendered = render_evaluation_table(evaluation)
 
         self.assertIn("<th>Codex replay</th><th>Historical Claude</th>", rendered)
         for identifier, label in taxonomy["REVIEW_DIMENSION_LABELS"].items():
@@ -1418,9 +1420,13 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("Pass: satisfied. Fail: failed.", rendered)
         self.assertNotIn("Explanation", rendered)
         self.assertNotIn("SENSITIVE REVIEWER NARRATIVE", rendered)
+        excluded = render_evaluation_table(
+            {**evaluation, "comparable_dimensions": ["request_fulfillment"]}
+        )
+        self.assertIn("Code quality (excluded from aggregate)", excluded)
 
     def test_controller_renders_codex_reviewer_failures_without_a_claude_reviewer(self) -> None:
-        rendered = _render_evaluation_table(
+        rendered = render_evaluation_table(
             {
                 "candidate_mapping": {"A": "claude", "B": "codex"},
                 "reviews": [
@@ -1450,7 +1456,7 @@ class McpServerTests(unittest.TestCase):
         self.assertNotIn("<offline>", rendered)
         self.assertIn(
             "No validated blind review ballot is available.",
-            _render_evaluation_table({}),
+            render_evaluation_table({}),
         )
 
     def test_controller_launch_ignores_completed_runs(self) -> None:
@@ -1707,17 +1713,18 @@ class McpServerTests(unittest.TestCase):
                 working_directory,
                 read_only,
                 log_label,
+                timeout,
             ):
                 call_index = fake_worker.calls
                 fake_worker.calls += 1
                 self.assertEqual(request["model"], "gpt-5.6-terra")
                 self.assertEqual(request["expected_schema"], server.REQUEST_SYNTHESIS_SCHEMA)
-                self.assertEqual(request["timeout_seconds"], 180)
                 self.assertIn(json.dumps(turns, ensure_ascii=False), request["prompt"])
                 self.assertTrue(read_only)
                 self.assertEqual(run_directory, working_directory)
                 self.assertTrue(working_directory.is_dir())
                 self.assertEqual(log_label, "prompt-synthesis")
+                self.assertEqual(timeout, 180)
                 return {"finalResponse": json.dumps({"request": summaries[call_index]})}
 
             fake_worker.calls = 0
@@ -2303,16 +2310,14 @@ class McpServerTests(unittest.TestCase):
                 }
             )
 
-    def test_long_command_timeout_tracks_bounded_run_timeout(self) -> None:
+    def test_worker_requests_do_not_include_execution_timeouts(self) -> None:
         server = load_server()
-        self.assertEqual(
-            server._long_command_timeout({"timeout_seconds": 1200}, default=1800),
-            1500,
+        payload = server._worker_request(
+            {"model": "gpt-test", "prompt": "Perform the task.", "timeout_seconds": 1},
+            working_directory=PLUGIN_ROOT,
+            read_only=False,
         )
-        self.assertEqual(
-            server._long_command_timeout({"timeout_seconds": 14_400}, default=1800),
-            server.MAX_COMMAND_TIMEOUT,
-        )
+        self.assertNotIn("timeoutSeconds", payload)
 
     def test_only_review_and_normalization_workers_use_medium_reasoning(self) -> None:
         server = load_server()
@@ -2322,7 +2327,6 @@ class McpServerTests(unittest.TestCase):
             ("implementation", False, None),
             ("prompt_synthesis", True, None),
             ("working_directory_inference", True, None),
-            ("controller_smoke_test", True, None),
             (None, True, None),
             ("evaluation", False, None),
         )
@@ -2345,7 +2349,6 @@ class McpServerTests(unittest.TestCase):
                     "model",
                     "prompt",
                     "workingDirectory",
-                    "timeoutSeconds",
                     "sandboxMode",
                     "networkAccess",
                 }
@@ -2970,6 +2973,10 @@ class McpServerTests(unittest.TestCase):
             def fake_engine(command: str, arguments=(), **kwargs):
                 if command == "complete-run":
                     return {}
+                if command == "reviewers":
+                    return {
+                        "evaluators": [{"id": "codex", "available": True, "model": "gpt-5.6-sol"}]
+                    }
                 if command == "evaluate":
                     self.assertEqual(
                         arguments[:4],
@@ -2979,7 +2986,7 @@ class McpServerTests(unittest.TestCase):
                     availability = json.loads(arguments[5])
                     self.assertEqual(
                         [(item["id"], item["model"]) for item in availability],
-                        [("codex", "gpt-test")],
+                        [("codex", "gpt-5.6-sol")],
                     )
                     self.assertNotIn("--claude-model", arguments)
                     return {"task_requests": [review_request]}
@@ -3261,7 +3268,7 @@ class McpServerTests(unittest.TestCase):
                 self.assertTrue((archived / f"partial-{attempt}.txt").is_file())
             self.assertEqual(log.count("starting retry"), 3)
             self.assertIn("[implementation:retry-3:stdout]", log)
-            self.assertEqual(log.count("connection reset by peer"), 3)
+            self.assertEqual(log.count("connection reset by peer"), 6)
 
     def test_implementation_stops_after_three_retries(self) -> None:
         server = load_server()
