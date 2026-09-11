@@ -1,6 +1,6 @@
 {
   "name": "codex-bakeoff",
-  "version": "1.0.131",
+  "version": "1.0.130",
   "description": "Run independent Codex replays in the in-app browser or your system browser.",
   "author": {
     "name": "OpenAI",
