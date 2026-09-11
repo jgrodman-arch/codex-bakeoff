@@ -388,13 +388,15 @@ def _prompt_reconstruction_turns(
     message_uuid: str,
     *,
     whole_thread: bool,
+    end_message_uuid: str | None = None,
+    preceding_clarification: str = "",
 ) -> tuple[list[dict[str, str]], bool]:
     """Return bounded user turns and clarification context for prompt synthesis."""
 
     turns: list[dict[str, str]] = []
     total_chars = 0
     truncated = False
-    pending_clarification = ""
+    pending_clarification = preceding_clarification
 
     def append_turn(role: str, text: str) -> bool:
         nonlocal total_chars, truncated
@@ -420,6 +422,7 @@ def _prompt_reconstruction_turns(
         source_path,
         message_uuid,
         whole_thread=whole_thread,
+        end_message_uuid=end_message_uuid,
     ):
         if _is_actionable_user_event(event):
             if pending_clarification and not append_turn("assistant", pending_clarification):
@@ -767,20 +770,28 @@ def _task_events(
     message_uuid: str,
     *,
     whole_thread: bool = False,
+    end_message_uuid: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     started = False
+    ended = False
     for event in _iter_events(source_path):
+        actionable = _is_actionable_user_event(event)
         if not started:
-            if _is_actionable_user_event(event) and event.get("uuid") == message_uuid:
-                started = True
-                yield event
-            continue
-        if _is_actionable_user_event(event) and not whole_thread:
+            if not actionable or event.get("uuid") != message_uuid:
+                continue
+            started = True
+        elif actionable and (ended or (end_message_uuid is None and not whole_thread)):
             break
+        if actionable and event.get("uuid") == end_message_uuid:
+            ended = True
         yield event
     if not started:
         raise TaskNotFoundError(
             "The selected original user-message UUID is not in the imported transcript."
+        )
+    if end_message_uuid is not None and not ended:
+        raise TaskNotFoundError(
+            "The ending user-message UUID must follow the start in the imported transcript."
         )
 
 
@@ -789,6 +800,7 @@ def _linked_subagent_paths(
     message_uuid: str,
     *,
     whole_thread: bool = False,
+    end_message_uuid: str | None = None,
 ) -> list[Path]:
     """Find the recursive closure of subagents launched by the selected task."""
 
@@ -798,6 +810,7 @@ def _linked_subagent_paths(
             source_path,
             message_uuid,
             whole_thread=whole_thread,
+            end_message_uuid=end_message_uuid,
         )
     ]
 
@@ -859,6 +872,7 @@ def _linked_subagent_sources(
     message_uuid: str,
     *,
     whole_thread: bool = False,
+    end_message_uuid: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return recursively linked subagent JSONL sources with launch provenance."""
 
@@ -889,6 +903,7 @@ def _linked_subagent_sources(
                 parent_path,
                 message_uuid,
                 whole_thread=whole_thread,
+                end_message_uuid=end_message_uuid,
             )
             if is_main
             else _iter_events(parent_path)
@@ -1172,11 +1187,138 @@ def _historical_model_request_timing(events: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def _tool_changed_paths(event: Mapping[str, Any], block: Mapping[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    name, arguments, cwd = block["name"], block.get("input"), event.get("cwd")
+    if not isinstance(arguments, dict):
+        return paths
+    if name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write_file"):
+        for field in ("file_path", "path", "notebook_path"):
+            value = arguments.get(field)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            path = Path(value).expanduser()
+            if (
+                not path.is_absolute()
+                and isinstance(cwd, str)
+                and Path(cwd).expanduser().is_absolute()
+            ):
+                path = Path(cwd).expanduser() / path
+            paths.add(str(path))
+    if name in ("Bash", "shell", "exec_command"):
+        paths.update(_shell_changed_files(arguments.get("command", arguments.get("cmd")), cwd))
+    return paths
+
+
+def _successful_file_changes(
+    events: Iterable[dict[str, Any]],
+) -> Iterator[tuple[int, set[str]]]:
+    pending: dict[str, tuple[int, set[str]]] = {}
+    for index, event in enumerate(events):
+        for block in _tool_blocks(event):
+            tool_id, paths = block.get("id"), _tool_changed_paths(event, block)
+            if isinstance(tool_id, str) and paths:
+                pending[tool_id] = (index, paths)
+        for block in _content_blocks(event):
+            tool_id = block.get("tool_use_id")
+            if block.get("type") != "tool_result" or not isinstance(tool_id, str):
+                continue
+            change = pending.pop(tool_id, None)
+            if change is not None and not block.get("is_error"):
+                yield change
+
+
+def _queued_prompt_groups(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    adjacent: list[dict[str, Any]] = []
+    for event in events:
+        if _is_actionable_user_event(event):
+            adjacent.append(event)
+        elif event.get("type") in ("assistant", "user"):
+            if len(adjacent) > 1 and any(item.get("type") == "attachment" for item in adjacent):
+                groups[adjacent[-1]["uuid"]] = adjacent
+            adjacent = []
+    return groups
+
+
+def _queued_range_changed_files(
+    source_path: Path, start_uuid: str, end_uuid: str
+) -> set[str] | None:
+    """Attribute shared queued-prompt writes without changing the task event range."""
+    events = list(_iter_events(source_path))
+    groups = _queued_prompt_groups(events)
+    owners: list[str | None] = []
+    owner: str | None = None
+    selected: set[str] = set()
+    selecting = False
+    for event in events:
+        if _is_actionable_user_event(event):
+            owner = event["uuid"]
+            if owner == start_uuid:
+                selecting = True
+            if selecting:
+                selected.add(owner)
+            if owner == end_uuid:
+                selecting = False
+        owners.append(owner)
+    if not groups:
+        return None
+
+    changes = list(_successful_file_changes(events))
+    group_paths: dict[str, set[str]] = {key: set() for key in groups}
+    for index, paths in changes:
+        if owners[index] in group_paths:
+            group_paths[owners[index]].update(paths)
+    reassigned: dict[tuple[str, str], str] = {}
+    separator = r"""[\s"'`<>(){}\[\],;:!?]"""
+    for last_uuid, prompts in groups.items():
+        paths = group_paths[last_uuid]
+        basename_counts = Counter(Path(os.path.normpath(path)).name for path in paths)
+        for path in paths:
+            normalized = Path(os.path.normpath(path))
+            matches: list[str] = []
+            for prompt in prompts:
+                aliases = {str(normalized)}
+                cwd = prompt.get("cwd")
+                if isinstance(cwd, str) and cwd.strip():
+                    try:
+                        aliases.add(
+                            str(
+                                normalized.relative_to(
+                                    Path(os.path.normpath(os.path.expanduser(cwd)))
+                                )
+                            )
+                        )
+                    except ValueError:
+                        pass
+                if basename_counts[normalized.name] == 1:
+                    aliases.add(normalized.name)
+                else:
+                    aliases.discard(normalized.name)
+                if any(
+                    re.search(
+                        rf"(?:^|{separator}){re.escape(alias)}(?=$|{separator}|\.(?=$|{separator}))",
+                        _actionable_user_text(prompt),
+                    )
+                    for alias in aliases
+                ):
+                    matches.append(prompt["uuid"])
+            if len(matches) == 1:
+                reassigned[last_uuid, path] = matches[0]
+    return {
+        path
+        for index, paths in changes
+        for path in paths
+        if reassigned.get((owners[index], path), owners[index]) in selected
+    }
+
+
 def _task_observations(
     source_path: Path,
     message_uuid: str,
     *,
     whole_thread: bool = False,
+    end_message_uuid: str | None = None,
     linked_sources: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     tools: set[str] = set()
@@ -1203,14 +1345,32 @@ def _task_observations(
             source_path,
             message_uuid,
             whole_thread=whole_thread,
+            end_message_uuid=end_message_uuid,
         )
     event_streams: list[list[dict[str, Any]]] = [
-        list(_task_events(source_path, message_uuid, whole_thread=whole_thread)),
+        list(
+            _task_events(
+                source_path,
+                message_uuid,
+                whole_thread=whole_thread,
+                end_message_uuid=end_message_uuid,
+            )
+        ),
         *(
             list(_iter_events(Path(linked_source["source_path"])))
             for linked_source in linked_sources
         ),
     ]
+    selected_prompts = {
+        event["uuid"] for event in event_streams[0] if _is_actionable_user_event(event)
+    }
+    historical_usage_shared = False
+    if end_message_uuid is not None:
+        for group in _queued_prompt_groups(list(_iter_events(source_path))).values():
+            group_prompts = {event["uuid"] for event in group}
+            if selected_prompts & group_prompts and group_prompts - selected_prompts:
+                historical_usage_shared = True
+                break
     for event_stream in event_streams:
         for event in event_stream:
             (
@@ -1343,17 +1503,20 @@ def _task_observations(
                     file_path = arguments.get(field)
                     if not isinstance(file_path, str) or not file_path.strip():
                         continue
-                    if name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
-                        changed_path = Path(file_path).expanduser()
-                        if (
-                            not changed_path.is_absolute()
-                            and isinstance(cwd, str)
-                            and Path(cwd).expanduser().is_absolute()
-                        ):
-                            changed_path = Path(cwd).expanduser() / changed_path
-                        changed_files.add(str(changed_path))
                     if Path(file_path).name in ("CLAUDE.md", "AGENTS.md"):
                         instruction_paths.add(file_path)
+
+    range_files = (
+        _queued_range_changed_files(source_path, message_uuid, end_message_uuid)
+        if end_message_uuid is not None
+        else None
+    )
+    file_streams = event_streams
+    if range_files is not None:
+        changed_files.update(range_files)
+        file_streams = event_streams[1:]
+    for _, paths in _successful_file_changes(event for stream in file_streams for event in stream):
+        changed_files.update(paths)
 
     for attributed_server, attributed_tool in attributed_mcp_observations:
         if any(
@@ -1442,6 +1605,7 @@ def _task_observations(
         "historical_changed_files": sorted(changed_files),
         "claude_model": claude_model,
         "historical_usage": totals,
+        "historical_usage_shared": historical_usage_shared,
         "historical_elapsed_seconds": wall_clock_seconds,
         "historical_wall_clock_seconds": wall_clock_seconds,
         "historical_model_request_seconds": model_request_seconds,
@@ -1463,6 +1627,7 @@ def validate_replay_sources(replay_spec: dict[str, Any]) -> dict[str, Any]:
         source_path,
         message_uuid,
         whole_thread=replay_spec.get("task_scope") == "whole_thread",
+        end_message_uuid=replay_spec.get("end_message_uuid"),
     )
     return {
         "source_path": str(source_path),
@@ -1474,7 +1639,17 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
     """Replay original user requests without leaking historical Claude output."""
 
     raw_path = session.get("source_path")
-    message_uuid = task.get("message_uuid")
+    start_message_uuid = task.get("start_message_uuid")
+    end_message_uuid = task.get("end_message_uuid")
+    ranged = start_message_uuid is not None or end_message_uuid is not None
+    if ranged and not (
+        isinstance(start_message_uuid, str)
+        and start_message_uuid.strip()
+        and isinstance(end_message_uuid, str)
+        and end_message_uuid.strip()
+    ):
+        raise TaskNotFoundError("Select both the first and last user turn for a Replay range.")
+    message_uuid = start_message_uuid if ranged else task.get("message_uuid")
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise TranscriptError("The imported session does not identify a source transcript.")
     if not isinstance(message_uuid, str) or not message_uuid.strip():
@@ -1482,53 +1657,80 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
             "Select an original user-message UUID before constructing a replay."
         )
     source_path = Path(raw_path).expanduser()
-    whole_thread = task.get("task_scope") == "whole_thread"
-
+    whole_thread = not ranged and task.get("task_scope") == "whole_thread"
+    actionable_turns = list_session_tasks(session)
+    turn_ids = [turn["message_uuid"] for turn in actionable_turns]
+    if message_uuid not in turn_ids:
+        raise TaskNotFoundError(
+            "The selected original user-message UUID is not in the imported transcript."
+        )
+    first_index = turn_ids.index(message_uuid)
+    if ranged and (
+        end_message_uuid not in turn_ids or turn_ids.index(end_message_uuid) < first_index
+    ):
+        raise TaskNotFoundError(
+            "The ending user-message UUID must follow the start in the imported transcript."
+        )
+    last_index = turn_ids.index(end_message_uuid) if ranged else len(turn_ids) - 1
+    selected_turns = (
+        actionable_turns[first_index : last_index + 1]
+        if whole_thread or ranged
+        else [actionable_turns[first_index]]
+    )
+    thread_requests = [turn["request"] for turn in selected_turns]
+    thread_message_uuids = [turn["message_uuid"] for turn in selected_turns]
     preceding_context: deque[dict[str, Any]] = deque(maxlen=12)
+    preceding_clarification = ""
     selected_event: dict[str, Any] | None = None
-    thread_requests: list[str] = []
-    thread_message_uuids: list[str] = []
     for event in _iter_events(source_path):
-        if _is_actionable_user_event(event):
-            if event.get("uuid") == message_uuid and selected_event is None:
-                selected_event = event
-                if not whole_thread:
-                    break
-            if selected_event is not None and whole_thread:
-                thread_requests.append(_actionable_user_text(event))
-                thread_message_uuids.append(event["uuid"])
-                continue
-        if selected_event is not None and whole_thread:
-            continue
+        actionable = _is_actionable_user_event(event)
+        if actionable and event.get("uuid") == message_uuid:
+            selected_event = event
+            break
+        if ranged:
+            if actionable or (event.get("type") == "user" and _ask_user_answer_text(event)):
+                preceding_clarification = ""
+            elif event.get("type") == "assistant" and not (
+                event.get("isMeta") or event.get("isSidechain") or event.get("isCompactSummary")
+            ):
+                questions = [
+                    block for block in _tool_blocks(event) if block.get("name") == "AskUserQuestion"
+                ]
+                if questions:
+                    preceding_clarification = "\n\n".join(
+                        _ask_user_question_text(block) for block in questions
+                    )
+                else:
+                    visible = _visible_message_text(event)
+                    if visible.strip() or any(True for _ in _tool_blocks(event)):
+                        preceding_clarification = _assistant_clarification_text(visible)
         if event.get("type") not in ("user", "assistant"):
             continue
         if event.get("type") == "user" and not _is_actionable_user_event(event):
             continue
         text = _visible_message_text(event)
-        if not text.strip():
-            continue
-        preceding_context.append(
-            {
-                "role": event["type"],
-                "text": text[:12_000],
-                "timestamp": _format_timestamp(_parse_timestamp(event.get("timestamp"))),
-                "message_uuid": event.get("uuid"),
-            }
-        )
-    if selected_event is None:
-        raise TaskNotFoundError(
-            "The selected original user-message UUID is not in the imported transcript."
-        )
+        if text.strip():
+            preceding_context.append(
+                {
+                    "role": event["type"],
+                    "text": text[:12_000],
+                    "timestamp": _format_timestamp(_parse_timestamp(event.get("timestamp"))),
+                    "message_uuid": event.get("uuid"),
+                }
+            )
+    assert selected_event is not None
 
     linked_sources = _linked_subagent_sources(
         source_path,
         message_uuid,
         whole_thread=whole_thread,
+        end_message_uuid=end_message_uuid,
     )
     observations = _task_observations(
         source_path,
         message_uuid,
         whole_thread=whole_thread,
+        end_message_uuid=end_message_uuid,
         linked_sources=linked_sources,
     )
     timestamp = _format_timestamp(_parse_timestamp(selected_event.get("timestamp")))
@@ -1536,7 +1738,7 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
     if not isinstance(project_dir, str) or not project_dir.strip():
         project_dir = task.get("project_dir", session.get("project_dir"))
     project_dirs = sorted(
-        set(_string_list(session.get("project_dirs")))
+        set(_string_list(session.get("project_dirs")) if not ranged else [])
         | set(observations["project_dirs"])
         | ({project_dir} if isinstance(project_dir, str) and project_dir.strip() else set())
     )
@@ -1546,14 +1748,19 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
         source_path,
         message_uuid,
         whole_thread=whole_thread,
+        end_message_uuid=end_message_uuid,
+        preceding_clarification=preceding_clarification,
     )
     replay = {
         "session_id": session.get("session_id", selected_event.get("sessionId", source_path.stem)),
         "imported_thread_id": session.get("imported_thread_id"),
         "source_path": str(source_path),
         "message_uuid": message_uuid,
+        "actionable_user_turns": actionable_turns,
         "request": (
-            "\n\n".join(thread_requests) if whole_thread else _actionable_user_text(selected_event)
+            "\n\n".join(thread_requests)
+            if whole_thread or ranged
+            else _actionable_user_text(selected_event)
         ),
         "task_timestamp": timestamp,
         "project_dir": project_dir,
@@ -1571,6 +1778,7 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
         "connector_names": connector_names,
         "configured_connector_names": configured_connector_names,
         "historical_usage": observations["historical_usage"],
+        "historical_usage_shared": observations["historical_usage_shared"],
         "historical_changed_files": observations["historical_changed_files"],
         "historical_elapsed_seconds": observations["historical_elapsed_seconds"],
         "historical_wall_clock_seconds": observations["historical_wall_clock_seconds"],
@@ -1579,16 +1787,35 @@ def build_replay_spec(session: dict[str, Any], task: dict[str, Any]) -> dict[str
         "linked_sources": linked_sources,
         "imported_at": session.get("imported_at"),
     }
-    if whole_thread:
+    if whole_thread or ranged:
         replay.update(
             {
-                "task_scope": "whole_thread",
+                "task_scope": "range" if ranged else "whole_thread",
                 "user_message_count": len(thread_requests),
                 "message_uuids": thread_message_uuids,
             }
         )
+    if ranged:
+        replay.update(
+            {
+                "start_message_uuid": message_uuid,
+                "end_message_uuid": end_message_uuid,
+                "prior_historical_changed_files": [],
+                "prior_user_requests": [
+                    turn["request"][:4_000]
+                    for turn in actionable_turns[max(0, first_index - 12) : first_index]
+                ],
+            }
+        )
+        if first_index:
+            prior = _task_observations(
+                source_path,
+                turn_ids[0],
+                end_message_uuid=turn_ids[first_index - 1],
+            )
+            replay["prior_historical_changed_files"] = prior["historical_changed_files"]
     recorded_result = session.get("recorded_claude_result")
-    if isinstance(recorded_result, Mapping):
+    if isinstance(recorded_result, Mapping) and not ranged:
         replay["recorded_claude_result"] = dict(recorded_result)
         for result_key, replay_keys in (
             ("duration_ms", ("historical_elapsed_seconds", "historical_wall_clock_seconds")),
@@ -1649,6 +1876,7 @@ def recover_historical_final_response(
     message_uuid: str,
     *,
     whole_thread: bool = False,
+    end_message_uuid: str | None = None,
 ) -> str | None:
     """Recover the final visible assistant response only for post-run reporting."""
     final_response: str | None = None
@@ -1656,6 +1884,7 @@ def recover_historical_final_response(
         Path(source_path).expanduser(),
         message_uuid,
         whole_thread=whole_thread,
+        end_message_uuid=end_message_uuid,
     ):
         if event.get("type") != "assistant":
             continue
@@ -1663,6 +1892,78 @@ def recover_historical_final_response(
         if visible_text.strip():
             final_response = _redact(visible_text)[:12_000]
     return final_response
+
+
+def _literal_shell_path(raw: str, cwd: str) -> str | None:
+    if (
+        not raw
+        or raw.startswith("-")
+        or raw == "/dev/null"
+        or raw in {">", "<", "&", "|", ";"}
+        or any(character in raw for character in "$`*?[]{}")
+    ):
+        return None
+    path = Path(raw).expanduser()
+    return str(path if path.is_absolute() else Path(cwd).expanduser() / path)
+
+
+def _shell_changed_files(command: object, cwd: object) -> list[str]:
+    """Recover only literal file targets named by simple shell mutations."""
+
+    if not isinstance(command, str) or not isinstance(cwd, str) or not cwd.strip():
+        return []
+    if (
+        "\x00" in command
+        or "$(" in command
+        or "`" in command
+        or "<<" in command
+        or any(character in command for character in "\n\r'\"")
+    ):
+        return []
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return []
+
+    changed: list[str] = []
+
+    def add(raw: str) -> None:
+        path = _literal_shell_path(raw, cwd)
+        if path is not None and path not in changed:
+            changed.append(path)
+
+    for index, token in enumerate(tokens[:-1]):
+        if token in {">", ">>"}:
+            add(tokens[index + 1])
+
+    separators = {";", "&&", "||", "|", "&"}
+    segment: list[str] = []
+    for token in [*tokens, ";"]:
+        if token not in separators:
+            segment.append(token)
+            continue
+        if segment:
+            command_name = segment[0]
+            arguments = [value for value in segment[1:] if value != "--"]
+            if command_name == "touch" and not any(
+                argument.startswith("-") for argument in arguments
+            ):
+                for argument in arguments:
+                    add(argument)
+            elif command_name == "tee":
+                for argument in arguments:
+                    if not argument.startswith("-"):
+                        add(argument)
+            elif command_name in {"cp", "mv"} and not any(
+                argument.startswith("-") for argument in arguments
+            ):
+                destinations = [value for value in arguments if not value.startswith("-")]
+                if len(destinations) >= 2:
+                    add(destinations[-1])
+        segment = []
+    return changed
 
 
 def _is_mutating_tool(name: str, arguments: dict[str, Any]) -> bool:
@@ -1995,6 +2296,7 @@ def _historical_working_tree(
     message_uuid: str,
     *,
     whole_thread: bool = False,
+    end_message_uuid: str | None = None,
     linked_paths: list[Path] | None = None,
     repository: Path | None = None,
 ) -> dict[str, Any]:
@@ -2004,12 +2306,18 @@ def _historical_working_tree(
                 source_path,
                 message_uuid,
                 whole_thread=whole_thread,
+                end_message_uuid=end_message_uuid,
             )
         mutation_times = [
             value
             for value in (
                 _first_mutation_timestamp(
-                    _task_events(source_path, message_uuid, whole_thread=whole_thread),
+                    _task_events(
+                        source_path,
+                        message_uuid,
+                        whole_thread=whole_thread,
+                        end_message_uuid=end_message_uuid,
+                    ),
                     repository=repository,
                 ),
                 *(
@@ -2024,7 +2332,12 @@ def _historical_working_tree(
         ]
         cutoff = min(mutation_times) if mutation_times else None
         main_evidence = _status_evidence(
-            _task_events(source_path, message_uuid, whole_thread=whole_thread),
+            _task_events(
+                source_path,
+                message_uuid,
+                whole_thread=whole_thread,
+                end_message_uuid=end_message_uuid,
+            ),
             source_path=source_path,
             mutation_cutoff=cutoff,
             repository=repository,
@@ -2171,6 +2484,7 @@ def inspect_baseline(replay_spec: dict[str, Any]) -> dict[str, Any]:
                 Path(raw_source).expanduser(),
                 message_uuid,
                 whole_thread=replay_spec.get("task_scope") == "whole_thread",
+                end_message_uuid=replay_spec.get("end_message_uuid"),
                 repository=working_tree_repository,
                 linked_paths=(
                     [
@@ -2645,6 +2959,7 @@ def recover_historical_solution(
 
     pending_commits: dict[str, str] = {}
     pending_diffs: dict[str, str] = {}
+    pending_file_operations: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     commit_candidates: list[tuple[str, str, str | None]] = []
     observed_diffs: list[tuple[str, str, str | None]] = []
     file_operations: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -2656,6 +2971,7 @@ def recover_historical_solution(
             Path(raw_source).expanduser(),
             message_uuid,
             whole_thread=replay_spec.get("task_scope") == "whole_thread",
+            end_message_uuid=replay_spec.get("end_message_uuid"),
         ):
             for block in _tool_blocks(event):
                 block_id = block.get("id")
@@ -2667,8 +2983,14 @@ def recover_historical_solution(
                 arguments = block.get("input")
                 if not isinstance(arguments, dict):
                     arguments = {}
-                if name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "write_file"):
-                    file_operations.append((event, block))
+                if name in (
+                    "Write",
+                    "Edit",
+                    "MultiEdit",
+                    "NotebookEdit",
+                    "write_file",
+                ) and isinstance(block_id, str):
+                    pending_file_operations[block_id] = (event, block)
                 if _is_mutating_tool(name, arguments) and name not in (
                     "Write",
                     "write_file",
@@ -2690,13 +3012,20 @@ def recover_historical_solution(
                 elif re.search(r"\bgit\b[^\n;&|]*?\bdiff\b", command):
                     pending_diffs[block_id] = command
             for block in _content_blocks(event):
-                if block.get("type") != "tool_result" or block.get("is_error"):
+                if block.get("type") != "tool_result":
                     continue
                 tool_id = block.get("tool_use_id")
                 if not isinstance(tool_id, str):
                     continue
+                if block.get("is_error"):
+                    pending_commits.pop(tool_id, None)
+                    pending_diffs.pop(tool_id, None)
+                    pending_file_operations.pop(tool_id, None)
+                    continue
                 output = _tool_result_text(event, block)
                 timestamp = _format_timestamp(_parse_timestamp(event.get("timestamp")))
+                if tool_id in pending_file_operations:
+                    file_operations.append(pending_file_operations.pop(tool_id))
                 if tool_id in pending_commits:
                     command = pending_commits.pop(tool_id)
                     for candidate in _commit_from_tool_output(output):

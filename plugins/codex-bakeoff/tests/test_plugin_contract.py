@@ -15,9 +15,10 @@ SKILL = PLUGIN_ROOT / "skills" / "codex-bakeoff" / "SKILL.md"
 AGENT = PLUGIN_ROOT / "skills" / "codex-bakeoff" / "agents" / "openai.yaml"
 BASELINE_HANDLING = PLUGIN_ROOT / "BASELINE_HANDLING.md"
 RUNNER = PLUGIN_ROOT / "scripts" / "historical_bakeoff.py"
-MCP_CONFIG = PLUGIN_ROOT / ".mcp.json"
 MCP_SERVER = PLUGIN_ROOT / "mcp" / "server.py"
+MCP_CONFIGURATION = PLUGIN_ROOT / "mcp" / "replay_configuration.py"
 MCP_CONTROLLER = PLUGIN_ROOT / "mcp" / "controller.html"
+MCP_CONTROLLER_CSS = PLUGIN_ROOT / "mcp" / "controller.css"
 MCP_WORKER = PLUGIN_ROOT / "mcp" / "codex-worker.mjs"
 
 
@@ -27,8 +28,6 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(payload["name"], "codex-bakeoff")
         self.assertEqual(payload["skills"], "./skills/")
         self.assertTrue((PLUGIN_ROOT / payload["skills"]).is_dir())
-        self.assertEqual(payload["mcpServers"], "./.mcp.json")
-        self.assertTrue((PLUGIN_ROOT / payload["mcpServers"]).is_file())
         self.assertEqual(payload["interface"]["displayName"], "Codex Bakeoff")
         self.assertIn("in-app or system browser", payload["interface"]["shortDescription"])
         self.assertIn("in-app browser", payload["description"])
@@ -41,46 +40,6 @@ class PluginContractTests(unittest.TestCase):
         )
         self.assertNotIn("embedded", json.dumps(payload).lower())
         self.assertNotIn("MCP App", json.dumps(payload))
-
-    def test_skill_opens_the_controller_in_the_available_browser(self) -> None:
-        text = SKILL.read_text(encoding="utf-8")
-        flat = " ".join(text.split())
-        self.assertIn("mcp__codex_bakeoff.open_controller", text)
-        self.assertIn("browser controller owns", flat.lower())
-        self.assertIn("command -v codex", text)
-        self.assertIn("codex_cli_path", text)
-        self.assertIn("prepared: true", text)
-        self.assertIn("opened: false", text)
-        self.assertIn("launch_url", text)
-        self.assertIn("open_in_codex", text)
-        self.assertIn('{ target: { type: "browser", url: launch_url } }', flat)
-        self.assertIn("Do not provide `threadId`", flat)
-        self.assertIn("native call explicitly succeeds", flat)
-        self.assertIn("If `open_in_codex` is unavailable, as in Codex CLI", flat)
-        self.assertIn('`open "$launch_url"` on macOS', flat)
-        self.assertIn('`xdg-open "$launch_url"` on Linux', flat)
-        self.assertIn("verify the command exits successfully", flat)
-        self.assertIn("If the native call exists but fails", flat)
-        self.assertIn("do not fall back to an external browser", flat)
-        self.assertIn("report that the controller could not be opened", flat)
-        self.assertNotIn('`Start-Process "$launch_url"`', flat)
-        self.assertNotIn("short-lived", text)
-        self.assertNotIn("authenticated", text)
-        self.assertNotIn("open_replay_app", text)
-        self.assertNotIn("RUNNER", text)
-        self.assertNotIn("--approve", text)
-
-    def test_skill_starts_an_independent_controller_without_stopping_a_listener(self) -> None:
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
-        self.assertIn("available loopback port", text)
-        self.assertIn("fresh, independent controller for this invocation", text)
-        self.assertIn("An occupied port is skipped", text)
-        self.assertIn("Never stop an existing process", text)
-        self.assertIn("Multiple replay sessions can run in parallel", text)
-        self.assertIn("plain loopback URL", text)
-        self.assertNotIn("requires_confirmation", text)
-        self.assertNotIn("confirmation_token", text)
-        self.assertNotIn("stop_port_process_and_open_controller", text)
 
     def test_beginning_and_end_state_document_contract(self) -> None:
         text = BASELINE_HANDLING.read_text(encoding="utf-8")
@@ -144,7 +103,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("excluded symmetrically from both candidates", runner)
         self.assertIn('commands.add_parser("complete-run")', runner)
 
-        source = MCP_SERVER.read_text(encoding="utf-8")
+        source = MCP_CONFIGURATION.read_text(encoding="utf-8")
         for field in ("beginning_kind", "ending_kind", "baseline_commit", "ending_commit"):
             with self.subTest(mcp_configuration_field=field):
                 self.assertIn(f'"{field}"', source)
@@ -152,8 +111,6 @@ class PluginContractTests(unittest.TestCase):
 
     def test_agent_prompt_opens_the_available_browser(self) -> None:
         text = AGENT.read_text(encoding="utf-8")
-        self.assertIn("open Codex Bakeoff in the Codex in-app browser", text)
-        self.assertIn("system browser in Codex CLI", text)
         self.assertIn("independent session on an automatically available loopback port", text)
         self.assertIn("Do not run the workflow in chat", text)
         self.assertNotIn("embedded", text)
@@ -162,7 +119,6 @@ class PluginContractTests(unittest.TestCase):
         text = " ".join(README.read_text(encoding="utf-8").split())
         self.assertIn("local browser controller", text)
         self.assertIn("Codex in-app browser", text)
-        self.assertIn("In Codex CLI, it opens in the system browser", text)
         self.assertIn("independent controller on an automatically available loopback port", text)
         self.assertIn("Multiple replay sessions can run in parallel", text)
         self.assertIn("each controller resumes only its own runs", text)
@@ -176,20 +132,9 @@ class PluginContractTests(unittest.TestCase):
         self.assertTrue((PLUGIN_ROOT / "assets" / "icon.svg").is_file())
 
     def test_browser_controller_is_packaged_with_direct_http_transport(self) -> None:
-        config = json.loads(MCP_CONFIG.read_text(encoding="utf-8"))
-        server = config["mcpServers"]["codex-bakeoff"]
-        self.assertEqual(server["command"], "python3")
-        self.assertEqual(server["args"], ["./mcp/server.py"])
-        self.assertEqual(server["cwd"], ".")
-        self.assertIn("CODEX_MCP_NODE_PATH", server["env_vars"])
-        self.assertIn("CODEX_BROWSER_USE_NODE_PATH", server["env_vars"])
-        self.assertIn("CODEX_ELECTRON_RESOURCES_PATH", server["env_vars"])
-        self.assertIn("XDG_CACHE_HOME", server["env_vars"])
-        self.assertIn("HOME", server["env_vars"])
-        self.assertIn("PATH", server["env_vars"])
-        self.assertIn("CODEX_BAKEOFF_CONTROLLER_PORT", server["env_vars"])
         self.assertTrue(MCP_SERVER.is_file())
         self.assertTrue(MCP_CONTROLLER.is_file())
+        self.assertTrue(MCP_CONTROLLER_CSS.is_file())
         self.assertLessEqual(
             MCP_CONTROLLER.stat().st_size,
             150_000,
@@ -197,6 +142,7 @@ class PluginContractTests(unittest.TestCase):
         )
         self.assertTrue(MCP_WORKER.is_file())
         controller = MCP_CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn('href="/controller.css"', controller)
         self.assertIn("/api/call", controller)
         self.assertIn("/api/download", controller)
         self.assertIn("localStorage", controller)

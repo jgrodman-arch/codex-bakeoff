@@ -408,6 +408,45 @@ def _selected_session(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
+    start_message_uuid = str(getattr(args, "start_message_uuid", None) or "").strip()
+    end_message_uuid = str(getattr(args, "end_message_uuid", None) or "").strip()
+    ranged = bool(start_message_uuid or end_message_uuid)
+    if ranged and not (start_message_uuid and end_message_uuid):
+        raise ReplayError("Select both the first and last user turn for a Replay range.")
+    loader = _module("claude_code_sample_loader")
+    if loader.is_sample_thread(args.imported_thread_id):
+        if ranged:
+            raise ReplayError("Recorded sample tasks support whole-thread Replay only.")
+        root = getattr(args, "sample_controller_root", None)
+        if root is None:
+            raise ReplayError("Recorded sample resolution requires its controller root.")
+        try:
+            sample = loader.resolve_sample(args.imported_thread_id, root)
+            request = (
+                sys.stdin.read()
+                if getattr(args, "request_stdin", False)
+                else getattr(args, "request", None)
+            )
+            loader.validate_selection(
+                sample,
+                {
+                    "repo": getattr(args, "repo", None),
+                    "request": request,
+                    "source_path": getattr(args, "source_path", None),
+                    "message_uuid": getattr(args, "message_uuid", None),
+                    "beginning_kind": getattr(args, "beginning_kind", None),
+                    "ending_kind": getattr(args, "ending_kind", None),
+                    "baseline_commit": getattr(args, "baseline_commit", None),
+                    "ending_commit": getattr(args, "ending_commit", None),
+                    "claude_output_files": getattr(args, "claude_output_file", None),
+                    "created_by_claude": getattr(args, "created_by_claude", None),
+                    "excluded_files": getattr(args, "exclude_file", None),
+                },
+            )
+        except loader.SampleError as error:
+            raise ReplayError(str(error)) from error
+        args.sample_resolution = sample
+        return sample["replay"]
     request_from_stdin = bool(getattr(args, "request_stdin", False))
     raw_request = sys.stdin.read() if request_from_stdin else getattr(args, "request", "")
     manual_request = str(raw_request or "").strip()
@@ -418,8 +457,8 @@ def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
     raw_source_path = getattr(args, "source_path", None)
     raw_message_uuid = getattr(args, "message_uuid", None)
     source_path = str(raw_source_path or "").strip()
-    message_uuid = str(raw_message_uuid or "").strip()
-    if bool(source_path) != bool(message_uuid):
+    message_uuid = start_message_uuid if ranged else str(raw_message_uuid or "").strip()
+    if not ranged and bool(source_path) != bool(message_uuid):
         raise ReplayError("Enter both the source transcript path and original user-message UUID.")
     session_recovered = True
     try:
@@ -436,7 +475,26 @@ def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
     transcript_overridden = False
     request_discovery_failed = False
     try:
-        if source_path and message_uuid:
+        if ranged:
+            if source_path:
+                reviewed_source = Path(source_path).expanduser()
+                if not reviewed_source.is_absolute():
+                    raise ReplayError("The reviewed source transcript path must be absolute.")
+                original_source = session.get("source_path")
+                transcript_overridden = (
+                    not isinstance(original_source, str)
+                    or reviewed_source.resolve() != Path(original_source).expanduser().resolve()
+                )
+                session = {**session, "source_path": str(reviewed_source)}
+            replay = _discovery().build_replay_spec(
+                session,
+                {
+                    "start_message_uuid": start_message_uuid,
+                    "end_message_uuid": end_message_uuid,
+                    "project_dir": getattr(args, "repo", None) or session.get("project_dir"),
+                },
+            )
+        elif source_path and message_uuid:
             reviewed_source = Path(source_path).expanduser()
             if not reviewed_source.is_absolute():
                 raise ReplayError("The reviewed source transcript path must be absolute.")
@@ -466,7 +524,7 @@ def _selected_replay(args: argparse.Namespace) -> dict[str, Any]:
             task = _discovery().build_thread_task(session)
             replay = _discovery().build_replay_spec(session, task)
     except Exception as error:
-        if source_path or message_uuid:
+        if ranged or source_path or message_uuid:
             raise ReplayError(_redact(error)) from error
         if not manual_request:
             raise ReplayError(_redact(error)) from error
@@ -565,6 +623,15 @@ def _resolved_replay_repository(
     args: argparse.Namespace,
     replay: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    if replay.get("sample_configuration"):
+        resolution = {
+            "source": "packaged_sample",
+            "original_project_dir": replay["project_dir"],
+            "effective_project_dir": replay["project_dir"],
+            "user_confirmed": False,
+            "overridden_blocking_reasons": [],
+        }
+        return {**replay, "repository_resolution": resolution}, resolution, []
     resolved = dict(replay)
     raw_original = replay.get("project_dir")
     original = (
@@ -816,7 +883,10 @@ def _with_historical_ending_commit(
 
 
 def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, Any]:
+    if replay.get("sample_configuration"):
+        return dict(args.sample_resolution["baseline"])
     inspected_replay = dict(replay)
+    ranged = replay.get("task_scope") == "range"
     raw_selected_project = args.repo or replay.get("project_dir")
     selected_project: Path | None = None
     if isinstance(raw_selected_project, (str, Path)) and str(raw_selected_project).strip():
@@ -899,13 +969,13 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
         git_root = _git_root(selected_project)
         if ending_kind == "git" and git_root is None:
             raise ReplayError("A Git end state requires an accessible Git repository.")
-        if ending_kind == "non_git" and git_root is not None:
+        if ending_kind == "non_git" and git_root is not None and not ranged:
             raise ReplayError("A Non-Git end state cannot point inside Git.")
         baseline = {
             **inspected,
             "kind": "unclassified_directory",
             "proposed_kind": "empty_directory",
-            "repository": str(git_root or selected_project),
+            "repository": str(git_root if ending_kind == "git" else selected_project),
             "attribution_root": str(selected_project),
             "source_kind": ending_kind,
             "beginning_kind": "non_git",
@@ -947,7 +1017,16 @@ def _baseline(args: argparse.Namespace, replay: Mapping[str, Any]) -> dict[str, 
                 "confidence": "requires_user_classification",
                 "proposed_kind": "empty_directory",
             }
-            return _with_historical_ending_commit(inspected_replay, baseline, "")
+            result = _with_historical_ending_commit(inspected_replay, baseline, "")
+            if ranged and not result.get("ending_commit"):
+                result.update(
+                    {
+                        "source_kind": "non_git",
+                        "ending_kind": "non_git",
+                        "repository": str(selected_project),
+                    }
+                )
+            return result
         attribution_root = selected_project or git_root
         if inspected.get("kind") != "git_commit" or not isinstance(inspected.get("commit"), str):
             return {
@@ -1073,27 +1152,198 @@ def _target_for_baseline(
     raise ReplayError("The selected historical baseline is not runnable.")
 
 
+def _transcript_inferred_paths(
+    replay: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> list[str]:
+    """Return selectable current files attributable to the selected transcript."""
+
+    candidates = {
+        str(item["path"])
+        for item in selection.get("candidates") or []
+        if isinstance(item, Mapping)
+        and isinstance(item.get("path"), str)
+        and item.get("selectable") is True
+    }
+    raw_source_root = selection.get("source_root")
+    if not candidates or not isinstance(raw_source_root, str) or not raw_source_root:
+        return []
+    source_root = _canonical_parent_path(raw_source_root)
+    evidence: list[str] = [
+        value
+        for value in replay.get("historical_changed_files") or []
+        if isinstance(value, str) and value
+    ]
+    if (
+        isinstance(replay.get("source_path"), str)
+        and isinstance(replay.get("message_uuid"), str)
+        and not (
+            replay.get("task_scope") == "range" and baseline.get("beginning_kind") == "non_git"
+        )
+    ):
+        beginning_kind = baseline.get("beginning_kind")
+        baseline_kind = "git_commit" if beginning_kind == "git" else "empty_directory"
+        baseline_commit = baseline.get("commit") if baseline_kind == "git_commit" else None
+        ending_commit = (
+            baseline.get("ending_commit")
+            if baseline.get("ending_kind") == "git"
+            and baseline.get("ending_commit_reviewed_override") is not True
+            else None
+        )
+        try:
+            recovered = _discovery().recover_historical_solution(
+                {
+                    **replay,
+                    "project_dir": str(source_root),
+                    "project_dirs": [str(source_root)],
+                },
+                baseline_commit if isinstance(baseline_commit, str) else None,
+                baseline_kind=baseline_kind,
+                ending_commit=ending_commit if isinstance(ending_commit, str) else None,
+            )
+        except Exception:
+            recovered = {}
+        evidence.extend(
+            value
+            for value in recovered.get("changed_files") or []
+            if isinstance(value, str) and value
+        )
+
+    inferred: set[str] = set()
+    for raw_path in evidence:
+        if raw_path in candidates:
+            inferred.add(raw_path)
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            continue
+        try:
+            relative = _canonical_parent_path(path).relative_to(source_root).as_posix()
+        except ValueError:
+            continue
+        if relative in candidates:
+            inferred.add(relative)
+    return sorted(inferred)
+
+
+def _carried_forward_paths(
+    args: argparse.Namespace,
+    replay: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    *,
+    include_tracked_inputs: bool = False,
+) -> list[str]:
+    if replay.get("task_scope") != "range":
+        return []
+    source_root = Path(str(selection["source_root"]))
+    candidates = {
+        str(item["path"])
+        for item in selection.get("candidates") or []
+        if isinstance(item, Mapping)
+        and item.get("selectable") is True
+        and item.get("kind") == "regular"
+    }
+    if include_tracked_inputs:
+        attribution_root = Path(str(selection.get("attribution_root") or source_root))
+        candidates.update(
+            (attribution_root / item["path"]).relative_to(source_root).as_posix()
+            for item in _file_selection().inspect_directory(
+                attribution_root, allow_git_with_commits=True
+            )
+            if item["selectable"] is True and item["kind"] == "regular"
+        )
+    excluded = set(getattr(args, "exclude_file", None) or ())
+    paths: set[str] = set()
+    for raw in (
+        *(replay.get("prior_historical_changed_files") or ()),
+        *(getattr(args, "carried_forward_file", None) or ()),
+    ):
+        if not isinstance(raw, str):
+            continue
+        path = Path(raw).expanduser()
+        try:
+            relative = (
+                _canonical_parent_path(path).relative_to(source_root).as_posix()
+                if path.is_absolute()
+                else path.as_posix()
+            )
+        except ValueError:
+            continue
+        if relative in candidates and relative not in excluded:
+            paths.add(relative)
+    return sorted(paths)
+
+
+def _with_transcript_inference(
+    selection: Mapping[str, Any],
+    inferred_paths: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        **selection,
+        "transcript_inferred_files": list(inferred_paths),
+        "transcript_inferred_file_count": len(inferred_paths),
+    }
+
+
 def _classified_baseline(
     args: argparse.Namespace,
     baseline: Mapping[str, Any],
+    replay: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if baseline.get("sample_configuration"):
+        return dict(baseline), dict(args.sample_resolution["file_selection"])
     repository = _absolute_no_follow(str(baseline.get("repository") or ""))
     attribution_root = _absolute_no_follow(str(baseline.get("attribution_root") or repository))
     source_kind = baseline.get("source_kind")
+    ranged = (replay or {}).get("task_scope") == "range"
     try:
         if source_kind == "git":
             non_git_values = (
                 *(getattr(args, "created_by_claude", None) or ()),
-                *(getattr(args, "exclude_file", None) or ()),
+                *((getattr(args, "exclude_file", None) or ()) if not ranged else ()),
             )
             if non_git_values:
                 raise ReplayError("Non-Git classification flags cannot be used for a Git project.")
+            requested_files = tuple(getattr(args, "claude_output_file", None) or ())
+            confirmed = bool(getattr(args, "confirm_file_selection", False))
             selection = _file_selection().select_git(
                 repository,
                 attribution_root=attribution_root,
-                claude_output_files=(getattr(args, "claude_output_file", None) or ()),
-                confirmed=bool(getattr(args, "confirm_file_selection", False)),
+                claude_output_files=requested_files,
+                confirmed=confirmed,
             )
+            carried_paths = _carried_forward_paths(
+                args,
+                replay or {},
+                selection,
+                include_tracked_inputs=ranged and baseline.get("beginning_kind") == "non_git",
+            )
+            inferred_paths = _transcript_inferred_paths(replay or {}, baseline, selection)
+            if ranged:
+                inferred_paths = [
+                    path
+                    for path in inferred_paths
+                    if path not in (getattr(args, "exclude_file", None) or ())
+                ]
+            if not confirmed and not requested_files and inferred_paths:
+                selection = _file_selection().select_git(
+                    repository,
+                    attribution_root=attribution_root,
+                    claude_output_files=inferred_paths,
+                    confirmed=False,
+                )
+            if carried_paths:
+                selection = _file_selection().select_git(
+                    repository,
+                    attribution_root=attribution_root,
+                    claude_output_files=[
+                        item["path"] for item in selection["claude_output_changes"]
+                    ],
+                    carried_forward_files=carried_paths,
+                    confirmed=confirmed,
+                )
+            selection = _with_transcript_inference(selection, inferred_paths)
             empty_beginning_required = baseline.get("beginning_kind") == "non_git"
             empty_beginning_confirmed = bool(getattr(args, "confirm_empty_beginning", False))
             selection = {
@@ -1129,15 +1379,58 @@ def _classified_baseline(
         if source_kind == "non_git":
             if getattr(args, "claude_output_file", None):
                 raise ReplayError("--claude-output-file applies only to a Git working tree.")
+            created_by_claude = tuple(getattr(args, "created_by_claude", None) or ())
+            exclude_files = tuple(getattr(args, "exclude_file", None) or ())
+            confirmed = bool(getattr(args, "confirm_file_selection", False))
             selection = _file_selection().select_directory(
                 repository,
-                created_by_claude=(getattr(args, "created_by_claude", None) or ()),
-                exclude_files=(getattr(args, "exclude_file", None) or ()),
-                confirmed=bool(getattr(args, "confirm_file_selection", False)),
+                allow_git_with_commits=ranged and baseline.get("beginning_kind") == "non_git",
+                created_by_claude=created_by_claude,
+                exclude_files=exclude_files,
+                confirmed=confirmed,
                 empty_starting_directory_confirmed=bool(
                     getattr(args, "confirm_empty_beginning", False)
                 ),
             )
+            carried_paths = _carried_forward_paths(args, replay or {}, selection)
+            inferred_paths = _transcript_inferred_paths(replay or {}, baseline, selection)
+            if not confirmed and not created_by_claude and (ranged or not exclude_files):
+                candidate_paths = [
+                    str(item["path"])
+                    for item in selection["candidates"]
+                    if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+                ]
+                selection = _file_selection().select_directory(
+                    repository,
+                    allow_git_with_commits=ranged and baseline.get("beginning_kind") == "non_git",
+                    created_by_claude=[
+                        path for path in inferred_paths if path not in exclude_files
+                    ],
+                    carried_forward_files=carried_paths,
+                    exclude_files=[
+                        path
+                        for path in candidate_paths
+                        if path not in inferred_paths and path not in carried_paths
+                    ]
+                    + [path for path in exclude_files if path in inferred_paths],
+                    confirmed=False,
+                    empty_starting_directory_confirmed=bool(
+                        getattr(args, "confirm_empty_beginning", False)
+                    ),
+                )
+            elif carried_paths:
+                selection = _file_selection().select_directory(
+                    repository,
+                    allow_git_with_commits=ranged and baseline.get("beginning_kind") == "non_git",
+                    created_by_claude=created_by_claude,
+                    carried_forward_files=carried_paths,
+                    exclude_files=exclude_files,
+                    confirmed=confirmed,
+                    empty_starting_directory_confirmed=bool(
+                        getattr(args, "confirm_empty_beginning", False)
+                    ),
+                )
+            selection = _with_transcript_inference(selection, inferred_paths)
             classified_kind = (
                 "empty_directory" if selection["complete"] else "unclassified_directory"
             )
@@ -1228,7 +1521,10 @@ def _selection_questions(
             {
                 "id": "confirm_empty_beginning",
                 "question": (
-                    "Confirm that the Non-Git beginning state was an empty directory. "
+                    "Confirm that the Non-Git beginning state consists only of "
+                    "the listed files carried forward from earlier chunks."
+                    if selection.get("before_files")
+                    else "Confirm that the Non-Git beginning state was an empty directory. "
                     "If any file existed before Claude, stop: non-empty Non-Git "
                     "beginning states are unsupported."
                 ),
@@ -1263,11 +1559,24 @@ def _configuration(
             "imported_thread_id": replay.get("imported_thread_id"),
             "original_session_id": replay.get("session_id"),
             "task_scope": replay.get("task_scope", "whole_thread"),
+            **(
+                {
+                    "start_message_uuid": replay["start_message_uuid"],
+                    "end_message_uuid": replay["end_message_uuid"],
+                }
+                if replay.get("task_scope") == "range"
+                else {}
+            ),
             "user_message_count": replay.get("user_message_count", 1),
             "request": replay.get("request"),
             "project": replay.get("project_dir"),
             "original_project": replay.get("original_project_dir"),
         },
+        **(
+            {"sample_configuration": replay["sample_configuration"]}
+            if replay.get("sample_configuration")
+            else {}
+        ),
         "beginning_state": {
             "kind": baseline.get("beginning_kind"),
             "commit": (baseline.get("commit") if baseline.get("beginning_kind") == "git" else None),
@@ -1330,6 +1639,7 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
             **_baseline(args, replay),
             "repository_resolution": repository_resolution,
         },
+        replay,
     )
     model = _selected_model(args.model, args.model_cache)
     try:
@@ -1348,6 +1658,11 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
         "capabilities": capabilities,
         "prompt": _prompt(replay),
         "sandbox_policy": {"type": "workspaceWrite", "networkAccess": True},
+        **(
+            {"sample_resolution": args.sample_resolution}
+            if replay.get("sample_configuration")
+            else {}
+        ),
     }
     questions = _selection_questions(file_selection)
     blocking_reasons = [
@@ -1388,7 +1703,11 @@ def _prepare_context(args: argparse.Namespace) -> dict[str, Any]:
 
 def _command_prepare(args: argparse.Namespace) -> dict[str, Any]:
     prepared = _prepare_context(args)
-    result = {key: value for key, value in prepared.items() if key != "historical_candidate"}
+    result = {
+        key: value
+        for key, value in prepared.items()
+        if key not in {"historical_candidate", "sample_resolution"}
+    }
     result["prepared_configuration_sha256"] = _canonical_json_sha256(prepared["configuration"])
     historical_candidate = prepared.get("historical_candidate")
     result["historical_result_sha256"] = (
@@ -1562,9 +1881,50 @@ def _command_collect_native_result(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _candidate_repository_state(
+    run: Mapping[str, Any],
+    *,
+    recovery: Mapping[str, Any] | None = None,
+    workspace: Path | None = None,
+) -> dict[str, Any] | None:
+    replay = run.get("replay")
+    if not isinstance(replay, Mapping) or replay.get("task_scope") != "range":
+        return None
+    baseline = run["baseline"]
+    beginning_kind = baseline.get("beginning_kind")
+    beginning = {
+        "kind": beginning_kind if beginning_kind in {"git", "non_git"} else "unknown",
+        "commit": baseline.get("commit") if beginning_kind == "git" else None,
+        "basis": "reviewed_boundary",
+        "working_tree": "unknown",
+    }
+    if workspace is not None:
+        ending = _execution().observe_repository_state(workspace)
+    else:
+        commit = (recovery or {}).get("commit")
+        resolved = isinstance(commit, str) and re.fullmatch(r"[a-fA-F0-9]{40,64}", commit)
+        ending_kind = baseline.get("ending_kind")
+        ending = {
+            "kind": "git" if resolved else "non_git" if ending_kind == "non_git" else "unknown",
+            "commit": commit if resolved else None,
+            "basis": "resolved_commit" if resolved else "reviewed_boundary",
+            "working_tree": "unknown",
+        }
+    return _execution().repository_state_from_payload({"beginning": beginning, "ending": ending})
+
+
 def _historical_candidate(
     run: Mapping[str, Any],
 ) -> tuple[Any | None, dict[str, Any], str]:
+    sample = run.get("sample_resolution")
+    if isinstance(sample, Mapping):
+        candidate = _execution().CandidateSolution(
+            provider="claude",
+            diff=sample["recovery"]["diff"],
+            model=sample["replay"]["claude_model"],
+            final_response=sample["final_response"],
+        )
+        return candidate, dict(sample["recovery"]), sample["final_response"]
     replay = run["replay"]
     if (
         not isinstance(replay.get("source_path"), str)
@@ -1639,7 +1999,9 @@ def _historical_candidate(
     elif selection.get("source_kind") == "git":
         selected_changes = selection.get("claude_output_changes")
         selected_changes = selected_changes if isinstance(selected_changes, list) else []
-        if selection.get("working_tree_state") == "dirty" and selected_changes:
+        if (selection.get("working_tree_state") == "dirty" and selected_changes) or selection.get(
+            "before_files"
+        ):
             try:
                 diff, changed = _file_selection().build_git_candidate_patch(
                     repository=repository,
@@ -1688,6 +2050,11 @@ def _historical_candidate(
         and recovery.get("commit") == baseline.get("ending_commit")
         and isinstance(diff, str)
     )
+    allow_no_change = allow_no_change or bool(
+        replay.get("task_scope") == "range"
+        and selection.get("complete") is True
+        and isinstance(diff, str)
+    )
     if not isinstance(diff, str) or (not diff.strip() and not allow_no_change):
         raise ReplayError(
             "No attributable historical Claude patch could be captured; "
@@ -1698,6 +2065,7 @@ def _historical_candidate(
             replay["source_path"],
             replay["message_uuid"],
             whole_thread=replay.get("task_scope") == "whole_thread",
+            end_message_uuid=replay.get("end_message_uuid"),
         )
     except Exception:
         final_response = ""
@@ -1707,6 +2075,7 @@ def _historical_candidate(
             diff=diff,
             model=str(replay.get("claude_model") or "unknown"),
             final_response=final_response or "",
+            repository_state=_candidate_repository_state(run, recovery=recovery),
         )
         if isinstance(diff, str)
         else None
@@ -1777,6 +2146,9 @@ def _historical_candidate_for_completion(
         diff=raw_candidate["diff"],
         model=str(raw_candidate.get("model") or "unknown"),
         final_response=final_response,
+        repository_state=_execution().repository_state_from_payload(
+            raw_candidate.get("repository_state")
+        ),
     )
     return candidate, dict(raw_recovery), final_response
 
@@ -1816,6 +2188,17 @@ def _codex_candidate(
                     str(baseline["commit"]) if baseline.get("kind") == "git_commit" else None
                 ),
             )
+            if selection.get("before_files"):
+                diff, changed = _file_selection().build_git_candidate_patch(
+                    repository=str(baseline["repository"]),
+                    baseline_commit=(
+                        str(baseline["commit"]) if isinstance(baseline.get("commit"), str) else None
+                    ),
+                    baseline_kind=str(baseline.get("kind") or "git_commit"),
+                    recovered_patch=diff,
+                    selection={**selection, "claude_output_changes": []},
+                    preserve_carried_inputs=False,
+                )
     except ReplayError:
         raise
     except Exception as error:
@@ -1825,6 +2208,7 @@ def _codex_candidate(
         diff=diff,
         model=str(native.get("model") or run.get("model") or "unknown"),
         final_response=str(native.get("final_output") or ""),
+        repository_state=_candidate_repository_state(run, workspace=worktree),
     )
     return candidate, diff, changed
 
@@ -1888,12 +2272,14 @@ def _command_complete_run(args: argparse.Namespace) -> dict[str, Any]:
         codex_usage=codex_usage,
         codex_result=native,
         limitations=limitations,
+        historical_usage_shared=run["replay"].get("historical_usage_shared") is True,
     )
     recorded_result = run["replay"].get("recorded_claude_result")
     if isinstance(recorded_result, Mapping):
         reported_cost = recorded_result.get("total_cost_usd")
         if (
             isinstance(reported_cost, (int, float))
+            and run["replay"].get("historical_usage_shared") is not True
             and not isinstance(reported_cost, bool)
             and math.isfinite(reported_cost)
             and reported_cost >= 0
@@ -1951,6 +2337,9 @@ def _report_candidates(report: Mapping[str, Any]) -> tuple[Any | None, Any | Non
                 diff=str(item.get("diff") or ""),
                 model=str(item.get("model") or "unknown"),
                 final_response=str(item.get("final_response") or ""),
+                repository_state=_execution().repository_state_from_payload(
+                    item.get("repository_state")
+                ),
             )
         )
     return candidates[0], candidates[1]
@@ -2621,11 +3010,19 @@ def _add_json(parser: argparse.ArgumentParser) -> None:
 
 def _add_session(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--imported-thread-id", required=True)
+    parser.add_argument("--start-message-uuid", help="First actionable user turn in the range.")
+    parser.add_argument("--end-message-uuid", help="Last actionable user turn in the range.")
+    parser.add_argument("--sample-controller-root", type=Path)
     parser.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
 
 
 def _add_baseline(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", type=Path)
+    parser.add_argument(
+        "--carried-forward-file",
+        action="append",
+        help="Include an earlier range's attributed file as a whole-file input.",
+    )
     parser.add_argument(
         "--beginning-kind",
         choices=("git", "non_git"),
@@ -2832,6 +3229,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 **_baseline(args, replay),
                 "repository_resolution": repository_resolution,
             },
+            replay,
         )
         return {
             "status": "ok",

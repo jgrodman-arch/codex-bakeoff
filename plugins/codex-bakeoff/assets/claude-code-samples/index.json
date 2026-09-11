@@ -41,7 +41,9 @@
           }
         ],
         "passed": true
-      }
+      },
+      "configuration_path": "records/jqlang__jq-2157--claude-fable-5/configuration.json",
+      "configuration_sha256": "260c1680d98d019c3c69428244fbb9333a78c6c07b03f3c8d621dc030a8cc81a"
     },
     {
       "baseline_commit": "f88c4e5888d6d125695444d044df4bb55ad75888",
@@ -84,7 +86,9 @@
           }
         ],
         "passed": true
-      }
+      },
+      "configuration_path": "records/jqlang__jq-2157--claude-opus-5/configuration.json",
+      "configuration_sha256": "4c3e67d9f229ac261a0de1ebb0435930049786fdf0fbf0220de01f40c27591c1"
     },
     {
       "baseline_commit": "f88c4e5888d6d125695444d044df4bb55ad75888",
@@ -126,7 +130,9 @@
           }
         ],
         "passed": true
-      }
+      },
+      "configuration_path": "records/jqlang__jq-2157--claude-sonnet-5/configuration.json",
+      "configuration_sha256": "b6c168be8a82d00fdb97c839bdfd8e9e3914db0e9e9ae9292f9ae4467cd15a5c"
     },
     {
       "baseline_commit": "f88c4e5888d6d125695444d044df4bb55ad75888",
@@ -168,7 +174,9 @@
           }
         ],
         "passed": true
-      }
+      },
+      "configuration_path": "records/jqlang__jq-2157--claude-haiku-4-5-20251001/configuration.json",
+      "configuration_sha256": "248d87a3265cf5647b1f285823c546bcd9f6e1ddd9ab1a4e40962b4158d57b74"
     },
     {
       "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
@@ -213,7 +221,9 @@
           }
         ],
         "passed": true
-      }
+      },
+      "configuration_path": "records/jqlang__jq-2919--claude-fable-5/configuration.json",
+      "configuration_sha256": "3e92bb640aa03cff401c522b632a326b8c6ea4c4d539cd489c1b17c1c99cb2db"
     },
     {
       "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
@@ -256,7 +266,9 @@
           }
         ],
         "passed": true
-      }
+      },
+      "configuration_path": "records/jqlang__jq-2919--claude-opus-5/configuration.json",
+      "configuration_sha256": "4618412a6a02ee716f30f796e883a9d889d8608ddf13c5046f91d6c48a667b7e"
     },
     {
       "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
@@ -299,7 +311,9 @@
           }
         ],
         "passed": false
-      }
+      },
+      "configuration_path": "records/jqlang__jq-2919--claude-sonnet-5/configuration.json",
+      "configuration_sha256": "ec6cdbb392fc2b6d754d94ecba6d292f3ee3bdff90818febd1277e8e156eeb62"
     },
     {
       "baseline_commit": "7f547827e47b5ade563a293329deb4226496d72f",
@@ -342,7 +356,9 @@
           }
         ],
         "passed": false
-      }
+      },
+      "configuration_path": "records/jqlang__jq-2919--claude-haiku-4-5-20251001/configuration.json",
+      "configuration_sha256": "a95a5533c36e35c9012692f0b6ffc0c462cc4ee5b739f1455d20027028c31425"
     }
   ],
   "schema_version": 1

@@ -1,0 +1,188 @@
+{
+  "version": 1,
+  "metadata_sha256": "2c736311e10d3f12fdb939e2590042851798fb1737b4e2331a70ba0cac10b527",
+  "working_directory": ".",
+  "beginning_state": {
+    "kind": "git",
+    "commit": "f88c4e5888d6d125695444d044df4bb55ad75888"
+  },
+  "ending_state": {
+    "kind": "git_patch",
+    "patch_path": "records/jqlang__jq-2157--claude-sonnet-5/patch.diff"
+  },
+  "attributed_files": [
+    "src/builtin.c",
+    "tests/jq.test"
+  ],
+  "capability_requirements": {
+    "observed_tools": [
+      "Bash",
+      "Edit",
+      "Grep",
+      "Read",
+      "Write"
+    ],
+    "observed_skills": [],
+    "observed_skill_provenance": [],
+    "observed_plugins": [],
+    "task_mutated_claude_skills": [],
+    "observed_instruction_paths": [],
+    "connector_names": [],
+    "configured_connector_names": []
+  },
+  "artifact_sha256": {
+    "records/jqlang__jq-2157--claude-sonnet-5/transcript.000.jsonl": "cad98ffa406aab52bcacd186b7b7931753411ef8899195f80cd81841784670c2",
+    "records/jqlang__jq-2157--claude-sonnet-5/patch.diff": "8f080d797c6ea03c93f406b6061cf5e33b15a152ff270372fcc40d564bc24ea1",
+    "records/jqlang__jq-2157--claude-sonnet-5/result.json": "5bdc7d8093ece9e9105bbae4bd88ec18a5cef67c8d12ad417ec58f8f8549acb6"
+  },
+  "replay": {
+    "message_uuid": "c8cbc50a-7b49-49d3-b395-c6b94749ffb9",
+    "task_timestamp": "2026-08-11T22:44:11.328000Z",
+    "preceding_context": [],
+    "claude_model": "claude-sonnet-5",
+    "historical_usage": {
+      "input_tokens": 62,
+      "output_tokens": 7572,
+      "cache_read_input_tokens": 591202,
+      "cache_creation_input_tokens": 14158,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 14158
+      },
+      "cache_write_5m_tokens": 0,
+      "cache_write_1h_tokens": 14158,
+      "cached_input_tokens": 591202,
+      "cache_write_input_tokens": 14158,
+      "provider_message_count": 31,
+      "fallback_message_count": 0,
+      "provider_message_ids": [
+        "msg_011Cdwmf5H3CfCNwxiymKAMh",
+        "msg_011CdwmfGaSHXBSuBsUcWjyj",
+        "msg_011CdwmfcHrF7Dj2ALZYBAqL",
+        "msg_011CdwmfsKEXAR7kcHuUmxdq",
+        "msg_011Cdwmg3wTWhRMK8XzJsoEB",
+        "msg_011CdwmgPiakuMFQCwayWeWB",
+        "msg_011CdwmggGFX2pkZWmZev1VM",
+        "msg_011CdwmhFBAHu5RhurCBUfGc",
+        "msg_011CdwmhTV5XhdbL77EWE96C",
+        "msg_011CdwmhgPigRhVRUk1vAGZK",
+        "msg_011CdwmhvV3VTqzse6DV8QJ8",
+        "msg_011Cdwmi5UHFgBfaDB4vf6d8",
+        "msg_011CdwmiMEZpJxER9F6WCLV9",
+        "msg_011CdwmiYyzvmBErwAuAESnE",
+        "msg_011Cdwmig3QW5qaeCpEd6eFh",
+        "msg_011CdwmiyMxHZ45ititivyAd",
+        "msg_011CdwmjCBdT2NokjbdDkVHA",
+        "msg_011CdwmjLEpXoLBqJ2QFnjqk",
+        "msg_011CdwmjaQMvu7t11mwcNGAJ",
+        "msg_011CdwmjzNFpmkggL252j1CT",
+        "msg_011CdwmkKedMBmtcs1B1Z7zF",
+        "msg_011CdwmkbwepxApKS1YYJV6M",
+        "msg_011Cdwmm6qDp21ThnRWqGF16",
+        "msg_011CdwmmJb9zfZ5FptjpMMXj",
+        "msg_011CdwmmSHGBUMToZSe5TSqV",
+        "msg_011CdwmmZcHcCpFmc3NN2jg7",
+        "msg_011CdwmmxJnfsnYZPq22dWkf",
+        "msg_011Cdwmn9cS8oBVouVcdjN2T",
+        "msg_011CdwmnhGBxuzVeszM1wCJx",
+        "msg_011CdwmntswVYjvibnjAR3mR",
+        "msg_011Cdwmo3ZpvxHoL58yCJE4t"
+      ],
+      "deduplication": "provider_message_id; request_id or event_uuid only when provider ID is unavailable"
+    },
+    "historical_elapsed_seconds": 110.688,
+    "historical_wall_clock_seconds": 110.688,
+    "historical_model_request_seconds": 110.021,
+    "historical_model_request_timing": {
+      "status": "observed",
+      "seconds": 110.021,
+      "request_count": 31,
+      "missing_request_count": 0,
+      "unidentified_assistant_event_count": 0,
+      "identity_basis_counts": {
+        "request_id": 31
+      },
+      "source_count": 1,
+      "basis": "recorded_claude_code_api_duration",
+      "includes": "Claude Code-reported aggregate API request duration",
+      "excludes": "inter-request idle time, user waiting, and tool execution gaps",
+      "limitation": "Captured from Claude Code's final result; server-side inference duration is not reported."
+    },
+    "task_scope": "whole_thread",
+    "user_message_count": 1,
+    "message_uuids": [
+      "c8cbc50a-7b49-49d3-b395-c6b94749ffb9"
+    ],
+    "recorded_claude_result": {
+      "duration_api_ms": 110021,
+      "duration_ms": 110688,
+      "fast_mode_state": "off",
+      "is_error": false,
+      "modelUsage": {
+        "claude-haiku-4-5-20251001": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 0,
+          "canonicalModel": "claude-haiku-4-5",
+          "contextWindow": 200000,
+          "costUSD": 0.000851,
+          "inputTokens": 771,
+          "maxOutputTokens": 32000,
+          "outputTokens": 16,
+          "provider": "firstParty",
+          "webSearchRequests": 0
+        },
+        "claude-sonnet-5": {
+          "cacheCreationInputTokens": 14158,
+          "cacheReadInputTokens": 591202,
+          "canonicalModel": "claude-sonnet-5",
+          "contextWindow": 1000000,
+          "costUSD": 0.37607460000000004,
+          "inputTokens": 62,
+          "maxOutputTokens": 64000,
+          "outputTokens": 7572,
+          "provider": "firstParty",
+          "webSearchRequests": 0
+        }
+      },
+      "num_turns": 31,
+      "session_id": "4c7ed7ad-e18b-4686-b2db-2e136e7acb1c",
+      "stop_reason": "end_turn",
+      "subtype": "success",
+      "terminal_reason": "completed",
+      "total_cost_usd": 0.3769256,
+      "ttft_ms": 2011,
+      "type": "result",
+      "usage": {
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 14158,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "cache_creation_input_tokens": 14158,
+        "cache_read_input_tokens": 591202,
+        "inference_geo": "not_available",
+        "input_tokens": 62,
+        "iterations": [
+          {
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 749,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "cache_creation_input_tokens": 749,
+            "cache_read_input_tokens": 24656,
+            "input_tokens": 2,
+            "output_tokens": 120,
+            "type": "message"
+          }
+        ],
+        "output_tokens": 7572,
+        "server_tool_use": {
+          "web_fetch_requests": 0,
+          "web_search_requests": 0
+        },
+        "service_tier": "standard",
+        "speed": "standard"
+      }
+    }
+  },
+  "final_response": "Updated `@uri` in `src/builtin.c:645` to use RFC 3986's unreserved set (`ALPHA / DIGIT / \"-\" / \".\" / \"_\" / \"~\"`), dropping `!*'()` which are no longer unreserved. Updated `tests/jq.test` accordingly and added a new test case covering the previously-unreserved characters."
+}

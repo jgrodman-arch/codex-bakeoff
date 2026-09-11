@@ -47,12 +47,12 @@ class HistoricalFileSelectionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_oversized_inventory_reports_dirty_file_limit(self) -> None:
+    def test_oversized_inventory_explains_how_to_reduce_workspace(self) -> None:
         with (
             mock.patch.object(selection, "MAX_CANDIDATE_FILES", 2),
             self.assertRaisesRegex(
                 selection.FileSelectionError,
-                "More than 2 dirty files were found",
+                "more than 2 files to review.*Choose a smaller project directory",
             ),
         ):
             selection._bounded([{}, {}, {}])
@@ -409,6 +409,39 @@ class HistoricalFileSelectionTests(unittest.TestCase):
         self.assertFalse(unconfirmed["empty_starting_directory_confirmed"])
         self.assertTrue(confirmed["complete"])
         self.assertTrue(confirmed["empty_starting_directory_confirmed"])
+
+    def test_non_git_inventory_skips_nested_git_repositories(self) -> None:
+        directory = self.root / "directory"
+        directory.mkdir()
+        (directory / "root.txt").write_text("root\n", encoding="utf-8")
+        ordinary = directory / "ordinary"
+        ordinary.mkdir()
+        (ordinary / "nested.txt").write_text("nested\n", encoding="utf-8")
+        repository = directory / "unrelated-repository"
+        _repository(repository)
+        for index in range(3):
+            (repository / f"unrelated-{index}.txt").write_text("unrelated\n", encoding="utf-8")
+
+        with mock.patch.object(selection, "MAX_CANDIDATE_FILES", 2):
+            entries = selection.inspect_directory(directory)
+
+        self.assertEqual(
+            [entry["path"] for entry in entries],
+            ["ordinary/nested.txt", "root.txt"],
+        )
+
+    def test_non_git_inventory_skips_nested_git_worktrees(self) -> None:
+        directory = self.root / "directory"
+        directory.mkdir()
+        (directory / "root.txt").write_text("root\n", encoding="utf-8")
+        worktree = directory / "unrelated-worktree"
+        worktree.mkdir()
+        (worktree / ".git").write_text("gitdir: /tmp/worktree\n", encoding="utf-8")
+        (worktree / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+
+        entries = selection.inspect_directory(directory)
+
+        self.assertEqual([entry["path"] for entry in entries], ["root.txt"])
 
     def test_git_repository_without_commits_can_use_directory_classification(
         self,

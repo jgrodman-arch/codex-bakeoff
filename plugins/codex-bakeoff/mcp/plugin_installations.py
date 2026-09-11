@@ -8,6 +8,17 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
+REQUIRED_MCP_FILES = (
+    "server.py",
+    "controller.html",
+    "controller.css",
+    "controller-ranges.js",
+    "replay_configuration.py",
+    "replay_batch.py",
+    "controller_constants.py",
+    "final_results_receipt.py",
+)
+
 
 def semantic_version(
     value: str | None,
@@ -108,8 +119,7 @@ def latest_enabled_plugin_root(current_root: Path, plugin_name: str, current_ver
             if (
                 version is None
                 or version <= selected_version
-                or not (candidate / "mcp" / "server.py").is_file()
-                or not (candidate / "mcp" / "controller.html").is_file()
+                or any(not (candidate / "mcp" / name).is_file() for name in REQUIRED_MCP_FILES)
             ):
                 continue
             selected_root = candidate.resolve()

@@ -1,6 +1,6 @@
 {
   "name": "codex-bakeoff",
-  "version": "1.0.74",
+  "version": "1.0.130",
   "description": "Run independent Codex replays in the in-app browser or your system browser.",
   "author": {
     "name": "OpenAI",
@@ -15,11 +15,10 @@
     "evaluation"
   ],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Codex Bakeoff",
     "shortDescription": "Run independent replays in the in-app or system browser.",
-    "longDescription": "Start an independent Codex Bakeoff controller on an available loopback port in the Codex in-app browser, or in your system browser when using Codex CLI. Select one imported historical Claude thread, choose one or more available Codex models, define the beginning and end states, approve their parallel isolated implementations, follow live progress, and review each blinded comparison. Available GPT-5.6 Sol, Terra, and Luna models are selected by default. Multiple replay sessions can run in parallel. Selection, execution, verification, evaluation, and results stay in the browser controller instead of a guided chat workflow.",
+    "longDescription": "Start an independent Codex Bakeoff controller on an available loopback port. In both Codex Desktop and Codex CLI, prefer an available Codex in-app browser and otherwise use your system browser. Select one or more historical Claude threads, choose shared Codex models, and start their isolated implementations. Historical state and configuration are detected separately for each thread, with details available when needed. View finished comparisons individually or in aggregate while remaining threads continue. Available GPT-5.6 Sol, Terra, and Luna models are selected by default. Multiple replay sessions can run in parallel. Selection, execution, verification, evaluation, and results stay in the browser controller instead of a guided chat workflow.",
     "developerName": "OpenAI",
     "category": "Productivity",
     "websiteURL": "https://github.com/jgrodman-arch/codex-bakeoff",
@@ -36,5 +35,6 @@
       "Open a new Codex Bakeoff session so I can select and run a historical replay.",
       "Open Codex Bakeoff so I can review my replay runs."
     ]
-  }
+  },
+  "mcpServers": "./.mcp.json"
 }

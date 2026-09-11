@@ -17,12 +17,63 @@ const pluginRoot = path.resolve(workerRoot, "..");
 const builtWorkerPath = path.join(pluginRoot, "mcp", "codex-worker.mjs");
 const temporaryRoots = [];
 
+test("captures a real filesystem error with its native code and launch stage", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "codex-bakeoff-error-"));
+  temporaryRoots.push(root);
+  let original;
+  try {
+    await readFile(path.join(root, "missing-file"));
+  } catch (error) {
+    original = error;
+  }
+  assert.equal(original.code, "ENOENT");
+  const request = normalizeRunRequest({
+    type: "run", id: "native-error", model: "gpt-5.6-sol", prompt: "synthetic",
+    workingDirectory: root, sandboxMode: "read-only", networkAccessEnabled: false
+  });
+  await assert.rejects(executeRunRequest(request, {
+    codexFactory: () => { throw original; }
+  }), (error) => {
+    assert.equal(error.systemCode, "ENOENT");
+    assert.equal(error.diagnostic, undefined);
+    assert.equal(error.stage, "launch");
+    assert.ok(error.elapsedMs >= 0);
+    return true;
+  });
+});
+
 test.after(async () => {
   await Promise.all(
     temporaryRoots.map(async (root) => {
       await rm(root, { recursive: true, force: true });
     })
   );
+});
+
+test("retains bounded redacted SDK exception context and the underlying cause", async () => {
+  const diagnostics = [];
+  const cause = new Error("Operation not permitted: access_token=private-token-value");
+  cause.code = "EPERM";
+  const original = new Error(`SDK startup failed: Bearer private-bearer-value\n${"warning ".repeat(2_000)}`, { cause });
+  const request = normalizeRunRequest({
+    type: "run", id: "sdk-exception", model: "gpt-5.6-sol", prompt: "synthetic",
+    workingDirectory: "/private/fixture", sandboxMode: "read-only", networkAccessEnabled: false
+  });
+  await assert.rejects(executeRunRequest(request, {
+    diagnostic: (message) => diagnostics.push(message),
+    codexFactory: () => { throw original; }
+  }), (error) => {
+    assert.equal(error.code, "worker_failed");
+    assert.equal(error.systemCode, "EPERM");
+    assert.equal(error.stage, "launch");
+    assert.equal(error.retryable, false);
+    assert.equal(error.message, "Operation not permitted: access_token=[REDACTED]");
+    return true;
+  });
+  assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0], /SDK startup failed: Bearer \[REDACTED\]/);
+  assert.ok(diagnostics[0].length <= 8_000 + "Codex worker exception: ".length);
+  assert.doesNotMatch(diagnostics[0], /private-token-value|private-bearer-value/);
 });
 
 test("probes Codex candidates in configured, PATH, and app-bundle order", async () => {
@@ -317,6 +368,157 @@ test("extracts actionable provider errors from JSON stream events", async () => 
   );
 });
 
+test("retries structured transient and ambiguous SDK stream errors", async () => {
+  const request = normalizeRunRequest({
+    type: "run",
+    id: "retryable-stream-errors",
+    model: "gpt-5.6-sol",
+    prompt: "private prompt",
+    workingDirectory: "/private/fixture",
+    timeoutMs: 30_000,
+    sandboxMode: "read-only",
+    networkAccessEnabled: false
+  });
+  const messages = [
+    JSON.stringify({
+      type: "error",
+      status: 503,
+      error: {
+        type: "error",
+        message: "invalid request while upstream auth service is unavailable"
+      }
+    }),
+    "The stream stopped before the final event."
+  ];
+
+  for (const message of messages) {
+    await assert.rejects(
+      executeRunRequest(request, {
+        codexFactory: () => ({
+          startThread() {
+            return {
+              async runStreamed() {
+                return {
+                  events: (async function* () {
+                    yield { type: "error", message };
+                  })()
+                };
+              }
+            };
+          }
+        })
+      }),
+      (error) => error.code === "stream_error" && error.retryable === true
+    );
+  }
+});
+
+test("retries interrupted SDK iterators and streams that end before completion", async () => {
+  const request = normalizeRunRequest({
+    type: "run",
+    id: "interrupted-streams",
+    model: "gpt-5.6-sol",
+    prompt: "private prompt",
+    workingDirectory: "/private/fixture",
+    timeoutMs: 30_000,
+    sandboxMode: "read-only",
+    networkAccessEnabled: false
+  });
+  const eventStreams = [
+    (async function* () {
+      yield { type: "turn.started" };
+      throw new Error("socket hang up");
+    })(),
+    (async function* () {
+      yield { type: "turn.started" };
+    })()
+  ];
+
+  for (const events of eventStreams) {
+    await assert.rejects(
+      executeRunRequest(request, {
+        codexFactory: () => ({
+          startThread() {
+            return {
+              async runStreamed() {
+                return { events };
+              }
+            };
+          }
+        })
+      }),
+      (error) => error.retryable === true
+    );
+  }
+});
+
+test("does not retry permanent SDK iterator failures", async () => {
+  const request = normalizeRunRequest({
+    type: "run",
+    id: "permanent-iterator-error",
+    model: "gpt-5.6-sol",
+    prompt: "private prompt",
+    workingDirectory: "/private/fixture",
+    timeoutMs: 30_000,
+    sandboxMode: "read-only",
+    networkAccessEnabled: false
+  });
+
+  await assert.rejects(
+    executeRunRequest(request, {
+      codexFactory: () => ({
+        startThread() {
+          return {
+            async runStreamed() {
+              return {
+                events: (async function* () {
+                  throw new Error("Authentication failed because the API key is invalid.");
+                })()
+              };
+            }
+          };
+        }
+      })
+    }),
+    (error) => error.code === "worker_failed" && error.retryable === false
+  );
+});
+
+test("does not retry explicit permanent plain-text stream errors", async () => {
+  const request = normalizeRunRequest({
+    type: "run",
+    id: "permanent-stream-error",
+    model: "gpt-5.6-sol",
+    prompt: "private prompt",
+    workingDirectory: "/private/fixture",
+    timeoutMs: 30_000,
+    sandboxMode: "read-only",
+    networkAccessEnabled: false
+  });
+
+  await assert.rejects(
+    executeRunRequest(request, {
+      codexFactory: () => ({
+        startThread() {
+          return {
+            async runStreamed() {
+              return {
+                events: (async function* () {
+                  yield {
+                    type: "error",
+                    message: "Authentication failed because the API key is invalid."
+                  };
+                })()
+              };
+            }
+          };
+        }
+      })
+    }),
+    (error) => error.code === "stream_error" && error.retryable === false
+  );
+});
+
 test("preserves actionable SDK turn failures while redacting bearer tokens", async () => {
   const request = normalizeRunRequest({
     type: "run",
@@ -397,6 +599,37 @@ test("returns actionable SDK stream errors through the worker protocol", async (
   assert.equal(failure.retryable, true);
   assert.equal(failure.message, "connection reset: fixture provider detail");
   assert.match(await stderr, /Codex stream error: connection reset: fixture provider detail/);
+});
+
+test("reports CLI startup failures through the packaged worker without losing stderr", async () => {
+  const fixture = await fakeCodexFixture();
+  const child = spawn(process.execPath, [builtWorkerPath], {
+    env: { ...process.env, CODEX_CLI_PATH: fixture.executablePath },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const stdout = collectLines(child.stdout);
+  const stderr = collectText(child.stderr);
+  child.stdin.end(`${JSON.stringify({
+    type: "run", id: "cli-startup-error", model: "gpt-5.6-sol", prompt: "CLI_STARTUP_ERROR",
+    workingDirectory: fixture.root, sandboxMode: "workspace-write", networkAccessEnabled: false
+  })}\n`);
+
+  const [code, signal] = await once(child, "exit");
+  assert.equal(code, 1);
+  assert.equal(signal, null);
+  const messages = await stdout;
+  const failure = messages.at(-1);
+  assert.equal(failure.type, "failed");
+  assert.equal(failure.code, "worker_failed");
+  assert.equal(failure.stage, "stream");
+  assert.equal(failure.retryable, false);
+  assert.equal(failure.message, "Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)");
+  assert.equal(messages.some((event) => event.phase === "thread_started"), false);
+  const details = await stderr;
+  assert.match(details, /Codex Exec exited with code 1/);
+  assert.match(details, /startup warning: api_key=\[REDACTED\]/);
+  assert.match(details, /failed to initialize in-process app-server client/);
+  assert.doesNotMatch(JSON.stringify(messages) + details, /fixture-private-api-key/);
 });
 
 test("built JSONL worker executes one SDK run and returns the observed result", async () => {
@@ -559,6 +792,7 @@ async function fakeCodexFixture() {
       "if (process.env.FAKE_CODEX_ARGS_FILE) writeFileSync(process.env.FAKE_CODEX_ARGS_FILE, JSON.stringify(process.argv.slice(2)));",
       "let prompt = '';",
       "for await (const chunk of process.stdin) prompt += chunk;",
+      "if (prompt.includes('CLI_STARTUP_ERROR')) { console.error('startup warning: api_key=fixture-private-api-key ' + 'warning '.repeat(200)); console.error('Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)'); process.exit(1); }",
       `if (prompt.includes('HANG')) {`,
       `  const grandchild = spawn(${JSON.stringify(grandchildPath)}, [], { stdio: ['ignore', 'pipe', 'ignore'] });`,
       "  await new Promise((resolve, reject) => { grandchild.stdout.once('data', resolve); grandchild.once('error', reject); });",

@@ -834,6 +834,11 @@ def _pack_recording(recording: Path, package_root: Path) -> dict[str, Any]:
             "original_repository_path_marker": REPOSITORY_PATH_MARKER,
         }
     )
+    if str(SCRIPT_ROOT) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_ROOT))
+    from precompute_sample_configurations import precompute
+
+    precompute(entry, package_root)
     return entry
 
 

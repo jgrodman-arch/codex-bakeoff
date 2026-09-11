@@ -1,0 +1,209 @@
+{
+  "version": 1,
+  "metadata_sha256": "0ac56abd65eb3d1ba55663169910ad89ff62de6f74cad5dc99f8620aa18ec2c2",
+  "working_directory": ".",
+  "beginning_state": {
+    "kind": "git",
+    "commit": "f88c4e5888d6d125695444d044df4bb55ad75888"
+  },
+  "ending_state": {
+    "kind": "git_patch",
+    "patch_path": "records/jqlang__jq-2157--claude-fable-5/patch.diff"
+  },
+  "attributed_files": [
+    "src/builtin.c",
+    "tests/jq.test"
+  ],
+  "capability_requirements": {
+    "observed_tools": [
+      "Bash",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Read",
+      "Write"
+    ],
+    "observed_skills": [],
+    "observed_skill_provenance": [],
+    "observed_plugins": [],
+    "task_mutated_claude_skills": [],
+    "observed_instruction_paths": [],
+    "connector_names": [],
+    "configured_connector_names": []
+  },
+  "artifact_sha256": {
+    "records/jqlang__jq-2157--claude-fable-5/transcript.000.jsonl": "6acdaaac6152fc4161e6a41b61a2536071cf78654c84e0a7eec8a5d96eca4317",
+    "records/jqlang__jq-2157--claude-fable-5/transcript.001.jsonl": "e272da8ba546363507f6436c7363ea919e3e0fb3c9a01013579673527e983646",
+    "records/jqlang__jq-2157--claude-fable-5/patch.diff": "caf963ec5d0174af831634fbfbdce2c64d4c32544a41e3896987b351a034b438",
+    "records/jqlang__jq-2157--claude-fable-5/result.json": "a5fe806fcbb955c04154e648b51bcd4ab9bc8c3070d9572116dc6eb7b7819da8"
+  },
+  "replay": {
+    "message_uuid": "a2e72224-d16b-4f56-92f5-08639aee876e",
+    "task_timestamp": "2026-08-11T22:27:35.874000Z",
+    "preceding_context": [],
+    "claude_model": "claude-fable-5",
+    "historical_usage": {
+      "input_tokens": 100,
+      "output_tokens": 12795,
+      "cache_read_input_tokens": 854000,
+      "cache_creation_input_tokens": 23747,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 23747
+      },
+      "cache_write_5m_tokens": 0,
+      "cache_write_1h_tokens": 23747,
+      "cached_input_tokens": 854000,
+      "cache_write_input_tokens": 23747,
+      "provider_message_count": 50,
+      "fallback_message_count": 0,
+      "provider_message_ids": [
+        "msg_011CdwkPkrjcbHaHVbvgFHft",
+        "msg_011CdwkQArciRBPdpbUz2ZK3",
+        "msg_011CdwkQRyhr3p39Nq582HZ6",
+        "msg_011CdwkQjqF1Jrz1Pf9WsZY4",
+        "msg_011CdwkR5QixLtLfsXD7m2Qg",
+        "msg_011CdwkRYoW5tZ1NAQdYsm4g",
+        "msg_011CdwkRxaVC1oUPUJmRdajH",
+        "msg_011CdwkSNzvC18n2jqESTrbE",
+        "msg_011CdwkSuWDdpiAsqjAEEqfJ",
+        "msg_011CdwkTUMuTHLgRySfpLwyg",
+        "msg_011CdwkTrGXwLZP3rAE9MhNB",
+        "msg_011CdwkUAe5cC1rHjc2QeRvo",
+        "msg_011CdwkUXs2Mz5Y93oDbQpPg",
+        "msg_011CdwkUtbx9T6QzhwDXesbu",
+        "msg_011CdwkVBJnvA1t8KAB7Ams3",
+        "msg_011CdwkVbXKmgMqkFikG5m1G",
+        "msg_011CdwkW1ftGbJVCApUoCM8W",
+        "msg_011CdwkWR3K33eGsfuEbdeoc",
+        "msg_011CdwkWsfD3BEU7Z11wAqja",
+        "msg_011CdwkX9XSKTSrAxVCfWagR",
+        "msg_011CdwkXQcYSuiQamQ792pE2",
+        "msg_011CdwkXfy2AaAynT78F41b6",
+        "msg_011CdwkY4kETBu5wa8M3k95C",
+        "msg_011CdwkYYmD3YMYz9y3jcHsL",
+        "msg_011CdwkZ3Kge28Qo4iF4gfCH",
+        "msg_011CdwkZJevNi3nULkBhnsCu",
+        "msg_011CdwkZaHmNCfoW8mKjcQFb",
+        "msg_011CdwkaGh8STWMFvt9tALQX",
+        "msg_011CdwkapK9eRCfDstxwuZGm",
+        "msg_011CdwkbTRaLAvccpMGSb3rK",
+        "msg_011Cdwkbmbxo2izynB77DLRN",
+        "msg_011Cdwkc5i8q4XF3oa97i6tD",
+        "msg_011CdwkcqpFH66dP21wGPhXZ",
+        "msg_011CdwkdBPUSRmm4wAJJfQBK",
+        "msg_011CdwkdZdgxSjrnBFESHhyR",
+        "msg_011CdwkdrTiiKQA215fWyCSS",
+        "msg_011CdwkfXS3JbxoDU5UrK9eM",
+        "msg_011Cdwkfu7Goaw9b55XXLfXz",
+        "msg_011CdwkgDng1eoU6t86U3TJb",
+        "msg_011CdwkgijTyr2zyLmLXnDeC",
+        "msg_011CdwkhRUusEEU69ZuEButK",
+        "msg_011Cdwki2Ex8ftN6BJ8ASK4t",
+        "msg_011Cdwkicp5HCMJ1CCEAtRGM",
+        "msg_011Cdwkj8fgRFHYaCbjtt2X4",
+        "msg_011CdwkjfPNs4fCATDPthCfN",
+        "msg_011CdwkkHdiPU791YXeKH1rD",
+        "msg_011Cdwkm6dT8W2FYXUDcNzAS",
+        "msg_011CdwkmZeAEEFa2mVHPMDLB",
+        "msg_011CdwknY6uqcLtUbNFXLGaX",
+        "msg_011CdwknpRS9M1zAwkTJHZVd"
+      ],
+      "deduplication": "provider_message_id; request_id or event_uuid only when provider ID is unavailable"
+    },
+    "historical_elapsed_seconds": 327.332,
+    "historical_wall_clock_seconds": 327.332,
+    "historical_model_request_seconds": 323.598,
+    "historical_model_request_timing": {
+      "status": "observed",
+      "seconds": 323.598,
+      "request_count": 50,
+      "missing_request_count": 0,
+      "unidentified_assistant_event_count": 0,
+      "identity_basis_counts": {
+        "request_id": 50
+      },
+      "source_count": 1,
+      "basis": "recorded_claude_code_api_duration",
+      "includes": "Claude Code-reported aggregate API request duration",
+      "excludes": "inter-request idle time, user waiting, and tool execution gaps",
+      "limitation": "Captured from Claude Code's final result; server-side inference duration is not reported."
+    },
+    "task_scope": "whole_thread",
+    "user_message_count": 1,
+    "message_uuids": [
+      "a2e72224-d16b-4f56-92f5-08639aee876e"
+    ],
+    "recorded_claude_result": {
+      "duration_api_ms": 323598,
+      "duration_ms": 327332,
+      "fast_mode_state": "off",
+      "is_error": false,
+      "modelUsage": {
+        "claude-fable-5": {
+          "cacheCreationInputTokens": 23747,
+          "cacheReadInputTokens": 854000,
+          "canonicalModel": "claude-fable-5",
+          "contextWindow": 1000000,
+          "costUSD": 1.96969,
+          "inputTokens": 100,
+          "maxOutputTokens": 64000,
+          "outputTokens": 12795,
+          "provider": "firstParty",
+          "webSearchRequests": 0
+        },
+        "claude-haiku-4-5-20251001": {
+          "cacheCreationInputTokens": 0,
+          "cacheReadInputTokens": 0,
+          "canonicalModel": "claude-haiku-4-5",
+          "contextWindow": 200000,
+          "costUSD": 0.000856,
+          "inputTokens": 771,
+          "maxOutputTokens": 32000,
+          "outputTokens": 17,
+          "provider": "firstParty",
+          "webSearchRequests": 0
+        }
+      },
+      "num_turns": 51,
+      "session_id": "61eec016-e315-4c68-bbcc-949c3d7553e2",
+      "stop_reason": "end_turn",
+      "subtype": "success",
+      "terminal_reason": "completed",
+      "total_cost_usd": 1.970546,
+      "ttft_ms": 5120,
+      "type": "result",
+      "usage": {
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 23747,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "cache_creation_input_tokens": 23747,
+        "cache_read_input_tokens": 854000,
+        "inference_geo": "not_available",
+        "input_tokens": 100,
+        "iterations": [
+          {
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 805,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "cache_creation_input_tokens": 805,
+            "cache_read_input_tokens": 27406,
+            "input_tokens": 2,
+            "output_tokens": 571,
+            "type": "message"
+          }
+        ],
+        "output_tokens": 12795,
+        "server_tool_use": {
+          "web_fetch_requests": 0,
+          "web_search_requests": 0
+        },
+        "service_tier": "standard",
+        "speed": "standard"
+      }
+    }
+  },
+  "final_response": "Done. `@uri` now follows RFC 3986: the unreserved set in `f_format` (src/builtin.c:645) is reduced from RFC 2396's `ALPHA DIGIT -_.!~*'()` to RFC 3986's `ALPHA DIGIT -_.~`, so `!`, `*`, `'`, `(`, and `)` are now percent-encoded as `%21`, `%2A`, `%27`, `%28`, `%29`.\n\nTest updates in tests/jq.test:\n- The combined format test's `@uri` expectation changed from `\"%3C%3E%26'%22%09\"` to `\"%3C%3E%26%27%22%09\"`, since the apostrophe is now encoded.\n- Added a regression test for #1506 that runs `@uri` over all alphanumerics plus `-_.~!*'()` and expects only the last five characters to be encoded.\n\nOne caveat on verification: I confirmed src/builtin.c compiles cleanly with the change (using `cc` directly with stub generated headers), but I could not run the built binary or the test suite — every command requiring approval in this session was denied, and executing compiled binaries falls in that category. The change is a one-line constant edit and the updated test expectations were derived directly from the RFC 3986 unreserved set, but you'll want `make check` in CI (or locally) to confirm.\n\nThe manual's description of `@uri` (\"maps all reserved URI characters to a %XX sequence\") remains accurate, and no manual examples or man.test entries reference the previously-unescaped characters, so no doc changes were needed."
+}

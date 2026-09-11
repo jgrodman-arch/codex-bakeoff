@@ -156,7 +156,16 @@ class ClaudeCodeSampleLoaderTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
+    def precompute(self, entry: dict) -> None:
+        sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+        from precompute_sample_configurations import precompute
+
+        precompute(entry, self.assets)
+
     def write_index(self, samples: list[dict]) -> None:
+        for sample in samples:
+            if "configuration_path" not in sample:
+                self.precompute(sample)
         self.index.write_text(
             json.dumps({"schema_version": 1, "samples": samples}),
             encoding="utf-8",
@@ -184,7 +193,9 @@ class ClaudeCodeSampleLoaderTests(unittest.TestCase):
 
     def test_original_prompt_whitespace_is_preserved_exactly(self) -> None:
         exact_prompt = "Fix argument parsing.\r\n"
-        self.write_index([{**self.sample, "prompt": exact_prompt}])
+        self.sample["prompt"] = exact_prompt
+        self.precompute(self.sample)
+        self.write_index([self.sample])
 
         (sample,) = loader.load_samples(self.index)
 
@@ -270,71 +281,51 @@ class ClaudeCodeSampleLoaderTests(unittest.TestCase):
         self.assertEqual(record["recorded_claude_result"]["total_cost_usd"], 0.027)
         self.assertIn("modelUsage", record["recorded_claude_result"])
 
-        replay_result = subprocess.run(
-            [
-                sys.executable,
-                str(PLUGIN_ROOT / "scripts" / "historical_bakeoff.py"),
-                "replay",
-                "--imported-thread-id",
-                record["imported_thread_id"],
-                "--ledger",
-                str(loader.ledger_path(controller)),
-                "--json",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        replay = json.loads(replay_result.stdout)["replay"]
+        with mock.patch.object(
+            loader, "_repository_url", side_effect=AssertionError("unexpected fetch")
+        ):
+            resolved = loader.resolve_sample(
+                record["imported_thread_id"], controller, index_path=self.index
+            )
+            repeated = loader.materialize_sample(
+                self.sample["id"], controller, index_path=self.index
+            )
+        replay = resolved["replay"]
         self.assertEqual(replay["claude_model"], "claude-sonnet-5")
         self.assertEqual(replay["historical_model_request_seconds"], 9.1)
         self.assertEqual(replay["historical_wall_clock_seconds"], 12.3)
         self.assertEqual(replay["historical_usage"]["input_tokens"], 14)
         self.assertEqual(replay["historical_usage"]["output_tokens"], 32)
-        self.assertEqual(replay["recorded_claude_result"]["total_cost_usd"], 0.027)
         self.assertEqual(replay["historical_changed_files"], [str(repository / "program.txt")])
-
-        baseline_result = subprocess.run(
-            [
-                sys.executable,
-                str(PLUGIN_ROOT / "scripts" / "historical_bakeoff.py"),
-                "baseline",
-                "--imported-thread-id",
-                record["imported_thread_id"],
-                "--repo",
-                str(repository),
-                "--beginning-kind",
-                "git",
-                "--ending-kind",
-                "git",
-                "--baseline-commit",
-                materialized["baseline_commit"],
-                "--ending-commit",
-                materialized["ending_commit"],
-                "--ledger",
-                str(loader.ledger_path(controller)),
-                "--json",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        baseline = json.loads(baseline_result.stdout)
-        self.assertEqual(baseline["repository_blocking_reasons"], [])
-        self.assertEqual(baseline["baseline"]["commit"], materialized["baseline_commit"])
-        self.assertEqual(baseline["baseline"]["ending_commit"], materialized["ending_commit"])
-
-        with mock.patch.object(loader, "_run_git") as git:
-            repeated = loader.materialize_sample(
-                self.sample["id"], controller, index_path=self.index
-            )
-        git.assert_not_called()
+        self.assertEqual(resolved["baseline"]["ending_commit"], materialized["ending_commit"])
+        self.assertEqual(resolved["recovery"]["diff"], self.patch)
         self.assertEqual(repeated, materialized)
+
+    def test_recorded_rename_is_packaged_and_materialized(self) -> None:
+        self.git("-C", str(self.upstream), "mv", "program.txt", "renamed program.txt")
+        patch = self.git("-C", str(self.upstream), "diff", "--binary", "HEAD") + "\n"
+        self.assertIn("rename from program.txt", patch)
+        (self.records / "patch.diff").write_text(patch, encoding="utf-8")
+        self.precompute(self.sample)
+        self.write_index([self.sample])
+
+        with mock.patch.object(loader, "_repository_url", return_value=str(self.upstream)):
+            resolved = loader.resolve_sample(
+                "claude-sample:" + self.sample["id"],
+                self.root / "rename-controller",
+                index_path=self.index,
+            )
+
+        self.assertEqual(resolved["file_selection"]["attributed_files"], ["renamed program.txt"])
+        self.assertEqual(resolved["recovery"]["diff"], patch)
+        repository = Path(resolved["baseline"]["repository"])
+        self.assertFalse((repository / "program.txt").exists())
+        self.assertEqual((repository / "renamed program.txt").read_text(), "before\n")
 
     def test_empty_recorded_patch_remains_an_honest_empty_child_commit(self) -> None:
         (self.records / "patch.diff").write_text("", encoding="utf-8")
+        self.precompute(self.sample)
+        self.write_index([self.sample])
         with mock.patch.object(loader, "_repository_url", return_value=str(self.upstream)):
             materialized = loader.materialize_sample(
                 self.sample["id"],
@@ -366,6 +357,108 @@ class ClaudeCodeSampleLoaderTests(unittest.TestCase):
 
         self.write_index([self.sample, dict(self.sample)])
         with self.assertRaisesRegex(loader.SampleError, "repeats an identifier"):
+            loader.load_samples(self.index)
+
+    def test_minimal_prepare_resolves_recorded_ending_without_inspection_or_discovery(self) -> None:
+        sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+        import claude_code_sample_loader as engine_loader
+        import historical_bakeoff as engine
+
+        server = load_server()
+        controller = self.root / "controller"
+        thread_id = "claude-sample:" + self.sample["id"]
+
+        def dispatch(command, arguments=(), **kwargs):
+            parsed = (
+                engine.build_parser().parse_args(
+                    [
+                        command,
+                        *arguments,
+                        "--sample-controller-root",
+                        str(controller),
+                    ]
+                )
+                if command != "models"
+                else engine.build_parser().parse_args([command])
+            )
+            return engine.dispatch(parsed)
+
+        with (
+            mock.patch.object(engine_loader, "SAMPLE_INDEX", self.index),
+            mock.patch.object(engine_loader, "_repository_url", return_value=str(self.upstream)),
+            mock.patch.object(server, "_claude_code_sample_loader", return_value=engine_loader),
+            mock.patch.object(server, "CONTROLLER_INSTANCE_ROOT", controller),
+            mock.patch.object(server, "RUN_ROOT", self.root / "runs"),
+            mock.patch.object(server, "_engine", side_effect=dispatch),
+            mock.patch.object(server, "_run_worker", side_effect=AssertionError("setup LLM call")),
+            mock.patch.object(engine, "_selected_model", return_value="gpt-test"),
+            mock.patch.object(
+                engine, "discover_codex_models", return_value={"options": [{"id": "gpt-test"}]}
+            ),
+            mock.patch.object(
+                engine._discovery(), "build_thread_task", side_effect=AssertionError("rediscovery")
+            ),
+            mock.patch.object(
+                engine._discovery(),
+                "recover_historical_solution",
+                side_effect=AssertionError("rediscovery"),
+            ),
+            mock.patch.object(
+                engine._discovery(), "inspect_baseline", side_effect=AssertionError("rediscovery")
+            ),
+            mock.patch.object(
+                engine._discovery(), "inspect_capabilities", return_value={"items": []}
+            ) as capabilities,
+        ):
+            prepared = server._prepare_payload({"thread_id": thread_id, "model": "gpt-test"})
+            inspected = server._inspect_thread({"thread_id": thread_id})
+            self.assertTrue(prepared["ready"])
+            self.assertEqual(prepared["baseline"]["commit"], self.baseline)
+            self.assertNotEqual(prepared["baseline"]["ending_commit"], self.baseline)
+            self.assertEqual(
+                prepared["baseline"]["ending_commit"], inspected["baseline"]["ending_commit"]
+            )
+            self.assertEqual(inspected["replay"]["request_generation"]["method"], "packaged_sample")
+            self.assertEqual(
+                server._synthesize_request_payload({"thread_id": thread_id})["request"],
+                self.sample["prompt"],
+            )
+            self.assertEqual(
+                server._working_directory_payload({"thread_id": thread_id})["source"],
+                "packaged_sample",
+            )
+            capabilities.assert_called()
+            self.assertEqual(capabilities.call_args.args[0]["observed_tools"], ["Edit"])
+            with self.assertRaisesRegex(server.ControllerError, "cannot be changed"):
+                server._resolved_sample({"thread_id": thread_id, "ending_commit": self.baseline})
+            context = engine._prepare_context(
+                engine.build_parser().parse_args(
+                    [
+                        "prepare",
+                        "--imported-thread-id",
+                        thread_id,
+                        "--sample-controller-root",
+                        str(controller),
+                        "--model",
+                        "gpt-test",
+                    ]
+                )
+            )
+            self.assertEqual(context["historical_candidate"]["candidate"]["diff"], self.patch)
+
+    def test_artifact_and_cached_ending_tampering_are_rejected(self) -> None:
+        controller = self.root / "controller"
+        with mock.patch.object(loader, "_repository_url", return_value=str(self.upstream)):
+            materialized = loader.materialize_sample(
+                self.sample["id"], controller, index_path=self.index
+            )
+        manifest = Path(materialized["repository_path"]).parent / "materialization.json"
+        materialized["ending_commit"] = self.baseline
+        manifest.write_text(json.dumps(materialized))
+        with self.assertRaisesRegex(loader.SampleError, "ending state changed"):
+            loader.materialize_sample(self.sample["id"], controller, index_path=self.index)
+        (self.records / "patch.diff").write_text(self.patch + "\n")
+        with self.assertRaisesRegex(loader.SampleError, "artifact integrity"):
             loader.load_samples(self.index)
 
 
@@ -478,9 +571,11 @@ class RecordedClaudeSampleControllerTests(unittest.TestCase):
 
     def test_thread_picker_separates_imported_and_sample_data(self) -> None:
         controller = (PLUGIN_ROOT / "mcp" / "controller.html").read_text(encoding="utf-8")
-        thread_picker = controller.split("function renderThreadStep", 1)[1].split(
-            "function capabilityRows", 1
-        )[0]
+        thread_picker = (
+            (PLUGIN_ROOT / "mcp" / "controller-ranges.js")
+            .read_text(encoding="utf-8")
+            .split("function renderThreadStep", 1)[1]
+        )
 
         self.assertIn('"Imported threads"', thread_picker)
         self.assertIn('"Sample data"', thread_picker)
@@ -512,95 +607,10 @@ class RecordedClaudeSampleControllerTests(unittest.TestCase):
                 )
 
             command = process.call_args.args[0]
-            self.assertIn("--ledger", command)
-            self.assertEqual(command[command.index("--ledger") + 1], str(private_ledger))
-
-    def test_recorded_sample_inspection_materializes_exact_upstream_baseline_on_demand(
-        self,
-    ) -> None:
-        server = load_server()
-        sample_loader = server._claude_code_sample_loader()
-        baseline = "a" * 40
-        ending = "b" * 40
-        original_prompt = "Fix argument parsing.\r\n"
-        with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
-            repository.mkdir()
-            materialized = {
-                "repository_path": str(repository),
-                "baseline_commit": baseline,
-                "ending_commit": ending,
-            }
-
-            def fake_engine(command: str, arguments=()):
-                if command == "replay":
-                    return {
-                        "replay": {
-                            "imported_thread_id": "claude-sample:jq-2919--claude-opus-5",
-                            "claude_model": "claude-opus-5",
-                            "request": original_prompt,
-                            "prompt_reconstruction_turns": [
-                                {"role": "user", "text": original_prompt}
-                            ],
-                            "project_dir": str(repository),
-                        }
-                    }
-                if command == "baseline":
-                    return {
-                        "baseline": {
-                            "commit": baseline,
-                            "ending_commit": ending,
-                            "beginning_kind": "git",
-                            "ending_kind": "git",
-                        }
-                    }
-                if command == "models":
-                    return {"options": [{"id": "gpt-test"}]}
-                if command == "capabilities":
-                    return {"items": []}
-                raise AssertionError(command)
-
-            with (
-                mock.patch.object(
-                    sample_loader,
-                    "materialize_sample",
-                    return_value=materialized,
-                ) as materialize,
-                mock.patch.object(server, "_engine", side_effect=fake_engine) as engine,
-            ):
-                inspected = server._inspect_thread(
-                    {"thread_id": "claude-sample:jq-2919--claude-opus-5"}
-                )
-
-            materialize.assert_called_once_with(
-                "jq-2919--claude-opus-5",
-                server.CONTROLLER_INSTANCE_ROOT,
-            )
-            baseline_call = next(
-                call for call in engine.call_args_list if call.args[0] == "baseline"
-            )
+            self.assertIn("--sample-controller-root", command)
             self.assertEqual(
-                baseline_call.args[1],
-                [
-                    "--imported-thread-id",
-                    "claude-sample:jq-2919--claude-opus-5",
-                    "--repo",
-                    str(repository),
-                    "--beginning-kind",
-                    "git",
-                    "--ending-kind",
-                    "git",
-                    "--baseline-commit",
-                    baseline,
-                    "--ending-commit",
-                    ending,
-                ],
+                command[command.index("--sample-controller-root") + 1], str(controller)
             )
-
-        self.assertEqual(inspected["replay"]["claude_model"], "claude-opus-5")
-        self.assertEqual(inspected["replay"]["request"], original_prompt)
-        self.assertEqual(inspected["baseline"]["commit"], baseline)
-        self.assertEqual(inspected["baseline"]["ending_commit"], ending)
 
     def test_recorded_sample_rejects_traversal_before_materializing(self) -> None:
         server = load_server()
@@ -609,6 +619,34 @@ class RecordedClaudeSampleControllerTests(unittest.TestCase):
             with self.assertRaisesRegex(server.ControllerError, "identifier is invalid"):
                 server._inspect_thread({"thread_id": "claude-sample:../escape"})
         materialize.assert_not_called()
+
+    def test_ui_sample_selection_skips_inference_but_imported_selection_still_infers(self) -> None:
+        harness = r"""
+const source = require("node:fs").readFileSync(process.argv[1], "utf8");
+const selectSource = source.slice(source.indexOf("      async function selectThread("), source.indexOf("      async function refreshAttributionAndContinue("));
+async function exercise(id) {
+  const calls = [];
+  const state = {threads: [{id}], selectedModels: [], reviewRevision: 0, promptSynthesisGeneration: 0, workingDirectoryGeneration: 0};
+  const select = new Function("state", "callTool", "threadId", "text", "render", "normalizeModels", "setSelectedModels", "initializeClassifications", "reviewDraftFromConfiguration", "synthesizePrompt", "inferWorkingDirectory", "asArray", selectSource + "return selectThread;")(
+    state, async name => { calls.push(name); return {replay: {request: "task", request_generation: {method: "pending"}}}; },
+    thread => thread.id, value => value || "", () => {}, () => [], () => {}, () => {}, () => ({}),
+    () => calls.push("synthesize"), () => calls.push("infer"), value => Array.isArray(value) ? value : []);
+  await select(id, 1);
+  return {calls, loading: state.workingDirectoryLoading};
+}
+(async () => process.stdout.write(JSON.stringify([await exercise("claude-sample:test"), await exercise("imported-test") ])))();
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness, str(PLUGIN_ROOT / "mcp" / "controller.html")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        sample, imported = json.loads(completed.stdout)
+        self.assertEqual(sample, {"calls": ["inspect_thread"], "loading": False})
+        self.assertEqual(
+            imported, {"calls": ["inspect_thread", "synthesize", "infer"], "loading": True}
+        )
 
     def test_packaged_text_files_remain_below_monorepo_size_limit(self) -> None:
         suffixes = frozenset({".py", ".json", ".jsonl", ".html", ".md", ".mjs", ".diff"})

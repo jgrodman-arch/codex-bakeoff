@@ -22,6 +22,61 @@ sys.modules[SPEC.name] = execution
 SPEC.loader.exec_module(execution)
 
 
+OPENAI_PRICING_DOCUMENT = """# Pricing
+
+Prices per 1M tokens.
+
+### Standard pricing data
+
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-5.6-sol | $4.00 | $0.40 | $5.00 | $20.00 | $8.00 | $0.80 | $10.00 | $30.00 |
+| gpt-5.4 (<272K context length) | $2.50 | $0.25 | - | $15.00 | $5.00 | $0.50 | - | $22.50 |
+
+### Batch pricing data
+
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-5.6-sol | $2.00 | $0.20 | $2.50 | $10.00 | $4.00 | $0.40 | $5.00 | $15.00 |
+
+### Fast pricing data
+
+| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-5.6-sol | $8.00 | $0.80 | $10.00 | $40.00 | $16.00 | $1.60 | $20.00 | $60.00 |
+"""
+
+ANTHROPIC_PRICING_DOCUMENT = """# Pricing
+
+## Model pricing
+
+| Model | Base Input Tokens | 5m Cache Writes | 1h Cache Writes | Cache Hits & Refreshes | Output Tokens |
+| --- | --- | --- | --- | --- | --- |
+| Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
+| Claude Sonnet 4.6 | $3 / MTok | $3.75 / MTok | $6 / MTok | $0.30 / MTok | $15 / MTok |
+| Claude Haiku 4.5 | $1 / MTok | $1.25 / MTok | $2 / MTok | $0.10 / MTok | $5 / MTok |
+| Claude Haiku 3.5 ([retired](https://platform.claude.com/docs/en/about-claude/model-deprecations)) | $0.80 / MTok | $1 / MTok | $1.60 / MTok | $0.08 / MTok | $4 / MTok |
+
+## Feature-specific pricing
+
+### Fast mode pricing
+
+| Model | Input | Output |
+| --- | --- | --- |
+| Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |
+
+### Batch processing
+
+| Model | Batch input | Batch output |
+| --- | --- | --- |
+| Claude Opus 5 | $2.50 / MTok | $12.50 / MTok |
+
+### Long context pricing
+
+Claude 4.6 and later models include the full 1M token context window at standard pricing.
+"""
+
+
 class _ReviewerCandidate(TypedDict):
     checks: dict[str, int | None]
     explanations: NotRequired[dict[str, str]]
@@ -295,12 +350,64 @@ class LeanExecutionTests(unittest.TestCase):
                 self.assertEqual(result["missing_models"], [])
                 self.assertEqual(result["dynamic_models"], [])
 
+    def test_retired_claude_models_use_bundled_rates_when_live_table_omits_them(self) -> None:
+        dynamic = execution._parse_first_party_pricing("anthropic", ANTHROPIC_PRICING_DOCUMENT)
+        expected = {
+            "claude-3-7-sonnet-20250219": 0.45,
+            "claude-3-5-sonnet-20240620": 0.45,
+            "claude-3-5-sonnet-20241022": 0.45,
+            "claude-3-opus-20240229": 2.25,
+            "claude-3-sonnet-20240229": 0.45,
+            "claude-3-haiku-20240307": 0.0375,
+        }
+        for model, estimated_usd in expected.items():
+            with self.subTest(model=model):
+                usage = execution.UsageRecord(
+                    provider="anthropic",
+                    model=model,
+                    input_tokens=100_000,
+                    output_tokens=10_000,
+                )
+                with mock.patch.object(execution, "_fetch_dynamic_pricing", return_value=dynamic):
+                    result = execution.estimate_api_equivalent_cost((usage,))
+
+                self.assertEqual(result["usd"], estimated_usd)
+                self.assertEqual(result["missing_models"], [])
+                self.assertEqual(result["dynamic_models"], [])
+
+    def test_retired_claude_cache_pricing_preserves_unclassified_and_ttl_writes(self) -> None:
+        dynamic = execution._parse_first_party_pricing("anthropic", ANTHROPIC_PRICING_DOCUMENT)
+        cache_usage = (
+            {"cached_input_tokens": 100_000},
+            {"cache_write_tokens": 100_000},
+            {"cache_write_5m_tokens": 100_000},
+            {"cache_write_1h_tokens": 100_000},
+        )
+        cases = (
+            ("claude-3-7-sonnet-20250219", (0.03, 0.375, 0.375, 0.6)),
+            ("claude-3-5-sonnet-20240620", (0.03, 0.375, 0.375, 0.6)),
+            ("claude-3-5-sonnet-20241022", (0.03, 0.375, 0.375, 0.6)),
+            ("claude-3-opus-20240229", (0.15, 1.875, 1.875, 3.0)),
+        )
+        for model, expected in cases:
+            for index, usage_fields in enumerate(cache_usage):
+                estimated_usd = expected[index]
+                with self.subTest(model=model, usage=usage_fields):
+                    usage = execution.UsageRecord(provider="anthropic", model=model, **usage_fields)
+                    with mock.patch.object(
+                        execution, "_fetch_dynamic_pricing", return_value=dynamic
+                    ):
+                        result = execution.estimate_api_equivalent_cost((usage,))
+
+                    self.assertEqual(result["usd"], estimated_usd)
+                    self.assertEqual(result["dynamic_models"], [])
+
     def test_estimated_cost_looks_up_unknown_model_dynamically(self) -> None:
         pricing = self.root / "pricing.json"
         pricing.write_text(
             json.dumps(
                 {
-                    "dynamic_fallback": {"url": "https://example.test/pricing.json"},
+                    "dynamic_sources": {"anthropic": "https://example.test/pricing.md"},
                     "models": {},
                 }
             ),
@@ -308,20 +415,14 @@ class LeanExecutionTests(unittest.TestCase):
         )
         usage = execution.UsageRecord(
             provider="anthropic",
-            model="claude-new",
+            model="claude-new-1",
             input_tokens=1_000_000,
             cached_input_tokens=100_000,
             cache_write_tokens=100_000,
             output_tokens=1_000_000,
         )
-        dynamic = {
-            "claude-new": {
-                "input_cost_per_token": 3e-6,
-                "cache_read_input_token_cost": 0.3e-6,
-                "cache_creation_input_token_cost": 3.75e-6,
-                "output_cost_per_token": 15e-6,
-            }
-        }
+        document = ANTHROPIC_PRICING_DOCUMENT.replace("Claude Sonnet 4.6", "Claude New 1", 1)
+        dynamic = execution._parse_first_party_pricing("anthropic", document)
 
         with (
             mock.patch.object(execution, "MODEL_PRICING_PATH", pricing),
@@ -330,7 +431,7 @@ class LeanExecutionTests(unittest.TestCase):
             result = execution.estimate_api_equivalent_cost((usage,))
 
         self.assertEqual(result["usd"], 18.405)
-        self.assertEqual(result["dynamic_models"], ["claude-new"])
+        self.assertEqual(result["dynamic_models"], ["claude-new-1"])
         self.assertEqual(result["missing_models"], [])
 
     def test_estimated_cost_prefers_live_pricing_over_bundled_rates(self) -> None:
@@ -338,19 +439,19 @@ class LeanExecutionTests(unittest.TestCase):
         pricing.write_text(
             json.dumps(
                 {
-                    "dynamic_fallback": {"url": "https://example.test/pricing.json"},
-                    "models": {"gpt-test": {"input": 5.0, "output": 30.0}},
+                    "dynamic_sources": {"openai": "https://example.test/pricing.md"},
+                    "models": {"gpt-5.6-sol": {"input": 5.0, "output": 30.0}},
                 }
             ),
             encoding="utf-8",
         )
         usage = execution.UsageRecord(
             provider="openai",
-            model="gpt-test",
-            input_tokens=1_000_000,
-            output_tokens=1_000_000,
+            model="gpt-5.6-sol",
+            input_tokens=100_000,
+            output_tokens=10_000,
         )
-        dynamic = {"gpt-test": {"input_cost_per_token": 2e-6, "output_cost_per_token": 12e-6}}
+        dynamic = execution._parse_first_party_pricing("openai", OPENAI_PRICING_DOCUMENT)
 
         with (
             mock.patch.object(execution, "MODEL_PRICING_PATH", pricing),
@@ -358,15 +459,15 @@ class LeanExecutionTests(unittest.TestCase):
         ):
             result = execution.estimate_api_equivalent_cost((usage,))
 
-        self.assertEqual(result["usd"], 14.0)
-        self.assertEqual(result["dynamic_models"], ["gpt-test"])
+        self.assertEqual(result["usd"], 0.6)
+        self.assertEqual(result["dynamic_models"], ["gpt-5.6-sol"])
 
     def test_estimated_cost_falls_back_to_bundled_rates_when_catalog_is_unavailable(self) -> None:
         pricing = self.root / "pricing.json"
         pricing.write_text(
             json.dumps(
                 {
-                    "dynamic_fallback": {"url": "https://example.test/pricing.json"},
+                    "dynamic_sources": {"openai": "https://example.test/pricing.md"},
                     "models": {"gpt-test": {"input": 5.0, "output": 30.0}},
                 }
             ),
@@ -393,7 +494,7 @@ class LeanExecutionTests(unittest.TestCase):
         pricing.write_text(
             json.dumps(
                 {
-                    "dynamic_fallback": {"url": "https://example.test/pricing.json"},
+                    "dynamic_sources": {"anthropic": "https://example.test/pricing.md"},
                     "models": {
                         "claude-sonnet-4-6": {
                             "aliases": ["claude-sonnet-4.6"],
@@ -413,8 +514,8 @@ class LeanExecutionTests(unittest.TestCase):
         )
         dynamic = {
             "claude-sonnet-4-6": {
-                "input_cost_per_token": 3e-6,
-                "output_cost_per_token": 15e-6,
+                "input": 3.0,
+                "output": 15.0,
             }
         }
 
@@ -432,70 +533,198 @@ class LeanExecutionTests(unittest.TestCase):
         pricing.write_text(
             json.dumps(
                 {
-                    "dynamic_fallback": {"url": "https://example.test/pricing.json"},
+                    "dynamic_sources": {"openai": "https://example.test/pricing.md"},
                     "models": {},
                 }
             ),
             encoding="utf-8",
         )
+        dynamic = execution._parse_first_party_pricing("openai", OPENAI_PRICING_DOCUMENT)
+
+        for input_tokens, expected in ((272_000, 0.978), (272_001, 1.856008), (300_000, 2.08)):
+            with self.subTest(input_tokens=input_tokens):
+                usage = execution.UsageRecord(
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    input_tokens=input_tokens,
+                    cached_input_tokens=100_000,
+                    cache_write_tokens=50_000,
+                    output_tokens=10_000,
+                )
+                with (
+                    mock.patch.object(execution, "MODEL_PRICING_PATH", pricing),
+                    mock.patch.object(execution, "_fetch_dynamic_pricing", return_value=dynamic),
+                ):
+                    result = execution.estimate_api_equivalent_cost((usage,))
+
+                self.assertEqual(result["usd"], expected)
+                self.assertEqual(result["dynamic_models"], ["gpt-5.6-sol"])
+
+    def test_openai_pricing_reads_standard_table_and_context_columns(self) -> None:
+        rates = execution._parse_first_party_pricing("openai", OPENAI_PRICING_DOCUMENT)
+
+        self.assertEqual(
+            rates["gpt-5.6-sol"],
+            {
+                "input": 4.0,
+                "cached_input": 0.4,
+                "cache_write": 5.0,
+                "output": 20.0,
+                "long_context_threshold_input_tokens": 272_000,
+                "long_context": {
+                    "input": 8.0,
+                    "cached_input": 0.8,
+                    "cache_write": 10.0,
+                    "output": 30.0,
+                },
+            },
+        )
+        self.assertEqual(rates["gpt-5.4"]["input"], 2.5)
+        self.assertNotIn("cache_write", rates["gpt-5.4"])
+        self.assertNotIn("cache_write", rates["gpt-5.4"]["long_context"])
+
+    def test_anthropic_pricing_reads_standard_cache_ttls_without_context_surcharge(self) -> None:
+        rates = execution._parse_first_party_pricing("anthropic", ANTHROPIC_PRICING_DOCUMENT)
+
+        self.assertEqual(
+            rates["claude-opus-5"],
+            {
+                "input": 5.0,
+                "cached_input": 0.5,
+                "cache_write": 6.25,
+                "cache_write_5m": 6.25,
+                "cache_write_1h": 10.0,
+                "output": 25.0,
+            },
+        )
+
+    def test_first_party_pricing_routes_provider_aliases_and_dated_models(self) -> None:
+        url = "https://example.test/pricing.md"
+        legacy_document = ANTHROPIC_PRICING_DOCUMENT.replace(
+            "Claude Sonnet 4.6", "Claude Sonnet 3.7", 1
+        ).replace(
+            "| Claude Opus 5 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |",
+            "| Claude Opus 3 | $15 / MTok | $18.75 / MTok | $30 / MTok | $1.50 / MTok | $75 / MTok |",
+            1,
+        )
+        cases = (
+            ("codex", "openai", "gpt-5.6-sol", OPENAI_PRICING_DOCUMENT, 0.6),
+            ("claude", "anthropic", "claude-haiku-4-5-20251001", ANTHROPIC_PRICING_DOCUMENT, 0.15),
+            ("claude", "anthropic", "claude-3-5-haiku-20241022", ANTHROPIC_PRICING_DOCUMENT, 0.12),
+            ("claude", "anthropic", "claude-3-7-sonnet-20250219", legacy_document, 0.45),
+            ("claude", "anthropic", "claude-3-opus-20240229", legacy_document, 2.25),
+        )
+        for provider, pricing_provider, model, document, expected in cases:
+            with self.subTest(provider=provider, model=model):
+                pricing = {"dynamic_sources": {pricing_provider: url}, "models": {}}
+                dynamic = execution._parse_first_party_pricing(pricing_provider, document)
+                usage = execution.UsageRecord(
+                    provider=provider,
+                    model=model,
+                    input_tokens=100_000,
+                    output_tokens=10_000,
+                )
+                with (
+                    mock.patch.object(execution, "_pricing", return_value=pricing),
+                    mock.patch.object(
+                        execution, "_fetch_dynamic_pricing", return_value=dynamic
+                    ) as fetch,
+                ):
+                    result = execution.estimate_api_equivalent_cost((usage,))
+
+                self.assertEqual(result["usd"], expected)
+                self.assertEqual(result["dynamic_models"], [model])
+                fetch.assert_called_once_with(pricing_provider, url)
+
+    def test_invalid_first_party_pricing_falls_back_without_using_other_tiers(self) -> None:
+        cases = {
+            "missing standard section": OPENAI_PRICING_DOCUMENT.replace(
+                "### Standard pricing data", "### Other pricing", 1
+            ),
+            "missing input column": OPENAI_PRICING_DOCUMENT.replace(
+                "Short context input", "Token input", 1
+            ),
+            "missing input price": OPENAI_PRICING_DOCUMENT.replace("$4.00", "-", 1),
+            "invalid output price": OPENAI_PRICING_DOCUMENT.replace("$20.00", "unknown", 1),
+            "nonfinite input price": OPENAI_PRICING_DOCUMENT.replace("$4.00", "$NaN", 1),
+            "infinite input price": OPENAI_PRICING_DOCUMENT.replace("$4.00", "$inf", 1),
+            "negative input price": OPENAI_PRICING_DOCUMENT.replace("$4.00", "$-1.00", 1),
+            "incomplete long context": OPENAI_PRICING_DOCUMENT.replace("$30.00", "-", 1),
+            "invalid long context cache": OPENAI_PRICING_DOCUMENT.replace("$0.80", "$NaN", 1),
+            "short row": OPENAI_PRICING_DOCUMENT.replace("| $30.00 |", "|", 1),
+            "extra column": OPENAI_PRICING_DOCUMENT.replace("| $30.00 |", "| $30.00 | extra |", 1),
+            "html error page": "<html>Pricing is temporarily unavailable.</html>",
+        }
+        pricing = {
+            "dynamic_sources": {"openai": "https://example.test/pricing.md"},
+            "models": {"gpt-5.6-sol": {"input": 5.0, "output": 30.0}},
+        }
         usage = execution.UsageRecord(
             provider="openai",
-            model="gpt-test",
-            input_tokens=300_000,
-            cached_input_tokens=100_000,
-            cache_write_tokens=50_000,
+            model="gpt-5.6-sol",
+            input_tokens=100_000,
             output_tokens=10_000,
         )
-        dynamic = {
-            "gpt-test": {
-                "input_cost_per_token": 2e-6,
-                "input_cost_per_token_above_272k_tokens": 4e-6,
-                "cache_read_input_token_cost": 0.2e-6,
-                "cache_read_input_token_cost_above_272k_tokens": 0.4e-6,
-                "cache_creation_input_token_cost": 2.5e-6,
-                "cache_creation_input_token_cost_above_272k_tokens": 5e-6,
-                "output_cost_per_token": 12e-6,
-                "output_cost_per_token_above_272k_tokens": 18e-6,
-            }
-        }
+        for label, document in cases.items():
+            with self.subTest(document=label):
+                dynamic = execution._parse_first_party_pricing("openai", document)
+                with (
+                    mock.patch.object(execution, "_pricing", return_value=pricing),
+                    mock.patch.object(execution, "_fetch_dynamic_pricing", return_value=dynamic),
+                ):
+                    result = execution.estimate_api_equivalent_cost((usage,))
 
-        with (
-            mock.patch.object(execution, "MODEL_PRICING_PATH", pricing),
-            mock.patch.object(execution, "_fetch_dynamic_pricing", return_value=dynamic),
-        ):
-            result = execution.estimate_api_equivalent_cost((usage,))
+                self.assertEqual(result["usd"], 0.8)
+                self.assertEqual(result["dynamic_models"], [])
 
-        self.assertEqual(result["usd"], 1.07)
-        self.assertEqual(result["dynamic_models"], ["gpt-test"])
+    def test_anthropic_pricing_rejects_incomplete_or_invalid_rows(self) -> None:
+        for invalid in ("-", "unknown", "$NaN / MTok", "$-1 / MTok"):
+            with self.subTest(price=invalid):
+                document = ANTHROPIC_PRICING_DOCUMENT.replace("$10 / MTok", invalid, 1)
+                rates = execution._parse_first_party_pricing("anthropic", document)
 
-    def test_dynamic_pricing_cache_refreshes_hourly(self) -> None:
-        url = "https://example.test/pricing.json"
+                self.assertNotIn("claude-opus-5", rates)
+                self.assertEqual(rates["claude-haiku-4-5"]["output"], 5.0)
+
+    def test_dynamic_pricing_cache_is_per_provider_and_refreshes_hourly(self) -> None:
+        url = "https://example.test/pricing.md"
         response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = b'{"gpt-test": {}}'
+        response.__enter__.return_value.read.side_effect = [
+            OPENAI_PRICING_DOCUMENT.encode("utf-8"),
+            ANTHROPIC_PRICING_DOCUMENT.encode("utf-8"),
+            OPENAI_PRICING_DOCUMENT.replace("$4.00", "$3.00", 1).encode("utf-8"),
+        ]
         execution._cached_dynamic_pricing.cache_clear()
         self.addCleanup(execution._cached_dynamic_pricing.cache_clear)
 
         with (
-            mock.patch.object(execution.time, "monotonic", side_effect=(1_000, 2_000, 4_600)),
+            mock.patch.object(
+                execution.time, "monotonic", side_effect=(1_000, 2_000, 2_000, 4_600)
+            ),
             mock.patch.object(
                 execution.urllib.request, "urlopen", return_value=response
             ) as urlopen,
         ):
-            first = execution._fetch_dynamic_pricing(url)
-            cached = execution._fetch_dynamic_pricing(url)
-            refreshed = execution._fetch_dynamic_pricing(url)
+            first = execution._fetch_dynamic_pricing("openai", url)
+            cached = execution._fetch_dynamic_pricing("openai", url)
+            other_provider = execution._fetch_dynamic_pricing("anthropic", url)
+            refreshed = execution._fetch_dynamic_pricing("openai", url)
 
-        self.assertEqual(first, {"gpt-test": {}})
+        self.assertEqual(first["gpt-5.6-sol"]["input"], 4.0)
         self.assertEqual(cached, first)
-        self.assertEqual(refreshed, first)
-        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(other_provider["claude-opus-5"]["input"], 5.0)
+        self.assertEqual(refreshed["gpt-5.6-sol"]["input"], 3.0)
+        self.assertEqual(urlopen.call_count, 3)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Accept"), "text/markdown")
+        self.assertEqual(request.get_header("User-agent"), "Codex-Replay/1.0")
 
     def test_estimated_cost_is_unavailable_when_model_cannot_be_resolved(self) -> None:
         pricing = self.root / "pricing.json"
         pricing.write_text(
             json.dumps(
                 {
-                    "dynamic_fallback": {"url": "https://example.test/pricing.json"},
+                    "dynamic_sources": {"anthropic": "https://example.test/pricing.md"},
                     "models": {},
                 }
             ),
@@ -516,6 +745,44 @@ class LeanExecutionTests(unittest.TestCase):
         self.assertIsNone(result["usd"])
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["missing_models"], ["missing-model"])
+
+    def test_shared_usage_preserves_raw_accounting_without_a_standalone_comparison(self) -> None:
+        for tokens in (0, 1234):
+            with (
+                self.subTest(tokens=tokens),
+                mock.patch.object(
+                    execution, "estimate_api_equivalent_cost", return_value={"usd": 1}
+                ),
+            ):
+                report = execution.generate_report(
+                    original_request="queued request",
+                    baseline={},
+                    parity_report={},
+                    claude_candidate=None,
+                    codex_candidate=None,
+                    claude_usage=(
+                        execution.UsageRecord(
+                            provider="anthropic",
+                            model="claude-test",
+                            input_tokens=tokens,
+                        ),
+                    ),
+                    historical_usage_shared=True,
+                )
+                report["historical_model_request_seconds"] = 7
+                self.assertEqual(report["usage"]["claude"][0]["input_tokens"], tokens)
+                self.assertEqual(
+                    report["normalized_usage"]["claude"]["ordinary_input_tokens"], tokens
+                )
+                self.assertEqual(report["estimated_cost"]["claude"]["status"], "shared")
+                self.assertIsNone(report["estimated_cost"]["claude"]["usd"])
+                rendered = execution.render_report_html(report)
+                historical = rendered.split("<h2>Historical Claude</h2>")[1].split("</article>")[0]
+                self.assertIn("No standalone usage", historical)
+                self.assertNotIn("7s", historical)
+                self.assertNotIn("$0", historical)
+                self.assertNotIn('class="metric metric--better"', rendered)
+                self.assertNotIn('class="metric metric--worse"', rendered)
 
     def test_report_uses_polished_dashboard_with_unblinded_results(self) -> None:
         reviewer_ballot = _review_ballot()
@@ -783,6 +1050,74 @@ class LeanExecutionTests(unittest.TestCase):
         diff, changed = execution.capture_candidate_diff(workspace)
         self.assertIn("game.html", diff)
         self.assertEqual(changed, ("game.html",))
+
+    def test_repository_observation_distinguishes_files_initialization_and_commit(self) -> None:
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        (workspace / "result.txt").write_text("result\n")
+        self.assertEqual(execution.observe_repository_state(workspace)["kind"], "non_git")
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+        initialized = execution.observe_repository_state(workspace)
+        self.assertEqual(initialized["kind"], "git")
+        self.assertIsNone(initialized["commit"])
+        self.assertEqual(initialized["working_tree"], "dirty")
+        subprocess.run(["git", "-C", str(workspace), "add", "result.txt"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "result",
+            ],
+            check=True,
+        )
+        committed = execution.observe_repository_state(workspace)
+        self.assertRegex(committed["commit"], r"^[a-f0-9]{40}$")
+        self.assertEqual(committed["working_tree"], "clean")
+        (workspace / "result.txt").write_text("later change\n")
+        changed = execution.observe_repository_state(workspace)
+        self.assertEqual(changed["commit"], committed["commit"])
+        self.assertEqual(changed["working_tree"], "dirty")
+        self.assertEqual(
+            execution.observe_repository_state(self.root / "missing")["kind"], "unknown"
+        )
+
+    def test_blind_repository_evidence_omits_identity_and_rejects_claimed_state(self) -> None:
+        beginning = {
+            "kind": "non_git",
+            "commit": None,
+            "basis": "reviewed_boundary",
+            "working_tree": "unknown",
+        }
+        ending = {
+            "kind": "git",
+            "commit": "a" * 40,
+            "basis": "workspace_observation",
+            "working_tree": "clean",
+        }
+        candidate = execution.CandidateSolution(
+            provider="codex",
+            model="gpt-test",
+            diff="+content",
+            final_response="Committed.",
+            repository_state={
+                "beginning": beginning,
+                "ending": {**ending, "author": "Codex", "path": "/private/tmp/private-repo"},
+                "provider": "codex",
+            },
+        )
+        anonymous = execution.anonymize_candidate(candidate, label="B")
+        self.assertEqual(anonymous["repository_state"], {"beginning": beginning, "ending": ending})
+        self.assertNotIn("Codex", json.dumps(anonymous))
+        self.assertNotIn("private-repo", json.dumps(anonymous))
+        candidate.repository_state["ending"]["commit"] = "The assistant says it committed"
+        self.assertNotIn("repository_state", execution.anonymize_candidate(candidate, label="B"))
 
     def test_capture_git_diff_includes_tracked_and_untracked_files(self) -> None:
         repository = self.root / "repo"

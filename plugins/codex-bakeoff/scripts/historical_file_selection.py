@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Live file classification for historical Claude candidate reconstruction.
 
-This module intentionally records paths and user decisions without hashing or
-snapshotting their contents. Candidate patches are assembled from the live
-sources when a run is completed.
+Whole-thread selections record paths and user decisions without snapshotting
+contents. Carried range inputs include fingerprints to bind approval to their
+whole-file contents. Candidate patches are assembled from the live sources.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -197,7 +198,10 @@ def _is_gitlink(repository: Path, relative: str) -> bool:
 
 def _bounded(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(entries) > MAX_CANDIDATE_FILES:
-        raise FileSelectionError(f"More than {MAX_CANDIDATE_FILES:,} dirty files were found.")
+        raise FileSelectionError(
+            f"This workspace contains more than {MAX_CANDIDATE_FILES:,} files to review. "
+            "Choose a smaller project directory or remove unrelated files and try again."
+        )
     return entries
 
 
@@ -322,11 +326,42 @@ def inspect_git(
     return _bounded(sorted(entries, key=lambda item: str(item["path"])))
 
 
+def _whole_file_sha256(path: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise FileSelectionError(f"A carried input is unavailable: {path.name}") from error
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_FILE_BYTES:
+            raise FileSelectionError(f"A carried input is not a bounded regular file: {path.name}")
+        digest = hashlib.sha256()
+        total = 0
+        while data := stream.read(1024 * 1024):
+            total += len(data)
+            if total > MAX_FILE_BYTES:
+                raise FileSelectionError(f"A carried input exceeds the file limit: {path.name}")
+            digest.update(data)
+        return digest.hexdigest()
+
+
+def _verify_carried_input_copies(selection: Mapping[str, Any], target: Path) -> None:
+    for entry in selection.get("before_files") or []:
+        expected = entry.get("content_sha256")
+        if (
+            expected is not None
+            and _whole_file_sha256(_safe_member(target, entry["path"])) != expected
+        ):
+            raise FileSelectionError(f"A carried input changed after review: {entry['path']}")
+
+
 def select_git(
     root: Path | str,
     *,
     attribution_root: Path | str | None = None,
     claude_output_files: Iterable[str] = (),
+    carried_forward_files: Iterable[str] = (),
     confirmed: bool = False,
 ) -> dict[str, Any]:
     """Select which current Git change units supplement Claude's recovered result."""
@@ -346,14 +381,25 @@ def select_git(
             aliases[original] = path
 
     requested = {_relative(value) for value in claude_output_files}
+    carried = {_relative(value) for value in carried_forward_files}
     unknown = requested - set(aliases)
     if unknown:
         raise FileSelectionError(
             "Selected files are not current Git changes: " + ", ".join(sorted(unknown))
         )
     selected_ids = {aliases[path] for path in requested}
+    carried_ids = {aliases.get(path, path) for path in carried}
+    carried_entries: dict[str, dict[str, Any]] = {}
+    for path in carried_ids:
+        try:
+            (repository / path).relative_to(selected_root)
+        except ValueError as error:
+            raise FileSelectionError(
+                "Carried inputs must stay inside the selected project."
+            ) from error
+        carried_entries[path] = by_path[path] if path in by_path else _metadata(repository, path)
     selected = [entry for path, entry in by_path.items() if path in selected_ids]
-    for entry in selected:
+    for entry in [*selected, *carried_entries.values()]:
         if entry.get("selectable") is not True:
             raise FileSelectionError(
                 f"Selected Git change cannot be captured safely: {entry['path']}"
@@ -364,6 +410,25 @@ def select_git(
     if selected_bytes > MAX_TOTAL_BYTES:
         raise FileSelectionError("The selected Git changes exceed the candidate byte limit.")
 
+    before_files = []
+    for path in sorted(carried_ids):
+        entry = carried_entries[path]
+        if entry["kind"] != "regular":
+            raise FileSelectionError(f"Carried inputs must be whole regular files: {path}")
+        before_files.append(
+            {
+                "path": path,
+                "source_path": str(repository / path),
+                "content_sha256": _whole_file_sha256(_safe_member(repository, path)),
+                "source_kind": entry["kind"],
+                "size": entry["size"],
+                "classification": "existed_before_claude",
+            }
+        )
+    if selected_bytes + sum(int(entry["size"]) for entry in before_files) > MAX_TOTAL_BYTES:
+        raise FileSelectionError(
+            "The selected Git inputs and outputs exceed the candidate byte limit."
+        )
     dirty = bool(candidates)
     confirmation_recorded = bool(confirmed)
     return {
@@ -377,8 +442,15 @@ def select_git(
         "complete": not dirty or confirmation_recorded,
         "candidates": candidates,
         "claude_output_changes": selected,
+        **(
+            {"before_files": before_files, "carried_forward_files": sorted(carried_ids)}
+            if before_files
+            else {}
+        ),
         "unselected_changes": [
-            entry for path, entry in by_path.items() if path not in selected_ids
+            entry
+            for path, entry in by_path.items()
+            if path not in selected_ids and path not in carried_ids
         ],
     }
 
@@ -428,6 +500,8 @@ def inspect_directory(
                 relative = child.relative_to(directory).as_posix()
                 if child.is_symlink():
                     entries.append(_metadata(directory, relative))
+                elif (child / ".git").exists():
+                    continue
                 elif name.casefold() in GENERATED_PARTS:
                     entries.append(
                         {
@@ -530,6 +604,7 @@ def select_directory(
     *,
     created_by_claude: Iterable[str] = (),
     existed_before_claude: Iterable[str] = (),
+    carried_forward_files: Iterable[str] = (),
     exclude_files: Iterable[str] = (),
     confirmed: bool = False,
     empty_starting_directory_confirmed: bool | None = None,
@@ -547,14 +622,17 @@ def select_directory(
     )
     by_path = {str(entry["path"]): entry for entry in candidates}
     legacy_baseline_paths = {_relative(value) for value in existed_before_claude}
+    carried = {_relative(value) for value in carried_forward_files}
     classes = {
         "created_by_claude": {_relative(value) for value in created_by_claude},
         "exclude": {_relative(value) for value in exclude_files},
     }
-    if legacy_baseline_paths:
+    if legacy_baseline_paths or carried:
         # Backward compatibility for completing run artifacts created before
         # non-empty non-Git baselines were removed from the public workflow.
-        classes["existed_before_claude"] = legacy_baseline_paths
+        classes["existed_before_claude"] = legacy_baseline_paths | (
+            carried - classes["created_by_claude"]
+        )
     all_selected = set().union(*classes.values())
     unknown = all_selected - set(by_path)
     if unknown:
@@ -577,12 +655,17 @@ def select_directory(
                 raise FileSelectionError(f"{path} can only be classified as Exclude.")
 
     baseline_entries: list[dict[str, Any]] = []
-    for path in sorted(legacy_baseline_paths):
+    for path in sorted(legacy_baseline_paths | carried):
         entry = by_path[path]
         baseline_entries.append(
             {
                 "path": path,
                 "source_path": str(directory / path),
+                **(
+                    {"content_sha256": _whole_file_sha256(_safe_member(directory, path))}
+                    if path in carried
+                    else {}
+                ),
                 "source_kind": entry["kind"],
                 "size": entry["size"],
                 "classification": "existed_before_claude",
@@ -607,15 +690,15 @@ def select_directory(
     )
     if selected_bytes > MAX_TOTAL_BYTES:
         raise FileSelectionError("The classified baseline and Claude output exceed the byte limit.")
-    baseline_kind = "classified_directory" if baseline_entries else "empty_directory"
+    baseline_kind = "classified_directory" if legacy_baseline_paths else "empty_directory"
     return {
         "schema_version": 1,
         "source_kind": "non_git",
         "source_root": str(directory),
         "requires_confirmation": True,
         "confirmed": confirmation_recorded,
-        "requires_empty_beginning_confirmation": not baseline_entries,
-        "empty_starting_directory_confirmed": empty_confirmed and not baseline_entries,
+        "requires_empty_beginning_confirmation": not legacy_baseline_paths,
+        "empty_starting_directory_confirmed": empty_confirmed and not legacy_baseline_paths,
         "complete": complete,
         "candidates": candidates,
         "unclassified_files": unclassified,
@@ -624,6 +707,7 @@ def select_directory(
             for classification, paths in classes.items()
         },
         "before_files": baseline_entries,
+        **({"carried_forward_files": sorted(carried)} if carried else {}),
         "claude_output_files": [
             {
                 **by_path[path],
@@ -757,6 +841,9 @@ def _directory_baseline_sources(
             raise FileSelectionError(
                 f"The baseline source does not match the Claude directory: {relative}"
             )
+        expected = raw.get("content_sha256")
+        if expected is not None and _whole_file_sha256(current) != expected:
+            raise FileSelectionError(f"A carried input changed after review: {relative}")
         checked.append(raw)
         files.append((relative, current))
     return source, checked, files
@@ -1271,6 +1358,7 @@ def materialize_directory_baseline(
             label="registered baseline project",
         )
         _validate_copied_symlinks(target, (relative for relative, _ in files))
+        _verify_carried_input_copies(selection, target)
         expected = _expected_target_paths(relative for relative, _ in files)
         if _target_inventory(target) != expected:
             raise FileSelectionError(
@@ -1295,6 +1383,47 @@ def materialize_directory_baseline(
         "source": str(source),
         "target": str(target),
         "copied_files": [relative for relative, _ in files],
+    }
+
+
+def materialize_carried_forward_files(
+    selection: Mapping[str, Any],
+    target_root: Path | str,
+) -> dict[str, Any]:
+    """Copy attributed whole-file inputs into a newly isolated replay workspace."""
+
+    source, _, files = _directory_baseline_sources(selection)
+    if selection.get("source_kind") != "git":
+        return materialize_directory_baseline(selection, target_root)
+    target = _canonical_directory(target_root, unavailable="The Replay workspace is unavailable.")
+    source = _canonical_directory(source, unavailable="The Claude source is unavailable.")
+    if _is_within(target, source) or _is_within(source, target):
+        raise FileSelectionError("Carried inputs require an isolated Replay workspace.")
+    source_fd, source_stat = _open_pinned_directory(source, label="Claude source directory")
+    directories: dict[DirectoryKey, int] = {(): source_fd}
+    read_paths: list[ReadPath] = []
+    try:
+        copied = 0
+        for relative, _ in files:
+            copied += _copy_pinned_entry_to_path(
+                relative,
+                directories,
+                read_paths,
+                _safe_member(target, relative),
+                label="Claude carried input",
+            )
+            if copied > MAX_TOTAL_BYTES:
+                raise FileSelectionError("The carried inputs exceed the candidate byte limit.")
+        _verify_pinned_directory(source, source_stat, directories, label="Claude source directory")
+        _verify_read_paths(read_paths, label="Claude carried input")
+        _verify_carried_input_copies(selection, target)
+    finally:
+        for directory_fd in reversed(tuple(directories.values())):
+            os.close(directory_fd)
+    return {
+        "source": str(source),
+        "target": str(target),
+        "copied_files": [path for path, _ in files],
     }
 
 
@@ -1472,6 +1601,7 @@ def build_git_candidate_patch(
     baseline_kind: str = "git_commit",
     recovered_patch: str | None,
     selection: Mapping[str, Any],
+    preserve_carried_inputs: bool = True,
 ) -> tuple[str, tuple[str, ...]]:
     """Overlay selected live Git changes onto the recovered historical result."""
 
@@ -1550,6 +1680,26 @@ def build_git_candidate_patch(
             _git(candidate, "checkout", "--quiet", "--detach", baseline_commit)
         else:
             _checkout_empty_baseline(candidate)
+        before_files = selection.get("before_files") or []
+        if before_files:
+            original_commit = _git(candidate, "rev-parse", "HEAD").stdout.decode().strip()
+            materialize_carried_forward_files(selection, candidate)
+            _git(candidate, "add", "-f", "-A")
+            _git(
+                candidate,
+                "-c",
+                "user.name=Codex Bakeoff",
+                "-c",
+                "user.email=codex-bakeoff@localhost",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "Replay inputs",
+            )
+            # Restore the original tree without moving HEAD, so the existing
+            # recovered commit patch still applies against its historical hash.
+            _git(candidate, "read-tree", "--reset", "-u", original_commit)
         if isinstance(recovered_patch, str) and recovered_patch.strip():
             applied = _git(
                 candidate,
@@ -1566,6 +1716,8 @@ def build_git_candidate_patch(
                     "The recovered Claude result cannot be combined with the "
                     f"selected working-tree changes: {detail}"
                 )
+        if before_files and preserve_carried_inputs:
+            materialize_carried_forward_files(selection, candidate)
         ordered_selected = sorted(
             selected,
             key=lambda raw: (

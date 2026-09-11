@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -54,6 +57,8 @@ class RecordedSample:
     total_cost_usd: float
     verification: object
     original_repository_path_marker: str
+    configuration: dict[str, Any]
+    configuration_sha256: str
 
 
 def _required_string(payload: Mapping[str, Any], key: str) -> str:
@@ -100,6 +105,57 @@ def _asset_path(root: Path, value: object, *, label: str) -> Path:
     if candidate.stat().st_size > MAX_ARTIFACT_BYTES:
         raise SampleError(f"Recorded Claude sample {label} is too large.")
     return candidate
+
+
+def _configuration(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
+    path = _asset_path(root, payload.get("configuration_path"), label="configuration")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != payload.get("configuration_sha256"):
+        raise SampleError("Recorded sample configuration integrity check failed.")
+    configuration = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(configuration, dict) or configuration.get("version") != 1:
+        raise SampleError("Recorded sample configuration version is unsupported.")
+    metadata = {
+        k: v for k, v in payload.items() if k not in {"configuration_path", "configuration_sha256"}
+    }
+    digest = hashlib.sha256(
+        json.dumps(metadata, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+    if configuration.get("metadata_sha256") != digest:
+        raise SampleError("Recorded sample metadata integrity check failed.")
+    artifacts = configuration.get("artifact_sha256")
+    expected_paths = {*payload["transcript_parts"], payload["patch_path"], payload["result_path"]}
+    if not isinstance(artifacts, dict) or set(artifacts) != expected_paths:
+        raise SampleError("Recorded sample artifact digests are incomplete.")
+    for name, expected in artifacts.items():
+        artifact = _asset_path(root, name, label="configuration artifact")
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != expected:
+            raise SampleError("Recorded sample artifact integrity check failed.")
+    if configuration.get("beginning_state") != {
+        "kind": "git",
+        "commit": payload["baseline_commit"],
+    }:
+        raise SampleError("Recorded sample beginning state does not match its baseline.")
+    if configuration.get("ending_state") != {
+        "kind": "git_patch",
+        "patch_path": payload["patch_path"],
+    }:
+        raise SampleError("Recorded sample ending state does not match its patch.")
+    files = configuration.get("attributed_files")
+    if not isinstance(files, list) or len(set(files)) != len(files):
+        raise SampleError("Recorded sample attributed files are invalid.")
+    for value in [configuration.get("working_directory"), *files]:
+        if (
+            not isinstance(value, str)
+            or not value
+            or Path(value).is_absolute()
+            or ".." in Path(value).parts
+        ):
+            raise SampleError("Recorded sample configuration paths must be repository-relative.")
+    if not isinstance(configuration.get("replay"), dict) or not isinstance(
+        configuration.get("capability_requirements"), dict
+    ):
+        raise SampleError("Recorded sample replay observations are invalid.")
+    return configuration
 
 
 def _sample_from_payload(payload: Mapping[str, Any], root: Path) -> RecordedSample:
@@ -159,9 +215,11 @@ def _sample_from_payload(payload: Mapping[str, Any], root: Path) -> RecordedSamp
         total_cost_usd=_positive_cost(payload, "total_cost_usd"),
         verification=payload.get("verification"),
         original_repository_path_marker=marker,
+        configuration={},
+        configuration_sha256=_required_string(payload, "configuration_sha256"),
     )
     _recorded_result(sample)
-    return sample
+    return dataclasses.replace(sample, configuration=_configuration(payload, root))
 
 
 def load_samples(index_path: str | Path | None = None) -> list[RecordedSample]:
@@ -242,7 +300,9 @@ def _repository_url(repository: str) -> str:
     return f"https://github.com/{repository}.git"
 
 
-def _run_git(arguments: Sequence[str], *, input_text: str | None = None) -> str:
+def _run_git(
+    arguments: Sequence[str], *, input_text: str | None = None, env: Mapping[str, str] | None = None
+) -> str:
     try:
         completed = subprocess.run(
             ["git", *arguments],
@@ -251,6 +311,7 @@ def _run_git(arguments: Sequence[str], *, input_text: str | None = None) -> str:
             capture_output=True,
             check=False,
             timeout=180,
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise SampleError("The recorded Claude sample repository could not be created.") from error
@@ -396,7 +457,9 @@ def materialize_sample(
     manifest = directory / "materialization.json"
     with _materialization_lock:
         if manifest.is_file():
-            return _read_materialization(manifest)
+            cached = _read_materialization(manifest)
+            _verify_materialization(selected, directory, cached)
+            return cached
         root.mkdir(parents=True, exist_ok=True)
         try:
             directory.mkdir(exist_ok=False)
@@ -468,6 +531,7 @@ def materialize_sample(
                 recorded_result=recorded_result,
             )
             result: dict[str, Any] = {
+                "configuration_sha256": selected.configuration_sha256,
                 "sample_id": selected.id,
                 "thread_id": f"{THREAD_PREFIX}{selected.id}",
                 "repository_path": str(repository_path),
@@ -478,8 +542,166 @@ def materialize_sample(
                 "ledger_path": str(private_ledger),
                 "recorded_claude_result": recorded_result,
             }
+            _verify_materialization(selected, directory, result)
             manifest.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
             return result
         except Exception:
             shutil.rmtree(directory, ignore_errors=True)
             raise
+
+
+def _verify_materialization(
+    sample: RecordedSample, directory: Path, materialized: Mapping[str, Any]
+) -> None:
+    """Verify cached Git objects against the packaged patch, not a cached ending SHA."""
+    repository = directory / "repository"
+    transcript = directory / f"{sample.session_id}.jsonl"
+    if (
+        materialized.get("configuration_sha256") != sample.configuration_sha256
+        or materialized.get("repository_path") != str(repository)
+        or materialized.get("transcript_path") != str(transcript)
+        or materialized.get("baseline_commit") != sample.baseline_commit
+    ):
+        raise SampleError("Recorded sample materialization does not match its configuration.")
+    ending = materialized.get("ending_commit")
+    if not isinstance(ending, str) or COMMIT_PATTERN.fullmatch(ending) is None:
+        raise SampleError("Recorded sample ending commit is invalid.")
+    git = ("-C", str(repository))
+    # A temporary index computes the expected tree without changing the workspace.
+    with tempfile.TemporaryDirectory(prefix="sample-integrity-") as temporary:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        _run_git((*git, "read-tree", sample.baseline_commit), env=env)
+        patch = sample.patch_path.read_text(encoding="utf-8")
+        if patch.strip():
+            _run_git((*git, "apply", "--cached", "-"), input_text=patch, env=env)
+        expected_tree = _run_git((*git, "write-tree"), env=env)
+    if (
+        _run_git((*git, "rev-parse", f"{ending}^{{tree}}")) != expected_tree
+        or _run_git((*git, "rev-parse", "HEAD")) != ending
+        or _run_git((*git, "status", "--porcelain", "--untracked-files=all"))
+    ):
+        raise SampleError(
+            "Recorded sample workspace or ending state changed; use a new controller."
+        )
+    changed = _run_git((*git, "diff", "--name-only", sample.baseline_commit, ending)).splitlines()
+    if sorted(changed) != sample.configuration["attributed_files"]:
+        raise SampleError("Recorded sample attributed files do not match its ending state.")
+    expected_transcript = b"".join(part.read_bytes() for part in sample.transcript_parts).replace(
+        sample.original_repository_path_marker.encode(),
+        json.dumps(str(repository), ensure_ascii=False)[1:-1].encode(),
+    )
+    if transcript.read_bytes() != expected_transcript:
+        raise SampleError("Recorded sample transcript integrity check failed.")
+    working_directory = (repository / sample.configuration["working_directory"]).resolve()
+    if not working_directory.is_dir() or not working_directory.is_relative_to(repository.resolve()):
+        raise SampleError("Recorded sample working directory is unavailable.")
+
+
+def resolve_sample(
+    thread_id: str, controller_root: str | Path, *, index_path: str | Path | None = None
+) -> dict[str, Any]:
+    """The authoritative sample resolver shared by inspection, preparation and execution."""
+    sample_id = sample_id_from_thread(thread_id)
+    sample = next((item for item in load_samples(index_path) if item.id == sample_id), None)
+    if sample is None:
+        raise SampleError("The selected recorded Claude sample is unavailable.")
+    materialized = materialize_sample(sample_id, controller_root, index_path=index_path)
+    configuration = sample.configuration
+    repository = materialized["repository_path"]
+    working_directory = str(Path(repository) / configuration["working_directory"])
+    replay = {
+        **configuration["replay"],
+        **configuration["capability_requirements"],
+        "sample_configuration": {
+            "version": configuration["version"],
+            "sha256": sample.configuration_sha256,
+        },
+        "sample_id": sample.id,
+        "session_id": sample.session_id,
+        "imported_thread_id": thread_id,
+        "source_path": materialized["transcript_path"],
+        "request": sample.prompt,
+        "request_generation": {"method": "packaged_sample"},
+        "project_dir": working_directory,
+        "project_dirs": [working_directory],
+        "historical_changed_files": [
+            str(Path(repository) / name) for name in configuration["attributed_files"]
+        ],
+        "linked_sources": [],
+        "review_decisions": {"transcript_overridden": False, "request_overridden": False},
+    }
+    baseline = {
+        "kind": "git_commit",
+        "proposed_kind": "git_commit",
+        "source_kind": "git",
+        "repository": repository,
+        "attribution_root": working_directory,
+        "beginning_kind": "git",
+        "ending_kind": "git",
+        "commit": materialized["baseline_commit"],
+        "ending_commit": materialized["ending_commit"],
+        "confidence": "packaged_sample",
+        "ending_commit_confidence": "packaged_sample",
+        "ending_commit_defaulted_to_beginning": False,
+        "working_tree_state": "clean",
+        "current_working_tree_state": "clean",
+        "sample_configuration": replay["sample_configuration"],
+    }
+    selection = {
+        "schema_version": 1,
+        "source_kind": "git",
+        "source_root": repository,
+        "attribution_root": working_directory,
+        "working_tree_state": "clean",
+        "complete": True,
+        "requires_confirmation": False,
+        "confirmed": False,
+        "candidates": [],
+        "claude_output_changes": [],
+        "attributed_files": configuration["attributed_files"],
+    }
+    recovery = {
+        "provenance": "packaged_sample",
+        "baseline_kind": "git_commit",
+        "baseline_commit": baseline["commit"],
+        "commit": baseline["ending_commit"],
+        "diff": sample.patch_path.read_text(encoding="utf-8"),
+        "changed_files": configuration["attributed_files"],
+        "limitations": [],
+        "evidence": [{"source": sample.source_url, **replay["sample_configuration"]}],
+    }
+    return {
+        "replay": replay,
+        "baseline": baseline,
+        "file_selection": selection,
+        "recovery": recovery,
+        "final_response": configuration["final_response"],
+    }
+
+
+def validate_selection(sample: Mapping[str, Any], arguments: Mapping[str, Any]) -> None:
+    """Reject conflicting client state rather than silently changing a bundled task."""
+    expected = {
+        "repo": sample["replay"]["project_dir"],
+        "request": sample["replay"]["request"],
+        "source_path": sample["replay"]["source_path"],
+        "message_uuid": sample["replay"]["message_uuid"],
+        "beginning_kind": "git",
+        "ending_kind": "git",
+        "baseline_commit": sample["baseline"]["commit"],
+        "ending_commit": sample["baseline"]["ending_commit"],
+    }
+    for key, value in expected.items():
+        supplied = arguments.get(key)
+        if supplied is None:
+            continue
+        if key in {"repo", "source_path"}:
+            matches = Path(supplied).expanduser().resolve() == Path(value).resolve()
+        else:
+            matches = isinstance(supplied, str) and supplied.strip() == value.strip()
+        if not matches:
+            raise SampleError(f"The recorded sample {key} cannot be changed.")
+    if any(
+        arguments.get(key) for key in ("claude_output_files", "created_by_claude", "excluded_files")
+    ):
+        raise SampleError("The recorded sample file attribution cannot be changed.")

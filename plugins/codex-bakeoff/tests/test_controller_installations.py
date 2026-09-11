@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,16 @@ from pathlib import Path
 from unittest import mock
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+REQUIRED_MCP_FILES = (
+    "server.py",
+    "controller.html",
+    "controller.css",
+    "controller-ranges.js",
+    "replay_configuration.py",
+    "replay_batch.py",
+    "controller_constants.py",
+    "final_results_receipt.py",
+)
 
 
 def load_server():
@@ -28,6 +39,126 @@ def load_server():
 
 
 class ControllerInstallationTests(unittest.TestCase):
+    def test_installed_controller_preserves_manifest_git_runtime_environment(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("Git is required for the local runtime probe.")
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plugin_root = root / "installed"
+            (plugin_root / "mcp").mkdir(parents=True)
+            (plugin_root / "scripts").mkdir()
+            (plugin_root / ".codex-plugin").mkdir()
+            for name in REQUIRED_MCP_FILES:
+                shutil.copyfile(PLUGIN_ROOT / "mcp" / name, plugin_root / "mcp" / name)
+            shutil.copyfile(PLUGIN_ROOT / ".mcp.json", plugin_root / ".mcp.json")
+            shutil.copyfile(
+                PLUGIN_ROOT / ".codex-plugin" / "plugin.json",
+                plugin_root / ".codex-plugin" / "plugin.json",
+            )
+            helpers = root / "git-core"
+            helpers.mkdir()
+            helper = helpers / "git-replay-runtime-probe"
+            helper.write_text(
+                '#!/bin/sh\nset -eu\ngit init --quiet "$1"\n'
+                "git config --system --get replay.runtime\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o755)
+            templates = root / "templates"
+            templates.mkdir()
+            (templates / "runtime-marker").write_text("preserved", encoding="utf-8")
+            system_config = root / "gitconfig"
+            system_config.write_text("[replay]\n\truntime = preserved\n", encoding="utf-8")
+            repository = root / "repository"
+            # A fixture engine exercises the installed controller's actual Git subprocess
+            # without downloading a sample or invoking a model.
+            (plugin_root / "scripts" / "historical_bakeoff.py").write_text(
+                "import json, os, subprocess\n"
+                "result = subprocess.run(['git', 'replay-runtime-probe', "
+                f"{str(repository)!r}], check=True, capture_output=True, text=True)\n"
+                "print(json.dumps({'options': [{'id': result.stdout.strip(), "
+                "'managed_environment': {name: os.environ.get(name) for name in "
+                "('OG_GIT_EXECUTABLE', 'CODEX_PREFERRED_GIT_EXECUTABLE')}}]}))\n",
+                encoding="utf-8",
+            )
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            host_environment = {
+                **os.environ,
+                "CODEX_HOME": str(root / "codex-home"),
+                "CODEX_BAKEOFF_RUN_ROOT": str(root / "runs"),
+                "CODEX_BAKEOFF_CONTROLLER_PORT": str(port),
+                "GIT_EXEC_PATH": str(helpers),
+                "GIT_TEMPLATE_DIR": str(templates),
+                "GIT_CONFIG_SYSTEM": str(system_config),
+            }
+            manifest = json.loads((plugin_root / ".mcp.json").read_text(encoding="utf-8"))
+            declaration = manifest["mcpServers"]["codex-bakeoff"]
+            environment = {
+                name: host_environment[name]
+                for name in declaration["env_vars"]
+                if name in host_environment
+            }
+            session = "e" * 32
+            runtime_path = root / "controllers" / session / "controller-server.json"
+            try:
+                launched = subprocess.run(
+                    [sys.executable, *declaration["args"]],
+                    cwd=plugin_root,
+                    env=environment,
+                    input=json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "open_controller",
+                                "arguments": {"controller_session_id": session},
+                            },
+                        }
+                    )
+                    + "\n",
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=20,
+                )
+                response = json.loads(launched.stdout)["result"]
+                self.assertNotIn("isError", response, response)
+                url = response["structuredContent"]["launch_url"]
+                status, body = server._http_request(
+                    "POST",
+                    url + "api/call",
+                    headers={"Origin": url.rstrip("/"), "Content-Type": "application/json"},
+                    data=json.dumps({"name": "get_state", "arguments": {}}).encode(),
+                    timeout=10,
+                )
+                self.assertEqual(status, 200, body)
+                state = json.loads(body)["structuredContent"]["state"]
+                self.assertEqual(state["diagnostics"], [])
+                self.assertEqual(state["models"][0]["id"], "preserved")
+                self.assertEqual(
+                    (repository / ".git" / "runtime-marker").read_text(encoding="utf-8"),
+                    "preserved",
+                )
+                self.assertEqual(
+                    state["models"][0]["managed_environment"],
+                    {
+                        name: host_environment.get(name)
+                        for name in ("OG_GIT_EXECUTABLE", "CODEX_PREFERRED_GIT_EXECUTABLE")
+                    },
+                )
+            finally:
+                if runtime_path.is_file():
+                    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+                    server._http_request(
+                        "POST",
+                        f"http://127.0.0.1:{runtime['port']}/api/shutdown",
+                        headers={server.CONTROLLER_CONTROL_HEADER: runtime["control_token"]},
+                    )
+
     def test_newest_enabled_installation_uses_semantic_versions_and_ignores_disabled(self) -> None:
         server = load_server()
         with tempfile.TemporaryDirectory() as temporary:
@@ -35,6 +166,7 @@ class ControllerInstallationTests(unittest.TestCase):
             (codex_home / "config.toml").write_text(
                 '[plugins."codex-bakeoff@older"]\nenabled = true\n'
                 '[plugins."codex-bakeoff@newer"]\nenabled = true\n'
+                '[plugins."codex-bakeoff@incomplete"]\nenabled = true\n'
                 '[plugins."codex-bakeoff@disabled"]\nenabled = false\n',
                 encoding="utf-8",
             )
@@ -46,12 +178,14 @@ class ControllerInstallationTests(unittest.TestCase):
                 (root / ".codex-plugin" / "plugin.json").write_text(
                     json.dumps({"name": "codex-bakeoff", "version": version}), encoding="utf-8"
                 )
-                (root / "mcp" / "server.py").touch()
-                (root / "mcp" / "controller.html").touch()
+                for name in REQUIRED_MCP_FILES:
+                    (root / "mcp" / name).touch()
                 return root
 
             install("older", "1.0.9")
             newest = install("newer", "1.0.10")
+            incomplete = install("incomplete", "1.0.11")
+            (incomplete / "mcp" / "replay_batch.py").unlink()
             install("disabled", "9.0.0")
 
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
@@ -103,7 +237,7 @@ class ControllerInstallationTests(unittest.TestCase):
             (plugin_root / ".codex-plugin" / "plugin.json").write_text(
                 json.dumps({"name": "codex-bakeoff", "version": "1.0.10"}), encoding="utf-8"
             )
-            for name in ("server.py", "controller.html"):
+            for name in REQUIRED_MCP_FILES:
                 shutil.copyfile(PLUGIN_ROOT / "mcp" / name, plugin_root / "mcp" / name)
 
             port = None

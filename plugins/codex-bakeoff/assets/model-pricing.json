@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "as_of": "2026-07-31",
+  "as_of": "2026-08-21",
   "currency": "USD",
   "unit": "per_1m_tokens",
   "pricing_basis": "standard, non-batch, API-equivalent token pricing; not a subscription charge",
@@ -18,14 +18,19 @@
       "url": "https://support.claude.com/en/articles/15424964-claude-fable-5-on-your-plan"
     },
     {
-      "provider": "litellm",
-      "url": "https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json"
+      "provider": "anthropic",
+      "url": "https://www-cdn.anthropic.com/files/4zrzovbb/website/5678bc2f5978e5bcd4f1fe7c14b2c72284dcf9f8.pdf",
+      "note": "Historical Claude API standard/global rates from the May 12, 2026 list-price card, page 3. Retired models are omitted from the current pricing table."
+    },
+    {
+      "provider": "anthropic",
+      "url": "https://claude.com/blog/prompt-caching",
+      "note": "Published Claude 3 Haiku input, output, cache-read and five-minute write rates. Its one-hour write rate uses the documented 2x input multiplier."
     }
   ],
-  "dynamic_fallback": {
-    "url": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
-    "format": "litellm_per_token",
-    "note": "Primary pricing source; bundled model rates are retained as an offline fallback."
+  "dynamic_sources": {
+    "openai": "https://developers.openai.com/api/docs/pricing.md",
+    "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing.md"
   },
   "subscription_reference": {
     "comparison_basis": "matched $100/month individual subscription plans",
@@ -46,49 +51,49 @@
       "aliases": [
         "gpt-5.6"
       ],
-      "input": 5.0,
-      "cached_input": 0.5,
-      "cache_write": 6.25,
-      "output": 30.0,
+      "input": 4.0,
+      "cached_input": 0.4,
+      "cache_write": 5.0,
+      "output": 20.0,
       "context_tier": "up to 272000 input tokens",
       "long_context_threshold_input_tokens": 272000,
       "long_context": {
-        "input": 10.0,
-        "cached_input": 1.0,
-        "cache_write": 12.5,
-        "output": 45.0
+        "input": 8.0,
+        "cached_input": 0.8,
+        "cache_write": 10.0,
+        "output": 30.0
       }
     },
     "gpt-5.6-terra": {
       "provider": "openai",
       "aliases": [],
-      "input": 2.5,
-      "cached_input": 0.25,
-      "cache_write": 3.125,
-      "output": 15.0,
+      "input": 2.0,
+      "cached_input": 0.2,
+      "cache_write": 2.5,
+      "output": 12.0,
       "context_tier": "up to 272000 input tokens",
       "long_context_threshold_input_tokens": 272000,
       "long_context": {
-        "input": 5.0,
-        "cached_input": 0.5,
-        "cache_write": 6.25,
-        "output": 22.5
+        "input": 4.0,
+        "cached_input": 0.4,
+        "cache_write": 5.0,
+        "output": 18.0
       }
     },
     "gpt-5.6-luna": {
       "provider": "openai",
       "aliases": [],
-      "input": 1.0,
-      "cached_input": 0.1,
-      "cache_write": 1.25,
-      "output": 6.0,
+      "input": 0.2,
+      "cached_input": 0.02,
+      "cache_write": 0.25,
+      "output": 1.2,
       "context_tier": "up to 272000 input tokens",
       "long_context_threshold_input_tokens": 272000,
       "long_context": {
-        "input": 2.0,
-        "cached_input": 0.2,
-        "cache_write": 2.5,
-        "output": 9.0
+        "input": 0.4,
+        "cached_input": 0.04,
+        "cache_write": 0.5,
+        "output": 1.8
       }
     },
     "gpt-5.4": {
@@ -120,6 +125,75 @@
       "input": 1.75,
       "cached_input": 0.175,
       "output": 14.0
+    },
+    "claude-3-7-sonnet": {
+      "provider": "anthropic",
+      "aliases": [
+        "claude-3-7-sonnet-20250219"
+      ],
+      "input": 3.0,
+      "cached_input": 0.3,
+      "cache_write": 3.75,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "output": 15.0
+    },
+    "claude-3-5-sonnet": {
+      "provider": "anthropic",
+      "aliases": [
+        "claude-3-5-sonnet-20240620",
+        "claude-3-5-sonnet-20241022"
+      ],
+      "input": 3.0,
+      "cached_input": 0.3,
+      "cache_write": 3.75,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "output": 15.0
+    },
+    "claude-3-5-haiku": {
+      "provider": "anthropic",
+      "aliases": [
+        "claude-3-5-haiku-20241022"
+      ],
+      "input": 0.8,
+      "cached_input": 0.08,
+      "cache_write": 1.0,
+      "cache_write_5m": 1.0,
+      "cache_write_1h": 1.6,
+      "output": 4.0
+    },
+    "claude-3-opus": {
+      "provider": "anthropic",
+      "aliases": [
+        "claude-3-opus-20240229"
+      ],
+      "input": 15.0,
+      "cached_input": 1.5,
+      "cache_write": 18.75,
+      "cache_write_5m": 18.75,
+      "cache_write_1h": 30.0,
+      "output": 75.0
+    },
+    "claude-3-sonnet": {
+      "provider": "anthropic",
+      "aliases": [
+        "claude-3-sonnet-20240229"
+      ],
+      "input": 3.0,
+      "output": 15.0
+    },
+    "claude-3-haiku": {
+      "provider": "anthropic",
+      "aliases": [
+        "claude-3-haiku-20240307"
+      ],
+      "input": 0.25,
+      "cached_input": 0.03,
+      "cache_write": 0.3,
+      "cache_write_5m": 0.3,
+      "cache_write_1h": 0.5,
+      "output": 1.25
     },
     "claude-fable-5": {
       "provider": "anthropic",

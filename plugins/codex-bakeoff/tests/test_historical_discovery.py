@@ -295,6 +295,66 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         self.assertNotIn("source_sha256", replay)
         self.assertNotIn("configuration_fingerprint", replay)
 
+    def test_range_excludes_later_tool_launches_and_session_totals(self) -> None:
+        session, _ = self.select(
+            [
+                self.user("u1", "Create the seed", "2026-01-01T10:00:00Z"),
+                self.assistant("a1", "Seed done", "2026-01-01T10:01:00Z"),
+                self.user("u2", "Create the result", "2026-01-01T10:02:00Z"),
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-01-01T10:03:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "later-agent",
+                                "name": "Agent",
+                                "input": {"prompt": "later work"},
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-01-01T10:04:00Z",
+                    "toolUseResult": {"agentId": "unavailable-later-agent"},
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "later-agent",
+                                "content": "launched",
+                            }
+                        ],
+                    },
+                },
+            ]
+        )
+        session["recorded_claude_result"] = {"duration_ms": 999999, "total_cost_usd": 42}
+        replay = discovery.build_replay_spec(
+            session,
+            {
+                "start_message_uuid": "u1",
+                "end_message_uuid": "u1",
+            },
+        )
+        self.assertEqual(replay["request"], "Create the seed")
+        self.assertEqual(replay["prior_user_requests"], [])
+        self.assertEqual(replay["linked_sources"], [])
+        self.assertNotIn("Agent", replay["observed_tools"])
+        self.assertNotIn("recorded_claude_result", replay)
+        self.assertEqual(
+            discovery.recover_historical_final_response(
+                session["source_path"],
+                "u1",
+                end_message_uuid="u1",
+            ),
+            "Seed done",
+        )
+
     def test_whole_thread_replay_includes_human_queued_commands(self) -> None:
         requests = [
             "download the linux repo",
@@ -381,6 +441,36 @@ class HistoricalDiscoveryTests(unittest.TestCase):
         self.assertNotIn("implementation location", serialized)
         self.assertNotIn("all tests pass", serialized)
 
+        chunk = discovery.build_replay_spec(
+            session,
+            {
+                "start_message_uuid": "u2",
+                "end_message_uuid": "u2",
+            },
+        )
+        self.assertEqual(
+            chunk["prompt_reconstruction_turns"],
+            replay["prompt_reconstruction_turns"][1:3],
+        )
+        self.assertEqual(chunk["prior_user_requests"], ["add hello world"])
+        serialized = json.dumps(chunk["prompt_reconstruction_turns"])
+        self.assertNotIn("implementation location", serialized)
+        self.assertNotIn("all tests pass", serialized)
+        self.assertNotIn("make it executable", serialized)
+        later = discovery.build_replay_spec(
+            session,
+            {
+                "start_message_uuid": "u3",
+                "end_message_uuid": "u3",
+            },
+        )
+        self.assertEqual(
+            later["prompt_reconstruction_turns"],
+            [
+                {"role": "user", "text": "make it executable"},
+            ],
+        )
+
     def test_prompt_reconstruction_includes_structured_question_answers(self) -> None:
         question_event = {
             "type": "assistant",
@@ -464,6 +554,33 @@ class HistoricalDiscoveryTests(unittest.TestCase):
             ],
         )
 
+        clarification = replay["prompt_reconstruction_turns"][1]
+        for answered in (False, True):
+            with self.subTest(answered=answered):
+                session, _ = self.select(
+                    [
+                        self.user("u1", "add an example", "2026-01-01T10:00:00Z"),
+                        question_event,
+                        *([answer_event] if answered else []),
+                        self.user("u2", "2", "2026-01-01T10:03:00Z"),
+                        self.assistant("a2", "Created the docs", "2026-01-01T10:04:00Z"),
+                    ]
+                )
+                chunk = discovery.build_replay_spec(
+                    session,
+                    {
+                        "start_message_uuid": "u2",
+                        "end_message_uuid": "u2",
+                    },
+                )
+                self.assertEqual(
+                    chunk["prompt_reconstruction_turns"],
+                    [
+                        *([] if answered else [clarification]),
+                        {"role": "user", "text": "2"},
+                    ],
+                )
+
     def test_prompt_reconstruction_marks_truncated_turns(self) -> None:
         request = "x" * (discovery.MAX_PROMPT_RECONSTRUCTION_TURN_CHARS + 1)
         session, task = self.select([self.user("u1", request, "2026-01-01T10:00:00Z")])
@@ -515,16 +632,100 @@ class HistoricalDiscoveryTests(unittest.TestCase):
                 "name": "Write",
                 "input": {"file_path": str(self.project / "absolute.txt")},
             },
+            {
+                "type": "tool_use",
+                "id": "write-2",
+                "name": "write_file",
+                "input": {"path": "generated.txt"},
+            },
+            {
+                "type": "tool_use",
+                "id": "shell-1",
+                "name": "Bash",
+                "input": {"command": "touch touched.txt && printf hi > redirected.txt"},
+            },
+            {
+                "type": "tool_use",
+                "id": "write-failed",
+                "name": "Write",
+                "input": {"file_path": "failed.txt"},
+            },
         ]
+        results = {
+            "type": "user",
+            "timestamp": "2026-01-01T10:01:01Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": "ok",
+                    }
+                    for tool_id in ("edit-1", "write-1", "write-2", "shell-1")
+                ]
+                + [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "write-failed",
+                        "content": "permission denied",
+                        "is_error": True,
+                    }
+                ],
+            },
+        }
         session, task = self.select(
-            [self.user("u1", "fix the project", "2026-01-01T10:00:00Z"), event]
+            [self.user("u1", "fix the project", "2026-01-01T10:00:00Z"), event, results]
         )
 
         replay = discovery.build_replay_spec(session, task)
 
         self.assertEqual(
             replay["historical_changed_files"],
-            sorted((str(self.project / "absolute.txt"), str(nested / "src/builtin.c"))),
+            sorted(
+                (
+                    str(self.project / "absolute.txt"),
+                    str(nested / "generated.txt"),
+                    str(nested / "redirected.txt"),
+                    str(nested / "src/builtin.c"),
+                    str(nested / "touched.txt"),
+                )
+            ),
+        )
+
+    def test_shell_changed_files_reject_quoted_redirects_and_heredocs(self) -> None:
+        self.assertEqual(
+            discovery._shell_changed_files('echo ">" existing.txt', str(self.project)),
+            [],
+        )
+        self.assertEqual(
+            discovery._shell_changed_files(
+                "cat <<EOF\n<div>text</div>\nEOF",
+                str(self.project),
+            ),
+            [],
+        )
+
+    def test_shell_changed_files_recovers_simple_literal_mutations(self) -> None:
+        self.assertEqual(
+            discovery._shell_changed_files(
+                "printf hi | tee tee.txt && cp source.txt copied.txt && mv old.txt moved.txt",
+                str(self.project),
+            ),
+            [
+                str(self.project / "tee.txt"),
+                str(self.project / "copied.txt"),
+                str(self.project / "moved.txt"),
+            ],
+        )
+
+    def test_shell_changed_files_rejects_optioned_copy_and_move(self) -> None:
+        self.assertEqual(
+            discovery._shell_changed_files(
+                "cp -t output source.txt && mv -t output old.txt",
+                str(self.project),
+            ),
+            [],
         )
 
     def test_git_status_evidence_matches_selected_repository(self) -> None:

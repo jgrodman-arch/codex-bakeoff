@@ -9,8 +9,6 @@ import http.client
 import importlib.util
 import json
 import os
-import re
-import signal
 import socket
 import subprocess
 import sys
@@ -18,19 +16,19 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 SERVER_PATH = PLUGIN_ROOT / "mcp" / "server.py"
 CONTROLLER_PATH = PLUGIN_ROOT / "mcp" / "controller.html"
-PUBLIC_TOOL_NAMES = ("open_controller",)
 
 
 def load_server():
-    spec = importlib.util.spec_from_file_location("replay_mcp_server", SERVER_PATH)
+    spec = importlib.util.spec_from_file_location("replay_controller_server", SERVER_PATH)
     if spec is None or spec.loader is None:
-        raise AssertionError("Cannot load the MCP server.")
+        raise AssertionError("Cannot load the controller server.")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -64,6 +62,7 @@ def controller_request(
 _CONTROLLER_HARNESS = r"""
 const fs = require("node:fs");
 const source = fs.readFileSync(process.argv[1], "utf8");
+require(require("node:path").join(require("node:path").dirname(process.argv[1]), "controller-ranges.js"));
 const extract = (start, end) => {
   const first = source.indexOf(start);
   const last = source.indexOf(end, first);
@@ -96,7 +95,70 @@ process.stdout.write(render(JSON.parse(process.argv[2])));
     return result.stdout
 
 
-class McpServerTests(unittest.TestCase):
+class ControllerServerTests(unittest.TestCase):
+    def test_stdio_exposes_only_the_controller_launcher(self) -> None:
+        requests = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25"},
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "start_run", "arguments": {}},
+            },
+            {"jsonrpc": "2.0", "id": 4, "method": "ping"},
+        ]
+        result = subprocess.run(
+            [sys.executable, str(SERVER_PATH)],
+            input="\n".join(json.dumps(request) for request in requests) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        replies = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([reply["id"] for reply in replies], [1, 2, 3, 4])
+        self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-11-25")
+        self.assertEqual(
+            [tool["name"] for tool in replies[1]["result"]["tools"]], ["open_controller"]
+        )
+        self.assertTrue(replies[2]["result"]["isError"])
+        self.assertEqual(replies[3]["result"], {})
+
+    def test_mcp_launch_rejects_invalid_identity_before_writing(self) -> None:
+        server = load_server()
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(server, "RUN_ROOT", Path(temporary) / "runs"),
+        ):
+            result = server._handle_mcp_request(
+                "tools/call",
+                {
+                    "name": "open_controller",
+                    "arguments": {"controller_session_id": "../outside"},
+                },
+            )
+            self.assertTrue(result["isError"])
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_controller_reports_unsupported_python_before_spawning(self) -> None:
+        server = load_server()
+        with (
+            mock.patch.object(
+                server, "_python_runtime_issue", return_value={"message": "Unsupported Python"}
+            ),
+            mock.patch.object(server, "_spawn_controller_daemon") as spawn,
+            self.assertRaisesRegex(server.ControllerError, "Unsupported Python"),
+        ):
+            server._ensure_controller_daemon()
+        spawn.assert_not_called()
+
     def test_python_39_is_supported_and_38_is_reported(self) -> None:
         server = load_server()
         self.assertIsNone(server._python_runtime_issue((3, 9, 0)))
@@ -106,218 +168,7 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(issue["detected_version"], "3.8.20")
         self.assertEqual(issue["required_version"], "3.9+")
 
-    def test_controller_opener_reports_unsupported_python_before_starting(self) -> None:
-        server = load_server()
-        issue = {
-            "kind": "dependency",
-            "dependency": "python",
-            "status": "unsupported",
-            "message": "Python is unsupported.",
-        }
-        with (
-            mock.patch.object(server, "_python_runtime_issue", return_value=issue),
-            mock.patch.object(server, "_ensure_controller_daemon") as ensure,
-        ):
-            result = server._call_tool({"name": "open_controller", "arguments": {}})
-
-        ensure.assert_not_called()
-        self.assertTrue(result["isError"])
-        self.assertFalse(result["structuredContent"]["opened"])
-        self.assertEqual(result["structuredContent"]["issue"], issue)
-
-    def test_only_controller_opener_is_model_visible(self) -> None:
-        server = load_server()
-        tools = server.tool_definitions()
-        self.assertEqual(tuple(item["name"] for item in tools), PUBLIC_TOOL_NAMES)
-        (opener,) = tools
-        self.assertIn("codex_cli_path", opener["inputSchema"]["properties"])
-        self.assertIn("available browser", opener["description"])
-        self.assertTrue(opener["annotations"]["readOnlyHint"])
-        for tool in tools:
-            with self.subTest(name=tool["name"]):
-                self.assertNotIn("ui", tool.get("_meta", {}))
-                self.assertNotIn("ui/resourceUri", tool.get("_meta", {}))
-                self.assertEqual(tool["execution"]["taskSupport"], "forbidden")
-
-    def test_public_tool_schemas_use_json_compatible_patterns(self) -> None:
-        server = load_server()
-
-        def check_schema(schema, path):
-            if isinstance(schema, dict):
-                pattern = schema.get("pattern")
-                if pattern is not None:
-                    with self.subTest(path=path, pattern=pattern):
-                        self.assertIsInstance(pattern, str)
-                        self.assertNotIn(r"\A", pattern)
-                        self.assertNotIn(r"\Z", pattern)
-                        self.assertNotIn(r"\z", pattern)
-                        re.compile(pattern)
-                for name, value in schema.items():
-                    check_schema(value, f"{path}.{name}")
-            elif isinstance(schema, list):
-                for index, value in enumerate(schema):
-                    check_schema(value, f"{path}[{index}]")
-
-        for tool in server.tool_definitions():
-            check_schema(tool["inputSchema"], tool["name"])
-
-    def test_configuration_schemas_accept_non_git_commit_placeholders(self) -> None:
-        server = load_server()
-
-        def permits(schema, value):
-            if "anyOf" in schema:
-                return any(permits(option, value) for option in schema["anyOf"])
-            if "oneOf" in schema:
-                return sum(permits(option, value) for option in schema["oneOf"]) == 1
-            allowed = schema.get("type")
-            allowed_types = allowed if isinstance(allowed, list) else [allowed]
-            if value is None:
-                return "null" in allowed_types
-            return (
-                "string" in allowed_types
-                and isinstance(value, str)
-                and len(value) >= schema.get("minLength", 0)
-            )
-
-        for name, value, approval in (
-            ("prepare_run", "", False),
-            ("start_run", None, True),
-        ):
-            properties = server._configuration_schema(approval=approval)["properties"]
-            for field in ("baseline_commit", "ending_commit"):
-                with self.subTest(tool=name, field=field, value=value):
-                    self.assertTrue(
-                        permits(properties[field], value),
-                        f"{name}.{field} rejects the valid Non-Git placeholder {value!r}",
-                    )
-        normalized = server._configuration_schema(approval=True)["properties"]
-        for field in (
-            "repo",
-            "source_path",
-            "message_uuid",
-            "request",
-            "beginning_kind",
-            "ending_kind",
-        ):
-            with self.subTest(tool="start_run", field=field, value=None):
-                self.assertTrue(permits(normalized[field], None))
-
-    def test_stdio_handshake_lists_controller_without_embedded_resources(self) -> None:
-        requests = [
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {"protocolVersion": "2025-11-25"},
-            },
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            {"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}},
-        ]
-        completed = subprocess.run(
-            [sys.executable, str(SERVER_PATH)],
-            cwd=PLUGIN_ROOT,
-            input="\n".join(json.dumps(item) for item in requests) + "\n",
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        responses = [json.loads(line) for line in completed.stdout.splitlines()]
-        self.assertEqual([item["id"] for item in responses], [1, 2, 3])
-        initialization = responses[0]["result"]
-        self.assertEqual(initialization["serverInfo"]["name"], "codex-bakeoff")
-        self.assertEqual(
-            tuple(item["name"] for item in responses[1]["result"]["tools"]),
-            PUBLIC_TOOL_NAMES,
-        )
-        self.assertEqual(responses[2]["result"]["resources"], [])
-
-    def test_stdio_cannot_call_private_browser_actions(self) -> None:
-        server = load_server()
-        for name in server.HTTP_TOOL_NAMES:
-            with self.subTest(name=name), mock.patch.object(server, "_call_tool") as call_tool:
-                result, error = server._handle_request(
-                    "tools/call",
-                    {"name": name, "arguments": {}},
-                )
-
-            call_tool.assert_not_called()
-            self.assertIsNone(error)
-            self.assertTrue(result["isError"])
-            self.assertIn(name, result["content"][0]["text"])
-
-    def test_resource_read_is_not_supported(self) -> None:
-        server = load_server()
-        result, error = server._handle_request(
-            "resources/read",
-            {"uri": "ui://codex-bakeoff/not-the-controller.html"},
-        )
-        self.assertIsNone(result)
-        self.assertEqual(error["code"], -32601)
-
-    def test_controller_opener_returns_direct_local_url_without_opening(self) -> None:
-        server = load_server()
-        launch_url = "http://127.0.0.1:43117/"
-        with (
-            mock.patch.object(
-                server,
-                "_ensure_controller_daemon",
-                return_value=(43117, {"version": "test-version"}),
-            ),
-            mock.patch.object(server, "_run_worker") as run_worker,
-        ):
-            result = server._call_tool({"name": "open_controller", "arguments": {}})
-
-        run_worker.assert_not_called()
-        structured = result["structuredContent"]
-        self.assertTrue(structured["prepared"])
-        self.assertFalse(structured["opened"])
-        self.assertEqual(structured["launch_url"], launch_url)
-        self.assertEqual(structured["origin"], "http://127.0.0.1:43117")
-        self.assertEqual(structured["controller_version"], "test-version")
-        self.assertNotIn("token=", structured["launch_url"])
-        self.assertNotIn("import webbrowser", SERVER_PATH.read_text(encoding="utf-8"))
-
-    def test_controller_opener_carries_invoking_task_codex_path_to_worker(self) -> None:
-        server = load_server()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            bin_directory = root / "bin"
-            lib_directory = root / "lib"
-            bin_directory.mkdir()
-            lib_directory.mkdir()
-            target = lib_directory / "codex.js"
-            target.touch()
-            target.chmod(0o700)
-            codex = bin_directory / "codex"
-            codex.symlink_to(target)
-            hint_path = root / "codex-cli-path.json"
-            with (
-                mock.patch.object(server, "REPLAY_CACHE_ROOT", root),
-                mock.patch.object(server, "CODEX_CLI_PATH_HINT_PATH", hint_path),
-                mock.patch.object(
-                    server,
-                    "_ensure_controller_daemon",
-                    return_value=(43117, {"version": "test-version"}),
-                ) as ensure,
-            ):
-                result = server._call_tool(
-                    {
-                        "name": "open_controller",
-                        "arguments": {"codex_cli_path": str(codex)},
-                    }
-                )
-                with mock.patch.dict(os.environ, {"PATH": ""}, clear=True):
-                    worker_environment = server._worker_environment()
-
-            self.assertTrue(result["structuredContent"]["prepared"])
-            self.assertFalse(result["structuredContent"]["opened"])
-            ensure.assert_called_once_with(codex_cli_path=str(codex))
-            self.assertEqual(worker_environment["CODEX_CLI_PATH"], str(codex))
-            self.assertEqual(worker_environment["PATH"].split(os.pathsep)[0], str(bin_directory))
-            self.assertEqual(json.loads(hint_path.read_text(encoding="utf-8"))["path"], str(codex))
-
-    def test_mcp_server_uses_http_without_launching_external_browser(self) -> None:
+    def test_controller_uses_http_without_launching_external_browser(self) -> None:
         source = SERVER_PATH.read_text(encoding="utf-8")
         self.assertIn("import http.server", source)
         self.assertNotIn("import webbrowser", source)
@@ -343,30 +194,6 @@ class McpServerTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(server._controller_idle_timeout_seconds(), 0.5)
-
-    def test_each_controller_open_prepares_an_independent_session(self) -> None:
-        server = load_server()
-        with (
-            mock.patch.object(
-                server,
-                "_ensure_controller_daemon",
-                side_effect=(
-                    (43118, {"version": "test-version", "controller_session_id": "first"}),
-                    (43119, {"version": "test-version", "controller_session_id": "second"}),
-                ),
-            ) as ensure,
-            mock.patch.object(server.os, "kill") as kill,
-        ):
-            first = server._call_tool({"name": "open_controller", "arguments": {}})
-            second = server._call_tool({"name": "open_controller", "arguments": {}})
-
-        kill.assert_not_called()
-        self.assertEqual(ensure.call_count, 2)
-        self.assertEqual(first["structuredContent"]["launch_url"], "http://127.0.0.1:43118/")
-        self.assertEqual(second["structuredContent"]["launch_url"], "http://127.0.0.1:43119/")
-        self.assertEqual(first["structuredContent"]["controller_session_id"], "first")
-        self.assertEqual(second["structuredContent"]["controller_session_id"], "second")
-        self.assertNotIn("requires_confirmation", first["structuredContent"])
 
     def test_controller_probe_rejects_a_stale_runtime_token(self) -> None:
         server = load_server()
@@ -463,6 +290,15 @@ class McpServerTests(unittest.TestCase):
             self.assertIn(b"codex-bakeoff.controller-draft.v7", body)
             self.assertNotIn(b"window.openai", body)
             self.assertNotIn(b"controller-session", body)
+            status, headers, body = request("GET", "/controller.css")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Type"], "text/css; charset=utf-8")
+            self.assertIn(b":root", body)
+            status, headers, body = request("GET", "/controller-ranges.js")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
+            self.assertEqual(body, server.APP_RANGES.read_bytes())
+            self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
 
             result = {
                 "content": [{"type": "text", "text": "Ready."}],
@@ -522,9 +358,14 @@ class McpServerTests(unittest.TestCase):
             run_directory = run_root / "run-1"
             run_directory.mkdir()
             artifacts = {
-                "json": (b'{"status":"completed"}\n', "application/json; charset=utf-8"),
+                "json": (
+                    b'{"status":"completed","original_request":"'
+                    + b"x" * (19 * 1024 * 1024)
+                    + b'"}\n',
+                    "application/json; charset=utf-8",
+                ),
                 "html": (
-                    b"<!doctype html><title>Replay report</title>",
+                    b"<!doctype html><title>Replay report</title>" + b"x" * (19 * 1024 * 1024),
                     "text/html; charset=utf-8",
                 ),
             }
@@ -943,6 +784,125 @@ class McpServerTests(unittest.TestCase):
             with self.assertRaisesRegex(server.ControllerError, "Node.js 18 or newer"):
                 server._node_runtime()
 
+    def test_configuration_only_promotes_required_details_after_loading(self) -> None:
+        draft = {
+            "thread_id": "thread-1",
+            "source_path": "/tmp/transcript.jsonl",
+            "message_uuid": "message-1",
+            "request": "Fix the task",
+            "repo": "/tmp/project",
+            "beginning_kind": "git",
+            "ending_kind": "git",
+            "baseline_commit": "abc123",
+            "ending_commit": "def456",
+            "models": ["gpt-5.6-sol"],
+        }
+        sections = {
+            "configuration-heading",
+            "beginning-state-heading",
+            "end-state-heading",
+            "files-heading",
+        }
+        cases = [
+            ("complete", {}, {}, set()),
+            ("missing repo", {"repo": ""}, {}, {"configuration-heading"}),
+            ("missing prompt", {"request": ""}, {}, {"configuration-heading"}),
+            ("missing message", {"message_uuid": ""}, {}, {"configuration-heading"}),
+            ("missing beginning", {"baseline_commit": ""}, {}, {"beginning-state-heading"}),
+            ("missing end", {"ending_commit": ""}, {}, {"end-state-heading"}),
+            (
+                "unknown states",
+                {"beginning_kind": "", "ending_kind": ""},
+                {},
+                {"beginning-state-heading", "end-state-heading"},
+            ),
+            (
+                "non-git attribution",
+                {"beginning_kind": "non_git", "ending_kind": "non_git"},
+                {
+                    "file_selection": {
+                        "source_kind": "non_git",
+                        "candidates": [{"path": "output.txt", "selectable": True}],
+                    },
+                    "baseline": {
+                        "beginning_kind": "non_git",
+                        "ending_kind": "non_git",
+                        "repository": "/tmp/project",
+                    },
+                },
+                {"files-heading"},
+            ),
+        ]
+        inputs = []
+        expectations = []
+        for name, overrides, inspection, expected in cases:
+            for prompt_pending, directory_pending in (
+                (True, True),
+                (True, False),
+                (False, True),
+                (False, False),
+            ):
+                loading = prompt_pending or directory_pending
+                inputs.append(
+                    {
+                        "reviewDraft": {**draft, **overrides},
+                        "inspection": {
+                            "replay": {"message_uuid": "message-1"},
+                            "baseline": {
+                                "repository": "/tmp/project",
+                                "beginning_kind": "git",
+                                "ending_kind": "git",
+                                "commit": "abc123",
+                                "ending_commit": "def456",
+                            },
+                            **inspection,
+                        },
+                        "models": [{"id": "gpt-5.6-sol", "label": "Sol"}],
+                        "promptGeneration": "pending" if prompt_pending else "llm_synthesis",
+                        "workingDirectoryLoading": directory_pending,
+                    }
+                )
+                expectations.append((name, prompt_pending, directory_pending, loading, expected))
+        harness = (
+            _CONTROLLER_HARNESS
+            + r"""
+const render = new Function("document", [
+  extract("      const STEPS =", '      app.addEventListener("click"'),
+  "return (values) => { Object.assign(state, values); return renderConfigureStep(); };",
+].join("\n"))({getElementById: () => null});
+process.stdout.write(JSON.stringify(JSON.parse(process.argv[2]).map(render)));
+"""
+        )
+        result = subprocess.run(
+            ["node", "-e", harness, str(CONTROLLER_PATH), json.dumps(inputs)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        for html, (name, prompt_pending, directory_pending, loading, expected) in zip(
+            json.loads(result.stdout), expectations, strict=True
+        ):
+            with self.subTest(
+                case=name, prompt_pending=prompt_pending, directory_pending=directory_pending
+            ):
+                inline, details = html.split('<details id="configuration-details"', 1)
+                for section in sections:
+                    self.assertEqual(
+                        f'id="{section}"' in inline, not loading and section in expected
+                    )
+                self.assertIn('id="selected-thread-heading"', inline)
+                self.assertIn('id="replay-models-heading"', inline)
+                self.assertNotIn(" open>", details.split("<summary", 1)[0])
+                start = html.split('data-action="approve-configuration"', 1)[1].split(
+                    "</button>", 1
+                )[0]
+                self.assertEqual("Loading configuration" in start, loading)
+                if loading or expected:
+                    self.assertIn("disabled", start)
+                else:
+                    self.assertNotIn("disabled", start)
+
     def test_controller_uses_direct_http_and_versioned_local_storage_draft(self) -> None:
         controller = CONTROLLER_PATH.read_text(encoding="utf-8")
         snapshot = controller.split("function draftSnapshot()", 1)[1].split(
@@ -1019,45 +979,31 @@ class McpServerTests(unittest.TestCase):
             'confirm_empty_beginning: draft.beginning_kind === "non_git"',
             controller,
         )
-        refresh_check = controller.split("function selectionNeedsRefresh()", 1)[1].split(
-            "function selectionPayload", 1
-        )[0]
-        self.assertNotIn("ending_commit", refresh_check)
         self.assertIn("Ending commit", configure)
         self.assertIn('id="review-ending-commit"', configure)
         self.assertIn("Historical output", configure)
-        self.assertIn("Unchecked files will be ignored", configure)
         self.assertIn("Reconstructed task prompt", configure)
-        self.assertIn(
-            "Select one or more models. Selected models run in parallel.",
-            configure,
-        )
         self.assertNotIn(
             "I reviewed every current Git change and this attribution is complete",
             controller,
         )
-        self.assertIn('finalStep ? "approve-configuration"', configure)
+        self.assertIn('data-action="approve-configuration"', configure)
         self.assertIn("Checking configuration", configure)
         self.assertIn("Review and confirm", configure)
         self.assertIn("Entire configuration", configure)
         self.assertIn("safeJson(configuration)", configure)
-        self.assertIn("Approve with gaps and start", configure)
-        self.assertIn('finalStep ? "approve-configuration" : "configuration-next"', configure)
+        self.assertIn('id="configuration-confirmation"', configure)
+        for label in ("Start with capability gaps", "Configure details", "Choose models"):
+            self.assertIn(label, configure)
+        self.assertEqual(configure.count('data-model-variant="${escapeHtml(id)}"'), 1)
+        self.assertNotIn('data-action="configuration-next"', configure)
         self.assertIn('data-action="configuration-back"', configure)
-        self.assertIn(
-            "const nextDisabled = Boolean(state.busy) || replayDetailsLoading()", configure
-        )
-        self.assertIn('${nextDisabled ? "disabled" : ""}', configure)
         loading_gate = controller.split("function replayDetailsLoading()", 1)[1].split(
             "function configurationStepProblems", 1
         )[0]
         self.assertIn("state.configurationStep === 0", loading_gate)
         self.assertIn('state.promptGeneration === "pending"', loading_gate)
         self.assertIn("state.workingDirectoryLoading", loading_gate)
-        next_step = controller.split("async function nextConfigurationStep()", 1)[1].split(
-            "function previousConfigurationStep", 1
-        )[0]
-        self.assertIn("if (replayDetailsLoading()) return", next_step)
         self.assertIn("refreshAttributionAndContinue", controller)
 
         diagnostics = controller.split("function inspectionDiagnostics()", 1)[1].split(
@@ -1090,14 +1036,15 @@ class McpServerTests(unittest.TestCase):
         self.assertNotIn('id="approval-dialog"', controller)
         self.assertNotIn('id="approval-check"', controller)
 
-        prepare_run = controller.split("async function prepareRun()", 1)[1].split(
+        prepare_run = controller.split("async function prepareRun(", 1)[1].split(
             "async function startRun", 1
         )[0]
         self.assertIn("const reviewRevision = state.reviewRevision", prepare_run)
         self.assertIn('callTool("prepare_run", configuration)', prepare_run)
         self.assertIn("reviewRevision !== state.reviewRevision", prepare_run)
         self.assertIn('state.step !== "configure"', prepare_run)
-        self.assertIn("if (shouldStart) await startRun()", prepare_run)
+        self.assertIn("Review historical output before starting", prepare_run)
+        self.assertIn("if (shouldStart && autoStart) await startRun()", prepare_run)
         self.assertNotIn("showModal", prepare_run)
         self.assertIn("approvedConfiguration()", controller)
 
@@ -1118,17 +1065,7 @@ class McpServerTests(unittest.TestCase):
             "async function prepareRun", 1
         )[0]
         self.assertIn("if (state.busy || state.run) return", select_thread)
-        self.assertIn(
-            'shouldSynthesize = state.promptGeneration === "pending"',
-            select_thread,
-        )
         self.assertIn("state.reviewDraft = reviewDraftFromConfiguration()", select_thread)
-        self.assertIn("state.workingDirectoryLoading = true", select_thread)
-        self.assertIn("void inferWorkingDirectory(id)", select_thread)
-        self.assertLess(
-            select_thread.index('state.busy = ""'),
-            select_thread.index("void inferWorkingDirectory(id)"),
-        )
         self.assertLess(
             select_thread.index("state.classifications = Object.create(null)"),
             select_thread.index("render();"),
@@ -1145,13 +1082,16 @@ class McpServerTests(unittest.TestCase):
         go_step = click_handler.split('if (action === "go-step")', 1)[1]
         self.assertNotIn("pollGeneration", go_step)
 
-        thread_step = controller.split("function renderThreadStep", 1)[1].split(
-            "function capabilityRows", 1
-        )[0]
+        thread_step = (
+            CONTROLLER_PATH.with_name("controller-ranges.js")
+            .read_text(encoding="utf-8")
+            .split("function renderThreadStep", 1)[1]
+        )
         self.assertIn("Inspecting", thread_step)
         self.assertIn('state.busy === "inspection"', thread_step)
-        self.assertIn('state.run ? "disabled"', thread_step)
-        self.assertIn("Start another replay", thread_step)
+        self.assertIn(
+            "To run another replay, open a new Codex task and invoke Codex Bakeoff.", thread_step
+        )
         self.assertIn('data-thread-number="${number}"', thread_step)
         self.assertIn('class="thread__number">#${number}', thread_step)
 
@@ -1159,19 +1099,19 @@ class McpServerTests(unittest.TestCase):
             "async function prepareRun", 1
         )[0]
         self.assertIn("state.selectedThreadNumber =", select_thread)
-        self.assertIn('threadStepEyebrow("Configuration")', controller)
+        self.assertIn('threadStepEyebrow("Replay")', controller)
         self.assertIn('threadStepEyebrow("Run in progress")', controller)
         self.assertIn('threadStepEyebrow("Comparison complete")', controller)
 
         synthesis = controller.split("async function synthesizePrompt", 1)[1].split(
-            "function resetController", 1
+            "function selectionNeedsRefresh", 1
         )[0]
         self.assertIn('callTool("synthesize_request"', synthesis)
         self.assertIn("thread_id: threadIdValue", synthesis)
         self.assertIn("state.promptEditRevision === editRevision", synthesis)
         self.assertIn("text(state.reviewDraft?.request) === fallbackRequest", synthesis)
         working_directory = controller.split("async function inferWorkingDirectory", 1)[1].split(
-            "function resetController", 1
+            "function selectionNeedsRefresh", 1
         )[0]
         self.assertIn('callTool("infer_working_directory"', working_directory)
         self.assertIn("editRevision !== state.workingDirectoryEditRevision", working_directory)
@@ -1202,12 +1142,9 @@ class McpServerTests(unittest.TestCase):
         self.assertIn('state.promptGeneration === "pending"', initializer)
         self.assertIn("await Promise.all([", initializer)
         self.assertIn('callTool("get_state", {})', initializer)
-        self.assertIn(
-            'callTool("list_threads", { offset: 0, limit: THREAD_PAGE_SIZE })', initializer
-        )
         self.assertNotIn("get_bootstrap", initializer)
         self.assertIn("const THREAD_PAGE_SIZE = 20", controller)
-        self.assertIn('data-action="load-more-threads"', controller)
+        self.assertIn('data-action="load-more-threads"', thread_step)
 
         run_step = controller.split("function renderRunStep", 1)[1].split(
             "function reportParts", 1
@@ -1976,288 +1913,165 @@ class McpServerTests(unittest.TestCase):
                 }
             )
 
-    def test_prepare_token_binds_config_and_makes_start_idempotent(self) -> None:
+    def test_supervisor_runs_models_in_independent_threads(self) -> None:
         server = load_server()
-
+        release = threading.Event()
+        running = threading.Barrier(4)
+        pids = []
         with tempfile.TemporaryDirectory() as temporary:
-            run_root = Path(temporary).resolve()
-            run_directory = run_root / "run-1"
-            run_calls = 0
-            coordinator = mock.Mock(pid=4321)
+            root = Path(temporary)
 
-            def fake_engine(command: str, arguments=(), **kwargs):
-                nonlocal run_calls
+            def workflow(directory, request):
+                pids.append(os.getpid())
+                running.wait(timeout=5)
+                release.wait(timeout=5)
+
+            with mock.patch.object(server, "_coordinator", side_effect=workflow):
+                for model in ("sol", "terra", "luna"):
+                    directory = root / model
+                    directory.mkdir()
+                    server._write_json(directory / server.COORDINATOR_REQUEST_NAME, {})
+                    server._spawn_coordinator(directory)
+                threads = list(server._run_threads.values())
+                try:
+                    running.wait(timeout=5)
+                    self.assertEqual(pids, [os.getpid()] * 3)
+                    self.assertTrue(all(thread.is_alive() for thread in threads))
+                finally:
+                    release.set()
+                    for thread in threads:
+                        thread.join(timeout=5)
+
+    def test_terminal_state_survives_completion_before_launch_returns(self) -> None:
+        server = load_server()
+        models = ["gpt-5.6-sol", "gpt-5.6-terra"]
+        first_completed = threading.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve() / "runs"
+
+            def engine(command: str, arguments=(), **kwargs):
+                model = arguments[arguments.index("--model") + 1]
                 if command == "prepare":
                     return {
                         "status": "ready_for_approval",
-                        "blocking_reasons": [],
-                        "approval_prompt": "Approve?",
-                        "historical_result_sha256": "b" * 64,
-                        "prepared_configuration_sha256": "d" * 64,
+                        "configuration": {"model": model},
+                        "historical_result_sha256": "a" * 64,
+                        "prepared_configuration_sha256": "b" * 64,
                     }
-                if command == "run":
-                    run_calls += 1
-                    self.assertEqual(
-                        kwargs.get("input_text"),
-                        "Build the reviewed thing.",
-                    )
-                    self.assertIn(
-                        [
-                            "--expected-historical-result-sha256",
-                            "b" * 64,
-                        ],
-                        [list(arguments[index : index + 2]) for index in range(len(arguments) - 1)],
-                    )
-                    self.assertIn(
-                        [
-                            "--expected-prepared-configuration-sha256",
-                            "d" * 64,
-                        ],
-                        [list(arguments[index : index + 2]) for index in range(len(arguments) - 1)],
-                    )
-                    run_directory.mkdir()
-                    return {
-                        "status": "native_task_required",
-                        "run_directory": str(run_directory),
-                        "task_request": {},
-                    }
-                raise AssertionError(command)
+                self.assertEqual(command, "run")
+                if model == models[1]:
+                    self.assertTrue(first_completed.wait(timeout=5))
+                directory = run_root / f"run-{models.index(model)}"
+                directory.mkdir(parents=True)
+                return {"run_directory": str(directory), "task_request": {"model": model}}
 
-            config = {
-                "thread_id": "thread-1",
-                "source_path": "/tmp/transcript.jsonl",
-                "message_uuid": "message-1",
-                "request": "Build the reviewed thing.",
-                "beginning_kind": "git",
-                "ending_kind": "git",
-                "baseline_commit": "a" * 40,
-                "ending_commit": "b" * 40,
-                "model": "gpt-5.6-terra",
-                "timeout_seconds": 1200,
-            }
+            def spawn(directory: Path) -> None:
+                if directory.name == "run-0":
+                    server._update_state(directory, status="completed")
+                    attempt = server._read_json(server._attempt_path())
+                    self.assertEqual(attempt["models"][0]["launch_status"], "pending")
+                    first_completed.set()
+
             with (
                 mock.patch.object(server, "RUN_ROOT", run_root),
-                mock.patch.object(server, "_engine", side_effect=fake_engine),
-                mock.patch.object(
-                    server,
-                    "_spawn_coordinator",
-                    return_value=coordinator,
-                ) as spawn_coordinator,
+                mock.patch.object(server, "_engine", side_effect=engine),
+                mock.patch.object(server, "_spawn_coordinator", side_effect=spawn),
             ):
-                prepared = server._prepare_payload(config)
-                approved = {
-                    **config,
-                    "approved": True,
-                    "prepare_token": prepared["prepare_token"],
-                }
-                first = server._start_run(approved)
-                second = server._start_run(approved)
-                with self.assertRaisesRegex(
-                    server.ControllerError,
-                    "configuration changed",
-                ):
-                    server._start_run({**approved, "model": "gpt-5.6-sol"})
-                with self.assertRaisesRegex(
-                    server.ControllerError,
-                    "configuration changed",
-                ):
-                    server._start_run({**approved, "request": "Build something else."})
-                with self.assertRaisesRegex(
-                    server.ControllerError,
-                    "configuration changed",
-                ):
-                    server._start_run({**approved, "message_uuid": "different-message"})
-                with self.assertRaisesRegex(
-                    server.ControllerError,
-                    "configuration changed",
-                ):
-                    server._start_run({**approved, "ending_commit": "c" * 40})
+                configuration = {"thread_id": "thread-1", "models": models, "model": models[0]}
+                prepared = server._prepare_payload(configuration)
+                result = server._start_run(
+                    {**configuration, "approved": True, "prepare_token": prepared["prepare_token"]}
+                )
+                attempt = server._read_json(server._attempt_path())
+                self.assertEqual([run["model"] for run in result["runs"]], models)
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(attempt["models"][0]["launch_status"], "started")
+                self.assertEqual(result["runs"][0]["run"]["status"], "completed")
 
-            self.assertEqual(run_calls, 1)
-            self.assertFalse(first["idempotent"])
-            self.assertTrue(second["idempotent"])
-            self.assertEqual(first["run_id"], second["run_id"])
-            self.assertEqual(first["run"]["coordinator_pid"], coordinator.pid)
-            self.assertEqual(second["run"]["coordinator_pid"], coordinator.pid)
-            spawn_coordinator.assert_called_once_with(run_directory)
-            request = run_directory / server.COORDINATOR_REQUEST_NAME
-            self.assertTrue(request.is_file())
-            self.assertEqual(request.stat().st_mode & 0o777, 0o600)
-            self.assertIn("[controller] run approved", first["run"]["run_log"])
+    def test_artifactless_launch_failure_is_recorded_before_sibling_launch_returns(self) -> None:
+        server = load_server()
+        models = ["gpt-5.6-sol", "gpt-5.6-terra"]
+        release_first = threading.Event()
+        failure_written = threading.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve() / "runs"
+            write_private_json = server._write_private_json
 
-    def test_detached_coordinator_survives_controller_restart_and_can_be_cancelled(self) -> None:
+            def record_launch(path, payload):
+                write_private_json(path, payload)
+                if any(
+                    entry["model"] == models[1] and entry["launch_status"] == "failed"
+                    for entry in payload.get("models", [])
+                ):
+                    failure_written.set()
+
+            def engine(command: str, arguments=(), **kwargs):
+                model = arguments[arguments.index("--model") + 1]
+                if command == "prepare":
+                    return {
+                        "status": "ready_for_approval",
+                        "configuration": {"model": model},
+                        "historical_result_sha256": "a" * 64,
+                        "prepared_configuration_sha256": "b" * 64,
+                    }
+                self.assertEqual(command, "run")
+                if model == models[1]:
+                    raise server.ControllerError("The later model could not launch.")
+                self.assertTrue(release_first.wait(timeout=5))
+                directory = run_root / "run-0"
+                directory.mkdir(parents=True)
+                return {"run_directory": str(directory), "task_request": {"model": model}}
+
+            def complete(directory: Path) -> None:
+                server._update_state(directory, status="completed")
+
+            with (
+                mock.patch.object(server, "RUN_ROOT", run_root),
+                mock.patch.object(server, "_engine", side_effect=engine),
+                mock.patch.object(server, "_spawn_coordinator", side_effect=complete),
+                mock.patch.object(server, "_write_private_json", side_effect=record_launch),
+                ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                configuration = {"thread_id": "thread-1", "models": models, "model": models[0]}
+                prepared = server._prepare_payload(configuration)
+                future = executor.submit(
+                    server._start_run,
+                    {**configuration, "approved": True, "prepare_token": prepared["prepare_token"]},
+                )
+                try:
+                    self.assertTrue(failure_written.wait(timeout=5))
+                    early_attempt = server._read_json(server._attempt_path())
+                    self.assertFalse(future.done())
+                    self.assertEqual(early_attempt["models"][1]["launch_status"], "failed")
+                    self.assertEqual(early_attempt["models"][1]["controller_code"], "launch_failed")
+                    self.assertEqual(early_attempt["models"][0]["launch_status"], "pending")
+                    self.assertNotIn("run_id", early_attempt["models"][1])
+                finally:
+                    release_first.set()
+                result = future.result(timeout=5)
+                attempt = server._read_json(server._attempt_path())
+                self.assertEqual(attempt["models"][1], early_attempt["models"][1])
+                self.assertEqual([run["model"] for run in result["runs"]], [models[0]])
+                self.assertEqual(result["runs"][0]["run"]["status"], "completed")
+                self.assertEqual(result["errors"][0]["model"], models[1])
+
+    def test_cancellation_terminates_grandchild_after_worker_exits(self) -> None:
         server = load_server()
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            run_root = root / "runs"
-            run_directory = run_root / "run-1"
-            run_directory.mkdir(parents=True)
-            ready_marker = run_directory / "coordinator-ready"
-            stopped_marker = run_directory / "coordinator-stopped"
-            fake_coordinator = root / "fake-coordinator.py"
-            fake_coordinator.write_text(
-                "import os, signal, sys, time\n"
-                "from pathlib import Path\n"
-                "if sys.argv[1:] != ['--run-coordinator', 'run-1']:\n"
-                "    raise SystemExit(2)\n"
-                "run = Path(os.environ['CODEX_BAKEOFF_RUN_ROOT']) / 'run-1'\n"
-                "def stop(signum, frame):\n"
-                "    (run / 'coordinator-stopped').write_text(str(signum))\n"
-                "    raise SystemExit(0)\n"
-                "signal.signal(signal.SIGTERM, stop)\n"
-                "(run / 'coordinator-ready').write_text(str(os.getpid()))\n"
-                "deadline = time.monotonic() + 15\n"
-                "while time.monotonic() < deadline:\n"
-                "    time.sleep(0.02)\n",
-                encoding="utf-8",
+            marker = Path(temporary) / "grandchild"
+            script = (
+                "import subprocess, sys, time; "
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import time; from pathlib import Path; time.sleep(0.6); Path(' + repr(sys.argv[1]) + ').touch()']); "
+                "time.sleep(0.05)"
             )
-            launcher = "\n".join(
-                [
-                    "import importlib.util",
-                    "from pathlib import Path",
-                    f"spec = importlib.util.spec_from_file_location('replay_parent', {str(SERVER_PATH)!r})",
-                    "module = importlib.util.module_from_spec(spec)",
-                    "spec.loader.exec_module(module)",
-                    f"module.__file__ = {str(fake_coordinator)!r}",
-                    f"process = module._spawn_coordinator(Path({str(run_directory)!r}))",
-                    "print(process.pid, flush=True)",
-                ]
+            worker = subprocess.Popen(
+                [sys.executable, "-c", script, str(marker)], start_new_session=True
             )
-            environment = {**os.environ, "CODEX_BAKEOFF_RUN_ROOT": str(run_root)}
-            parent = subprocess.run(
-                [sys.executable, "-c", launcher],
-                cwd=PLUGIN_ROOT,
-                env=environment,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            coordinator_pid = int(parent.stdout.strip())
-            try:
-                deadline = time.monotonic() + 5
-                while not ready_marker.exists() and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                self.assertTrue(ready_marker.is_file(), "Detached coordinator never started.")
-                self.assertEqual(int(ready_marker.read_text()), coordinator_pid)
-                os.kill(coordinator_pid, 0)
-
-                state = server._initial_state(run_directory)
-                state["coordinator_pid"] = coordinator_pid
-                state["controller_pid"] = coordinator_pid
-                original_controller_session_id = "a" * 32
-                replacement_controller_session_id = "b" * 32
-                state["controller_session_id"] = original_controller_session_id
-                server._write_json(server._state_path(run_directory), state)
-                with socket.socket() as reservation:
-                    reservation.bind(("127.0.0.1", 0))
-                    port = int(reservation.getsockname()[1])
-                restarted = subprocess.Popen(
-                    [sys.executable, str(SERVER_PATH), "--http"],
-                    cwd=PLUGIN_ROOT,
-                    env={
-                        **environment,
-                        "CODEX_BAKEOFF_CONTROLLER_PORT": str(port),
-                        "CODEX_BAKEOFF_CONTROLLER_SESSION_ID": replacement_controller_session_id,
-                    },
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-
-                def request(
-                    method: str,
-                    path: str,
-                    *,
-                    payload: dict[str, object] | None = None,
-                    headers: dict[str, str] | None = None,
-                ) -> tuple[int, bytes]:
-                    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                    try:
-                        connection.request(
-                            method,
-                            path,
-                            body=json.dumps(payload) if payload is not None else None,
-                            headers=headers or {},
-                        )
-                        response = connection.getresponse()
-                        return response.status, response.read()
-                    finally:
-                        connection.close()
-
-                try:
-                    deadline = time.monotonic() + 5
-                    runtime_paths: list[Path] = []
-                    while not runtime_paths and time.monotonic() < deadline:
-                        if restarted.poll() is not None:
-                            stdout, stderr = restarted.communicate()
-                            self.fail(f"Restarted controller exited early: {stdout}\n{stderr}")
-                        runtime_paths = list(
-                            (root / "controllers").glob("*/controller-server.json")
-                        )
-                        time.sleep(0.02)
-                    self.assertEqual(len(runtime_paths), 1)
-                    runtime_path = runtime_paths[0]
-                    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-                    control_headers = {
-                        "Content-Type": "application/json",
-                        "X-Codex-Replay-Control": runtime["control_token"],
-                    }
-                    request_headers = {
-                        "Content-Type": "application/json",
-                        "Origin": f"http://127.0.0.1:{port}",
-                    }
-
-                    status, running = request(
-                        "POST",
-                        "/api/call",
-                        payload={"name": "get_run", "arguments": {"run_id": "run-1"}},
-                        headers=request_headers,
-                    )
-                    self.assertEqual(status, 200)
-                    self.assertEqual(
-                        json.loads(running)["structuredContent"]["run"]["status"], "running"
-                    )
-                    self.assertEqual(
-                        json.loads(running)["structuredContent"]["run"]["controller_session_id"],
-                        replacement_controller_session_id,
-                    )
-
-                    status, cancelled = request(
-                        "POST",
-                        "/api/call",
-                        payload={"name": "cancel_run", "arguments": {"run_id": "run-1"}},
-                        headers=request_headers,
-                    )
-                    self.assertEqual(status, 200)
-                    self.assertEqual(
-                        json.loads(cancelled)["structuredContent"]["run"]["status"], "cancelled"
-                    )
-
-                    deadline = time.monotonic() + 5
-                    while not stopped_marker.exists() and time.monotonic() < deadline:
-                        time.sleep(0.02)
-                    self.assertTrue(
-                        stopped_marker.is_file(), "Cancellation never reached coordinator."
-                    )
-                    self.assertEqual(int(stopped_marker.read_text()), signal.SIGTERM)
-
-                    status, _ = request(
-                        "POST", "/api/shutdown", payload={}, headers=control_headers
-                    )
-                    self.assertEqual(status, 200)
-                    self.assertEqual(restarted.wait(timeout=5), 0)
-                    restarted.communicate()
-                finally:
-                    if restarted.poll() is None:
-                        restarted.terminate()
-                        restarted.wait(timeout=5)
-                        restarted.communicate()
-            finally:
-                try:
-                    os.killpg(coordinator_pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+            worker.wait(timeout=5)
+            server._terminate_process_group(worker)
+            time.sleep(0.7)
+            self.assertFalse(marker.exists(), "A worker grandchild survived cancellation")
 
     def test_prepare_requires_a_historical_result_digest(self) -> None:
         server = load_server()
@@ -2568,16 +2382,58 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(payload["threads"], threads)
         self.assertNotIn("sessions", payload)
 
-    def test_get_report_accepts_report_larger_than_legacy_limit(self) -> None:
+    def test_thread_search_covers_all_imports_and_paginates_filtered_results(self) -> None:
+        server = load_server()
+        threads = [
+            {
+                "imported_thread_id": f"thread-{index}",
+                "title": f"{'Later match' if index >= 100 else 'Task'} {index}",
+            }
+            for index in range(125)
+        ]
+        threads[-1]["title"] = "Later match NH game new feature"
+
+        def sessions(command: str, arguments: list[str]) -> dict[str, object]:
+            self.assertEqual(command, "sessions")
+            limit = int(arguments[arguments.index("--limit") + 1])
+            offset = int(arguments[arguments.index("--offset") + 1])
+            return {"sessions": threads[offset : offset + limit], "total": len(threads)}
+
+        with mock.patch.object(server, "_engine", side_effect=sessions):
+            initial = server._thread_payload({"source": "imported"})
+            self.assertEqual(initial["threads"], threads[:20])
+            unique = server._thread_payload({"query": " NH GAME NEW FEATURE "})
+            self.assertEqual(unique["threads"], threads[-1:])
+            self.assertEqual(unique["total"], 1)
+            self.assertEqual(unique["imported_total"], 125)
+            self.assertFalse(unique["has_more"])
+            first = server._thread_payload({"source": "imported", "query": "Later match"})
+            second = server._thread_payload(
+                {"source": "imported", "query": "Later match", "offset": 20}
+            )
+            self.assertEqual(first["threads"] + second["threads"], threads[100:])
+            self.assertEqual(first["total"], 25)
+            self.assertEqual(second["total"], 25)
+            self.assertTrue(first["has_more"])
+            self.assertFalse(second["has_more"])
+            by_id = server._thread_payload({"source": "imported", "query": "thread-124"})
+            self.assertEqual(by_id["threads"], threads[-1:])
+            cleared = server._thread_payload({"source": "imported", "query": ""})
+            self.assertEqual(cleared["threads"], threads[:20])
+            self.assertEqual(cleared["total"], 125)
+
+    def test_get_report_accepts_report_larger_than_16_mib(self) -> None:
         server = load_server()
         with tempfile.TemporaryDirectory() as temporary:
             run_root = Path(temporary).resolve()
             run_directory = run_root / "run-large"
             run_directory.mkdir()
             (run_directory / "report.json").write_text(
-                json.dumps({"original_request": "x" * (600 * 1024)}),
+                json.dumps({"original_request": "x" * (19 * 1024 * 1024)}),
                 encoding="utf-8",
             )
+            with self.assertRaisesRegex(server.ControllerError, "too large to display"):
+                server._read_json(run_directory / "report.json")
             with mock.patch.object(server, "RUN_ROOT", run_root):
                 result = server._call_tool(
                     {
@@ -2587,7 +2443,7 @@ class McpServerTests(unittest.TestCase):
                 )
         self.assertEqual(
             len(result["structuredContent"]["report"]["original_request"]),
-            600 * 1024,
+            19 * 1024 * 1024,
         )
 
     def test_get_report_download_returns_only_the_requested_artifact(self) -> None:
@@ -2597,8 +2453,16 @@ class McpServerTests(unittest.TestCase):
             run_directory = run_root / "run-1"
             run_directory.mkdir()
             bodies = {
-                "json": json.dumps({"winner": "codex", "summary": "Résumé"}, ensure_ascii=False),
-                "html": "<!doctype html><title>Replay report</title><p>Résumé</p>",
+                "json": json.dumps(
+                    {
+                        "winner": "codex",
+                        "summary": "Résumé",
+                        "original_request": "x" * (19 * 1024 * 1024),
+                    },
+                    ensure_ascii=False,
+                ),
+                "html": "<!doctype html><title>Replay report</title><p>Résumé</p>"
+                + "x" * (19 * 1024 * 1024),
             }
             for artifact_format, body in bodies.items():
                 (run_directory / f"report.{artifact_format}").write_text(body, encoding="utf-8")
@@ -2641,15 +2505,15 @@ class McpServerTests(unittest.TestCase):
                             f"codex-bakeoff-run-1-report.{artifact_format}",
                         )
 
-                result, error = server._handle_request(
-                    "tools/call",
-                    {
-                        "name": "get_report",
-                        "arguments": {"run_id": "run-1", "format": "pdf"},
-                    },
-                )
-                self.assertIsNone(error)
-                self.assertTrue(result["isError"])
+                with self.assertRaisesRegex(
+                    server.ControllerError, "Report format must be json or html"
+                ):
+                    server._call_tool(
+                        {
+                            "name": "get_report",
+                            "arguments": {"run_id": "run-1", "format": "pdf"},
+                        }
+                    )
 
     def test_get_report_rejects_non_string_artifact_formats(self) -> None:
         server = load_server()
@@ -2729,6 +2593,7 @@ class McpServerTests(unittest.TestCase):
             stale = server._initial_state(stale_directory)
             stale["coordinator_pid"] = 99_999_999
             stale["controller_pid"] = os.getpid()
+            stale["failure_diagnostic"] = {"worker_code": "stream_error", "exit_code": 1}
             live = server._initial_state(live_directory)
             live["coordinator_pid"] = os.getpid()
             live["controller_pid"] = 99_999_999
@@ -2747,81 +2612,12 @@ class McpServerTests(unittest.TestCase):
             foreign_after = server._read_json(server._state_path(foreign_directory))
         self.assertEqual(stale_after["status"], "failed")
         self.assertTrue(stale_after["interrupted"])
+        self.assertEqual(
+            stale_after["failure_diagnostic"],
+            {"controller_code": "coordinator_stopped", "worker_stage": "outside_worker"},
+        )
         self.assertEqual(live_after["status"], "running")
         self.assertEqual(foreign_after["status"], "running")
-
-    def test_orphan_recovery_reconciles_dead_workers_without_claiming_legacy_runs(self) -> None:
-        server = load_server()
-        with tempfile.TemporaryDirectory() as temporary:
-            run_root = Path(temporary).resolve() / "runs"
-            run_root.mkdir()
-            orphan_directory = run_root / "orphan"
-            legacy_directory = run_root / "legacy"
-            orphan_directory.mkdir()
-            legacy_directory.mkdir()
-
-            orphan = server._initial_state(orphan_directory)
-            orphan["controller_session_id"] = "e" * 32
-            orphan["coordinator_pid"] = 99_999_999
-            server._write_json(server._state_path(orphan_directory), orphan)
-
-            legacy = server._initial_state(legacy_directory)
-            legacy.pop("controller_session_id")
-            legacy["coordinator_pid"] = 99_999_999
-            server._write_json(server._state_path(legacy_directory), legacy)
-
-            with mock.patch.object(server, "RUN_ROOT", run_root):
-                server._adopt_orphaned_runs()
-                server._reconcile_interrupted_runs()
-
-            orphan_after = server._read_json(server._state_path(orphan_directory))
-            legacy_after = server._read_json(server._state_path(legacy_directory))
-
-        self.assertEqual(orphan_after["controller_session_id"], server.CONTROLLER_SESSION_ID)
-        self.assertEqual(orphan_after["status"], "failed")
-        self.assertTrue(orphan_after["interrupted"])
-        self.assertEqual(legacy_after["status"], "running")
-        self.assertNotIn("controller_session_id", legacy_after)
-
-    def test_orphan_recovery_never_claims_a_live_unresponsive_controller(self) -> None:
-        server = load_server()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            run_root = root / "runs"
-            run_directory = run_root / "owned"
-            run_directory.mkdir(parents=True)
-            original_owner = "f" * 32
-
-            state = server._initial_state(run_directory)
-            state["controller_session_id"] = original_owner
-            state["coordinator_pid"] = os.getpid()
-            state_path = server._state_path(run_directory)
-            server._write_json(state_path, state)
-            server._write_private_json(
-                root / "controllers" / original_owner / "controller-server.json",
-                {
-                    "controller_session_id": original_owner,
-                    "pid": os.getpid(),
-                    "port": 43219,
-                    "started_at": time.time() - 30,
-                    "control_token": "x" * 48,
-                },
-            )
-
-            with (
-                mock.patch.object(server, "RUN_ROOT", run_root),
-                mock.patch.object(
-                    server,
-                    "_probe_controller",
-                    return_value=("unverified", {}),
-                ),
-            ):
-                server._adopt_orphaned_runs()
-
-            recovered = server._read_json(state_path)
-
-        self.assertEqual(recovered["controller_session_id"], original_owner)
-        self.assertEqual(recovered["status"], "running")
 
     def test_shutdown_terminates_tracked_process_groups(self) -> None:
         server = load_server()
@@ -2833,6 +2629,90 @@ class McpServerTests(unittest.TestCase):
             terminate.assert_called_once_with(process)
         finally:
             server._active_processes.discard(process)
+
+    def test_shutdown_prevents_late_worker_launches(self) -> None:
+        server = load_server()
+        with mock.patch.object(server, "RUN_ROOT", Path("/nonexistent-replay-root")):
+            server._stop_jobs()
+        with mock.patch.object(server.subprocess, "Popen") as spawn:
+            with self.assertRaises(server.RunCancelled):
+                server._run_process(["unused"], cwd=PLUGIN_ROOT, timeout=1)
+        spawn.assert_not_called()
+
+    def test_shutdown_interrupts_waiting_runs_without_starting_them(self) -> None:
+        server = load_server()
+        release = threading.Event()
+        condition = threading.Condition()
+        entered: set[str] = set()
+        count = server.MAX_PARALLEL_RUNS + 2
+
+        def workflow(directory, request):
+            with condition:
+                entered.add(directory.name)
+                condition.notify_all()
+            release.wait(timeout=10)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            directories = [root / f"run-{index}" for index in range(count)]
+            with (
+                mock.patch.object(server, "RUN_ROOT", root),
+                mock.patch.object(server, "_coordinator", side_effect=workflow),
+            ):
+                workers: list[threading.Thread] = []
+                try:
+                    for directory in directories:
+                        directory.mkdir()
+                        state = server._initial_state(directory)
+                        state.update(phase="queued", coordinator_pid=os.getpid())
+                        server._write_json(server._state_path(directory), state)
+                        server._write_json(directory / server.COORDINATOR_REQUEST_NAME, {})
+                        server._spawn_coordinator(directory)
+                    with condition:
+                        self.assertTrue(
+                            condition.wait_for(
+                                lambda: len(entered) == server.MAX_PARALLEL_RUNS, timeout=5
+                            )
+                        )
+                    with server._active_processes_lock:
+                        workers = list(server._run_threads.values())
+                    server._cancel_run({"run_id": directories[-1].name})
+                    server._stop_jobs()
+                    with self.assertRaisesRegex(server.ControllerError, "shutting down"):
+                        server._spawn_coordinator(directories[-2])
+                    for directory in directories[:-1]:
+                        state = server._read_json(server._state_path(directory))
+                        self.assertEqual(state["status"], "failed")
+                        self.assertTrue(state["interrupted"])
+                    self.assertEqual(
+                        server._read_json(server._state_path(directories[-1]))["status"],
+                        "cancelled",
+                    )
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(timeout=5)
+                        self.assertFalse(worker.is_alive())
+                self.assertEqual(entered, {directory.name for directory in directories[:-2]})
+                self.assertFalse(server._run_cancellations)
+                self.assertEqual(server._active_controller_runs(), 0)
+
+    def test_metrics_sidecar_is_not_inherited_by_server_or_worker(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as temporary, socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            with (
+                mock.patch.dict(
+                    os.environ, {"CODEX_PLUGIN_METRICS_OUTPUT": "/private/host-sidecar"}
+                ),
+                mock.patch.object(server, "RUN_ROOT", Path(temporary) / "runs"),
+                mock.patch.object(server.subprocess, "Popen") as spawn,
+            ):
+                server._spawn_controller_daemon(
+                    reservation=reservation, controller_session_id="a" * 32
+                )
+                self.assertNotIn("CODEX_PLUGIN_METRICS_OUTPUT", spawn.call_args.kwargs["env"])
+                self.assertNotIn("CODEX_PLUGIN_METRICS_OUTPUT", server._worker_environment())
 
     def test_reviews_run_with_only_copied_anonymous_candidates(self) -> None:
         server = load_server()
@@ -2950,11 +2830,15 @@ class McpServerTests(unittest.TestCase):
         server = load_server()
         with tempfile.TemporaryDirectory() as temporary:
             run_directory = Path(temporary).resolve()
+            server._write_json(
+                server._state_path(run_directory), server._initial_state(run_directory)
+            )
             report_path = run_directory / "report.json"
             report_path.write_text(
                 json.dumps(
                     {
                         "winner": "codex",
+                        "original_request": "x" * (19 * 1024 * 1024),
                         "evaluation": {
                             "candidate_mapping": {"A": "claude", "B": "codex"},
                             "reviews": [{"evaluator": "codex", "model": "gpt-test"}],
@@ -3003,7 +2887,11 @@ class McpServerTests(unittest.TestCase):
                 raise AssertionError(command)
 
             with (
-                mock.patch.object(server, "_update_state") as update_state,
+                mock.patch.object(
+                    server, "_update_state", wraps=server._update_state
+                ) as update_state,
+                mock.patch.object(server, "RUN_ROOT", run_directory.parent),
+                mock.patch.object(server._attempt_state, "refresh"),
                 mock.patch.object(
                     server,
                     "_run_implementation",
@@ -3056,6 +2944,13 @@ class McpServerTests(unittest.TestCase):
                 call.kwargs
                 for call in update_state.call_args_list
                 if call.kwargs.get("status") == "completed"
+            )
+            state = server._read_json(server._state_path(run_directory))
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["phase"], "reporting")
+            self.assertIsNone(state["error"])
+            self.assertFalse(
+                any(call.kwargs.get("status") == "failed" for call in update_state.call_args_list)
             )
             self.assertEqual(
                 completed["details"]["report_summary"]["evaluation"]["candidate_mapping"],
@@ -3268,7 +3163,10 @@ class McpServerTests(unittest.TestCase):
                 self.assertTrue((archived / f"partial-{attempt}.txt").is_file())
             self.assertEqual(log.count("starting retry"), 3)
             self.assertIn("[implementation:retry-3:stdout]", log)
-            self.assertEqual(log.count("connection reset by peer"), 6)
+            self.assertEqual(log.count(':stdout] {"type":"failed"'), 3)
+            self.assertIsNone(
+                server._read_json(server._state_path(run_directory))["failure_diagnostic"]
+            )
 
     def test_implementation_stops_after_three_retries(self) -> None:
         server = load_server()

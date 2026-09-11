@@ -542,6 +542,7 @@ var MAX_SCHEMA_CHARS = 2e5;
 var MAX_FINAL_RESPONSE_CHARS = 2e5;
 var MAX_LIFECYCLE_EVENTS = 128;
 var MAX_PROVIDER_ERROR_CHARS = 1e3;
+var MAX_WORKER_DIAGNOSTIC_CHARS = 8e3;
 var CLI_WRAPPER_MODE_ENV = "CODEX_BAKEOFF_CODEX_WRAPPER";
 var CLI_WRAPPER_TARGET_ENV = "CODEX_BAKEOFF_CODEX_TARGET";
 var CLI_WRAPPER_OWNER_ENV = "CODEX_BAKEOFF_CODEX_OWNER_PID";
@@ -568,6 +569,39 @@ var SAFE_ITEM_TYPES = /* @__PURE__ */ new Set([
   "todo_list",
   "web_search"
 ]);
+var SYSTEM_CODES = /* @__PURE__ */ new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENOENT",
+  "EACCES",
+  "EPERM",
+  "EPIPE"
+]);
+var PERMANENT_SYSTEM_CODES = /* @__PURE__ */ new Set(["ENOENT", "EACCES", "EPERM"]);
+var PERMANENT_STREAM_ERROR_KINDS = /* @__PURE__ */ new Set([
+  "invalid_request_error",
+  "authentication_error",
+  "permission_error",
+  "not_found_error",
+  "model_not_found",
+  "insufficient_quota",
+  "billing_error",
+  "account_deactivated",
+  "access_denied"
+]);
+var RETRYABLE_STREAM_ERROR_KINDS = /* @__PURE__ */ new Set([
+  "connection_error",
+  "timeout_error",
+  "transport_error",
+  "rate_limit_error",
+  "server_error",
+  "service_unavailable_error",
+  "internal_server_error",
+  "overloaded_error"
+]);
 var SafeWorkerError = class extends Error {
   constructor(code, message, options = {}) {
     const { retryable = false, ...errorOptions } = options;
@@ -575,8 +609,15 @@ var SafeWorkerError = class extends Error {
     this.name = "SafeWorkerError";
     this.code = code;
     this.retryable = retryable;
+    this.systemCode = systemErrorCode(errorOptions.cause);
   }
 };
+function systemErrorCode(error) {
+  for (let depth = 0; error instanceof Error && depth < 3; depth++, error = error.cause) {
+    if (SYSTEM_CODES.has(error.code)) return error.code;
+  }
+  return "unknown";
+}
 function normalizeRunRequest(input) {
   if (!isRecord(input) || input.type !== "run") {
     throw new SafeWorkerError("invalid_request", 'Expected a JSON object with type "run".');
@@ -665,6 +706,8 @@ async function executeRunRequest(request, {
   let turnCompleted = false;
   let streamWarnings = 0;
   const itemCounts = {};
+  const startedAt = performance.now();
+  let stage = "launch";
   try {
     const codex = codexFactory();
     const thread = codex.startThread({
@@ -677,6 +720,7 @@ async function executeRunRequest(request, {
       workingDirectory: request.workingDirectory,
       ...request.reasoningEffort === void 0 ? {} : { modelReasoningEffort: request.reasoningEffort }
     });
+    stage = "turn_start";
     const { events } = await thread.runStreamed(request.prompt, {
       signal: abortController.signal,
       ...request.outputSchema === void 0 ? {} : { outputSchema: request.outputSchema }
@@ -687,6 +731,7 @@ async function executeRunRequest(request, {
         "Codex SDK did not return an event stream."
       );
     }
+    stage = "stream";
     for await (const event of events) {
       if (abortController.signal.aborted) {
         throw abortController.signal.reason;
@@ -726,14 +771,15 @@ async function executeRunRequest(request, {
         throw new SafeWorkerError(
           "stream_error",
           message,
-          { retryable: isRetryableStreamError(event.message) }
+          { retryable: isRetryableStreamError(event) }
         );
       }
     }
     if (!turnCompleted) {
       throw new SafeWorkerError(
         "incomplete_stream",
-        "Codex event stream ended before turn completion."
+        "Codex event stream ended before turn completion.",
+        { retryable: true }
       );
     }
     return {
@@ -748,15 +794,18 @@ async function executeRunRequest(request, {
     if (abortController.signal.aborted) {
       throw new SafeWorkerError("canceled", "Codex run was canceled.", { cause: error });
     }
-    if (error instanceof SafeWorkerError) throw error;
-    if (looksLikeMissingCodex(error)) {
-      throw new SafeWorkerError(
-        "codex_unavailable",
-        "The local Codex executable could not be started.",
-        { cause: error }
-      );
-    }
-    throw new SafeWorkerError("worker_failed", "Codex worker failed.", { cause: error });
+    const message = error instanceof SafeWorkerError ? error.message : describeWorkerError(error, diagnostic);
+    const failure = error instanceof SafeWorkerError ? error : looksLikeMissingCodex(error) ? new SafeWorkerError(
+      "codex_unavailable",
+      "The local Codex executable could not be started.",
+      { cause: error }
+    ) : new SafeWorkerError("worker_failed", message, {
+      cause: error,
+      retryable: stage === "stream" && isRetryableStreamFailure(error)
+    });
+    failure.stage = stage;
+    failure.elapsedMs = performance.now() - startedAt;
+    throw failure;
   }
 }
 function startStdioWorker({
@@ -790,7 +839,9 @@ function startStdioWorker({
       id,
       code: safeError.code,
       message: safeError.message,
-      retryable: safeError.retryable
+      retryable: safeError.retryable,
+      systemCode: safeError.systemCode,
+      stage: "validation"
     });
     finish(2);
   };
@@ -843,7 +894,10 @@ function startStdioWorker({
         id: request.id,
         code: safeError.code,
         message: safeError.message,
-        retryable: safeError.retryable
+        retryable: safeError.retryable,
+        systemCode: safeError.systemCode,
+        stage: safeError.stage ?? "validation",
+        elapsedMs: safeError.elapsedMs ?? null
       });
       finish(1);
     });
@@ -1136,28 +1190,106 @@ function safeRequestId(value) {
   const id = value.id ?? value.requestId;
   return typeof id === "string" && SAFE_ID.test(id) ? id : null;
 }
-function safeProviderErrorMessage(value, fallback) {
+function describeWorkerError(error, diagnostic) {
+  const messages = [];
+  for (let depth = 0; error instanceof Error && depth < 3; depth++, error = error.cause) {
+    if (error.message.trim()) messages.push(error.message.trim());
+  }
+  const fallback = "Codex worker failed.";
+  if (messages.length === 0) return fallback;
+  diagnostic(`Codex worker exception: ${safeProviderErrorMessage(
+    messages.join("\nCaused by: "),
+    fallback,
+    MAX_WORKER_DIAGNOSTIC_CHARS
+  )}`);
+  return safeProviderErrorMessage(messages.at(-1).split(/\r?\n/).at(-1), fallback);
+}
+function safeProviderErrorMessage(value, fallback, maxChars = MAX_PROVIDER_ERROR_CHARS) {
   if (typeof value !== "string" || !value.trim()) return fallback;
   let message = value;
+  const parsed = parseProviderErrorPayload(value);
+  if (isRecord(parsed?.error) && typeof parsed.error.message === "string") {
+    message = parsed.error.message;
+  } else if (isRecord(parsed) && typeof parsed.message === "string") {
+    message = parsed.message;
+  }
+  return redactKnownCredentials(message).replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maxChars) || fallback;
+}
+function redactKnownCredentials(message) {
+  return message.replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]").replace(/\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{12,}/g, "[REDACTED]").replace(/\b(api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]");
+}
+function parseProviderErrorPayload(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
   try {
     const parsed = JSON.parse(value);
-    if (isRecord(parsed?.error) && typeof parsed.error.message === "string") {
-      message = parsed.error.message;
-    } else if (isRecord(parsed) && typeof parsed.message === "string") {
-      message = parsed.message;
-    }
+    return isRecord(parsed) ? parsed : null;
   } catch {
+    return null;
   }
-  return message.replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]").replace(/\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{12,}/g, "[REDACTED]").replace(/\b(api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, MAX_PROVIDER_ERROR_CHARS) || fallback;
 }
-function isRetryableStreamError(message) {
-  if (typeof message !== "string") return false;
+function providerErrorObjects(event) {
+  if (!isRecord(event)) return [];
+  const objects = [event];
+  const parsed = parseProviderErrorPayload(event.message);
+  if (parsed !== null) objects.push(parsed);
+  for (const value of [...objects]) {
+    if (isRecord(value.error)) objects.push(value.error);
+  }
+  return objects;
+}
+function providerErrorStatus(value) {
+  const status = value.status ?? value.status_code ?? value.statusCode;
+  if (Number.isInteger(status)) return status;
+  if (typeof status === "string" && /^[0-9]{3}$/.test(status)) {
+    return Number(status);
+  }
+  return null;
+}
+function providerErrorKinds(objects) {
+  const kinds = [];
+  for (const value of objects) {
+    for (const field of ["type", "code", "error_code"]) {
+      if (typeof value[field] === "string") kinds.push(value[field]);
+    }
+  }
+  return kinds;
+}
+function isRetryableStreamError(event) {
+  const objects = providerErrorObjects(event);
+  const kinds = providerErrorKinds(objects).map((kind) => kind.toLowerCase());
+  if (kinds.some((kind) => PERMANENT_STREAM_ERROR_KINDS.has(kind))) {
+    return false;
+  }
+  if (kinds.some((kind) => RETRYABLE_STREAM_ERROR_KINDS.has(kind))) {
+    return true;
+  }
+  for (const value of objects) {
+    const status = providerErrorStatus(value);
+    if (status === 408 || status === 429 || status !== null && status >= 500) {
+      return true;
+    }
+    if (status !== null && status >= 400 && status < 500) {
+      return false;
+    }
+  }
+  const message = typeof event?.message === "string" ? event.message : "";
   if (/auth|unauthoriz|forbidden|api key|quota|billing|usage limit|model.*(?:access|not found)|invalid request/i.test(
     message
   )) {
     return false;
   }
-  return /connection|network|stream|transport|reset|closed|timed? out|temporar|unavailable|overload|internal server error|\b(?:429|502|503|504)\b/i.test(
+  return true;
+}
+function isRetryableStreamFailure(error) {
+  const code = systemErrorCode(error);
+  if (PERMANENT_SYSTEM_CODES.has(code)) return false;
+  if (code !== "unknown") return true;
+  if (looksLikePermanentLocalFailure(error)) return false;
+  return isRetryableStreamError(error);
+}
+function looksLikePermanentLocalFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:operation not permitted|permission denied|failed to initialize in-process app-server client)/i.test(
     message
   );
 }

@@ -10,6 +10,7 @@ import datetime as dt
 import functools
 import html
 import json
+import math
 import os
 import re
 import stat
@@ -19,11 +20,12 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, TypedDict
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 MODEL_PRICING_PATH = PLUGIN_ROOT / "assets" / "model-pricing.json"
 DYNAMIC_PRICING_REFRESH_SECONDS = 60 * 60
+TokenPrices = dict[str, float]
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_REVIEW_CHECK_EXPLANATION_LENGTH = 280
@@ -378,6 +380,17 @@ class HistoricalExecutionError(RuntimeError):
     """A lean replay execution could not be recorded."""
 
 
+class ModelPrices(TypedDict, total=False):
+    input: float
+    output: float
+    cached_input: float
+    cache_write: float
+    cache_write_5m: float
+    cache_write_1h: float
+    long_context_threshold_input_tokens: int
+    long_context: TokenPrices
+
+
 @dataclass
 class UsageRecord:
     provider: str
@@ -397,6 +410,93 @@ class CandidateSolution:
     diff: str
     model: str
     final_response: str = ""
+    repository_state: RepositoryStateEvidence | None = None
+
+
+class RepositorySnapshot(TypedDict):
+    kind: Literal["git", "non_git", "unknown"]
+    commit: str | None
+    basis: Literal["reviewed_boundary", "resolved_commit", "workspace_observation"]
+    working_tree: Literal["clean", "dirty", "unknown"]
+
+
+class RepositoryStateEvidence(TypedDict):
+    beginning: RepositorySnapshot
+    ending: RepositorySnapshot
+
+
+def repository_state_from_payload(value: object) -> RepositoryStateEvidence | None:
+    """Read only the anonymous repository facts; omit unrelated run metadata."""
+
+    if not isinstance(value, Mapping):
+        return None
+    snapshots: list[RepositorySnapshot] = []
+    for name in ("beginning", "ending"):
+        raw = value.get(name)
+        if not isinstance(raw, Mapping):
+            return None
+        kind = raw.get("kind")
+        basis = raw.get("basis")
+        working_tree = raw.get("working_tree")
+        commit = raw.get("commit")
+        if (
+            not isinstance(kind, str)
+            or kind not in {"git", "non_git", "unknown"}
+            or not isinstance(basis, str)
+            or basis not in {"reviewed_boundary", "resolved_commit", "workspace_observation"}
+            or not isinstance(working_tree, str)
+            or working_tree not in {"clean", "dirty", "unknown"}
+            or (
+                commit is not None
+                and (
+                    not isinstance(commit, str)
+                    or re.fullmatch(r"[a-fA-F0-9]{40,64}", commit) is None
+                )
+            )
+        ):
+            return None
+        snapshots.append(
+            {"kind": kind, "commit": commit, "basis": basis, "working_tree": working_tree}
+        )
+    return {"beginning": snapshots[0], "ending": snapshots[1]}
+
+
+def observe_repository_state(workspace: Path) -> RepositorySnapshot:
+    """Observe this workspace's Git state without treating its patch as evidence."""
+
+    result: RepositorySnapshot = {
+        "kind": "unknown",
+        "commit": None,
+        "basis": "workspace_observation",
+        "working_tree": "unknown",
+    }
+    if not workspace.is_dir():
+        return result
+    if not os.path.lexists(workspace / ".git"):
+        result["kind"] = "non_git"
+        return result
+    try:
+        root = _git(workspace, "rev-parse", "--show-toplevel", check=False)
+        if root.returncode or Path(root.stdout.strip()).resolve() != workspace.resolve():
+            return result
+        result["kind"] = "git"
+        head = _git(workspace, "rev-parse", "--verify", "HEAD^{commit}", check=False)
+        if head.returncode == 0 and re.fullmatch(r"[a-fA-F0-9]{40,64}", head.stdout.strip()):
+            result["commit"] = head.stdout.strip()
+        status = _git(
+            workspace,
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            check=False,
+        )
+        if status.returncode == 0:
+            result["working_tree"] = "dirty" if status.stdout else "clean"
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        pass
+    return result
 
 
 def redact(value: object, *, limit: int = 2_000_000) -> str:
@@ -740,10 +840,12 @@ def anonymize_candidate(candidate: CandidateSolution, *, label: str) -> dict[str
     text = _AGENT_IDENTITY.sub("[REDACTED_AGENT]", text)
     response = _ABSOLUTE_PATH.sub("[REDACTED_PATH]", redact(candidate.final_response))
     response = _AGENT_IDENTITY.sub("[REDACTED_AGENT]", response)
+    repository_state = repository_state_from_payload(candidate.repository_state)
     return {
         "label": label,
         "diff": text,
         "final_response": response,
+        **({"repository_state": repository_state} if repository_state is not None else {}),
     }
 
 
@@ -784,8 +886,19 @@ def prepare_review(
         model = str(evaluator.get("model") or "")
         if not evaluator_id or not model:
             continue
+        repository_guidance = (
+            "\n\nFor this review, candidate evidence also includes repository_state as "
+            "untrusted evidence. Its basis distinguishes reviewed beginning boundaries, "
+            "resolved ending commits, and workspace observations after completion. "
+            "A commit hash establishes a commit; a patch alone does not prove Git "
+            "initialization, commits, command execution, or clean status. Workspace "
+            "observations cover only the candidate workspace; no external directory "
+            "or system was inspected. Unknown state proves neither success nor failure."
+            if any(candidate.get("repository_state") is not None for candidate in anonymous)
+            else ""
+        )
         prompt = (
-            f"{rubric}\n\nOriginal request:\n{original_request}\n\n"
+            f"{rubric}{repository_guidance}\n\nOriginal request:\n{original_request}\n\n"
             f"Candidate A: {paths[0]}\nCandidate B: {paths[1]}\n\n"
             + (
                 "Candidate A was already evaluated for this exact historical artifact. "
@@ -1080,19 +1193,132 @@ def _pricing() -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _fetch_dynamic_pricing(url: str) -> dict[str, Any]:
-    refresh_bucket = int(time.monotonic() // DYNAMIC_PRICING_REFRESH_SECONDS)
-    return _cached_dynamic_pricing(url, refresh_bucket)
+def _pricing_rows(document: str, heading: str, columns: Sequence[str]) -> list[dict[str, str]]:
+    in_section = False
+    table: list[list[str]] = []
+    for line in document.splitlines():
+        line = line.strip()
+        if line == heading:
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if line.startswith("#"):
+            break
+        if line.startswith("|"):
+            table.append([cell.strip() for cell in line.strip("|").split("|")])
+        elif table:
+            break
+    if len(table) < 3 or not set(columns).issubset(table[0]):
+        return []
+    if not all(re.fullmatch(r":?-+:?", cell) for cell in table[1]):
+        return []
+    return [
+        {column: row[index] for index, column in enumerate(table[0])}
+        for row in table[2:]
+        if len(row) == len(table[0])
+    ]
 
 
-@functools.lru_cache(maxsize=2)
-def _cached_dynamic_pricing(url: str, refresh_bucket: int) -> dict[str, Any]:
-    try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            loaded = json.loads(response.read().decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+def _price_columns(row: Mapping[str, str], columns: Mapping[str, str]) -> TokenPrices | None:
+    prices: TokenPrices = {}
+    for name, column in columns.items():
+        cell = row[column]
+        if cell == "-":
+            continue
+        match = re.fullmatch(r"\$(\d+(?:\.\d+)?)\s*(?:/\s*MTok)?", cell)
+        if match is None:
+            return None
+        price = float(match.group(1))
+        if not math.isfinite(price):
+            return None
+        prices[name] = price
+    return prices if "input" in prices and "output" in prices else None
+
+
+def _parse_first_party_pricing(provider: str, document: str) -> dict[str, ModelPrices]:
+    long_columns: dict[str, str] = {}
+    if provider == "openai":
+        heading = "### Standard pricing data"
+        columns = {
+            "input": "Short context input",
+            "cached_input": "Short context cached input",
+            "cache_write": "Short context cache writes",
+            "output": "Short context output",
+        }
+        long_columns = {
+            name: column.replace("Short context", "Long context")
+            for name, column in columns.items()
+        }
+    elif provider == "anthropic":
+        heading = "## Model pricing"
+        columns = {
+            "input": "Base Input Tokens",
+            "cached_input": "Cache Hits & Refreshes",
+            "cache_write_5m": "5m Cache Writes",
+            "cache_write_1h": "1h Cache Writes",
+            "output": "Output Tokens",
+        }
+    else:
         return {}
-    return loaded if isinstance(loaded, dict) else {}
+
+    models: dict[str, ModelPrices] = {}
+    required_columns = ("Model", *columns.values(), *long_columns.values())
+    for row in _pricing_rows(document, heading, required_columns):
+        model = row["Model"].split(" (", 1)[0].strip("`")
+        if provider == "anthropic":
+            match = re.fullmatch(r"Claude ([A-Za-z]+) (\d+(?:\.\d+)?)", model)
+            if match is None:
+                continue
+            family = match.group(1).lower()
+            version = match.group(2).replace(".", "-")
+            if version.split("-")[0] == "3":
+                model = f"claude-{version}-{family}"
+            else:
+                model = f"claude-{family}-{version}"
+        elif re.fullmatch(r"[a-z][a-z0-9.-]+", model) is None:
+            continue
+        standard = _price_columns(row, columns)
+        if standard is None:
+            continue
+        rate: ModelPrices = {"input": standard["input"], "output": standard["output"]}
+        if "cached_input" in standard:
+            rate["cached_input"] = standard["cached_input"]
+        if "cache_write" in standard:
+            rate["cache_write"] = standard["cache_write"]
+        if provider == "anthropic":
+            if len(standard) != len(columns):
+                continue
+            rate["cache_write"] = standard["cache_write_5m"]
+            rate["cache_write_5m"] = standard["cache_write_5m"]
+            rate["cache_write_1h"] = standard["cache_write_1h"]
+        elif any(row[column] != "-" for column in long_columns.values()):
+            long_context = _price_columns(row, long_columns)
+            if long_context is None:
+                continue
+            # OpenAI's standard short/long-context table splits at 272K input tokens.
+            rate["long_context_threshold_input_tokens"] = 272_000
+            rate["long_context"] = long_context
+        models[model] = rate
+    return models
+
+
+def _fetch_dynamic_pricing(provider: str, url: str) -> dict[str, ModelPrices]:
+    refresh_bucket = int(time.monotonic() // DYNAMIC_PRICING_REFRESH_SECONDS)
+    return _cached_dynamic_pricing(provider, url, refresh_bucket)
+
+
+@functools.lru_cache(maxsize=4)
+def _cached_dynamic_pricing(provider: str, url: str, refresh_bucket: int) -> dict[str, ModelPrices]:
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Codex-Replay/1.0", "Accept": "text/markdown"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            document = response.read().decode("utf-8")
+    except (OSError, UnicodeError):
+        return {}
+    return _parse_first_party_pricing(provider, document)
 
 
 def _configured_model_name(models: Mapping[str, Any], model: str) -> str | None:
@@ -1117,55 +1343,27 @@ def _configured_rate(models: Mapping[str, Any], model: str) -> Mapping[str, Any]
     return None
 
 
-def _dynamic_rate(pricing: Mapping[str, Any], model: str) -> dict[str, Any] | None:
-    fallback = pricing.get("dynamic_fallback")
-    if not isinstance(fallback, Mapping):
+def _dynamic_rate(pricing: Mapping[str, Any], model: str, provider: str) -> ModelPrices | None:
+    provider = {"codex": "openai", "claude": "anthropic"}.get(provider.lower(), provider.lower())
+    sources = pricing.get("dynamic_sources")
+    if not isinstance(sources, Mapping):
         return None
-    url = fallback.get("url")
+    url = sources.get(provider)
     if not isinstance(url, str) or not url:
         return None
-    dynamic_models = _fetch_dynamic_pricing(url)
+    dynamic_models = _fetch_dynamic_pricing(provider, url)
     candidate = dynamic_models.get(model)
-    if not isinstance(candidate, Mapping):
+    if candidate is None:
         configured_models = pricing.get("models")
         if isinstance(configured_models, Mapping):
             configured_name = _configured_model_name(configured_models, model)
             if configured_name is not None:
                 candidate = dynamic_models.get(configured_name)
-    if not isinstance(candidate, Mapping):
-        return None
-
-    fields = {
-        "input": "input_cost_per_token",
-        "cached_input": "cache_read_input_token_cost",
-        "cache_write": "cache_creation_input_token_cost",
-        "cache_write_5m": "cache_creation_input_token_cost",
-        "cache_write_1h": "cache_creation_input_token_cost_above_1hr",
-        "output": "output_cost_per_token",
-    }
-    rate: dict[str, Any] = {}
-    for target, source in fields.items():
-        value = candidate.get(source)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-            rate[target] = float(value) * 1_000_000
-    if "input" not in rate or "output" not in rate:
-        return None
-
-    for name in candidate:
-        threshold_match = re.search(r"_above_(\d+)k_tokens(?:_|$)", name)
-        if threshold_match is None:
-            continue
-        threshold = int(threshold_match.group(1)) * 1_000
-        long_context: dict[str, float] = {}
-        for target, source in fields.items():
-            value = candidate.get(f"{source}_above_{threshold // 1_000}k_tokens")
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-                long_context[target] = float(value) * 1_000_000
-        if "input" in long_context and "output" in long_context:
-            rate["long_context_threshold_input_tokens"] = threshold
-            rate["long_context"] = long_context
-            break
-    return rate
+    if candidate is None and provider == "anthropic":
+        # Pre-4.6 Claude snapshots append a date to the family/version model ID.
+        model_name = re.sub(r"-\d{8}$", "", model.replace(".", "-"))
+        candidate = dynamic_models.get(model_name)
+    return candidate
 
 
 def _usage_value(record: UsageRecord | Mapping[str, Any], name: str) -> int:
@@ -1229,7 +1427,7 @@ def estimate_api_equivalent_cost(records: Sequence[UsageRecord]) -> dict[str, An
     missing: list[str] = []
     dynamic: list[str] = []
     for record in records:
-        rate = _dynamic_rate(pricing, record.model)
+        rate = _dynamic_rate(pricing, record.model, record.provider)
         if rate is not None:
             dynamic.append(record.model)
         if rate is None:
@@ -1277,6 +1475,7 @@ def generate_report(
     codex_result: Mapping[str, Any] | None = None,
     reviews: Mapping[str, Any] | None = None,
     limitations: Sequence[str] = (),
+    historical_usage_shared: bool = False,
 ) -> dict[str, Any]:
     candidates = {
         "claude": _jsonable(claude_candidate) if claude_candidate else None,
@@ -1285,6 +1484,7 @@ def generate_report(
     return {
         "schema_version": 3,
         "status": "completed",
+        "historical_usage_shared": historical_usage_shared,
         "original_request": original_request,
         "baseline": _jsonable(baseline),
         "capabilities": _jsonable(parity_report),
@@ -1298,7 +1498,15 @@ def generate_report(
             "codex": normalize_usage(codex_usage),
         },
         "estimated_cost": {
-            "claude": estimate_api_equivalent_cost(claude_usage),
+            "claude": (
+                {
+                    "status": "shared",
+                    "usd": None,
+                    "basis": "No standalone usage — shared across chunks",
+                }
+                if historical_usage_shared
+                else estimate_api_equivalent_cost(claude_usage)
+            ),
             "codex": estimate_api_equivalent_cost(codex_usage),
         },
         "codex_execution": _jsonable(codex_result or {}),
@@ -1308,6 +1516,9 @@ def generate_report(
 
 
 def render_report_html(report: Mapping[str, Any]) -> str:
+    shared_usage = report.get("historical_usage_shared") is True
+    shared_notice = "No standalone usage — shared across chunks"
+
     def esc(value: object) -> str:
         return html.escape(str(value))
 
@@ -1353,12 +1564,16 @@ def render_report_html(report: Mapping[str, Any]) -> str:
         return normalize_usage(raw_usage)
 
     def cost_usd(provider: str) -> float | None:
+        if provider == "claude" and shared_usage:
+            return None
         value = mapping(mapping(report.get("estimated_cost")).get(provider)).get("usd")
         if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
             return float(value)
         return None
 
     def format_cost(provider: str) -> str:
+        if provider == "claude" and shared_usage:
+            return "Shared"
         value = cost_usd(provider)
         return f"${value:.6f}" if value is not None else "Unavailable"
 
@@ -1378,6 +1593,8 @@ def render_report_html(report: Mapping[str, Any]) -> str:
         return f'<div class="{classes}"><span>{esc(label)}</span><strong>{rendered}</strong></div>'
 
     def usage_rows(provider: str) -> str:
+        if provider == "claude" and shared_usage:
+            return f'<tr><td colspan="2">{esc(shared_notice)}</td></tr>'
         totals = usage_totals(provider)
         labels = (
             (
@@ -1669,7 +1886,7 @@ details {{ border-top:1px solid var(--line); padding:12px 0; }} summary {{ curso
 <article class="card">
 <div class="provider"><h2>Historical Claude</h2></div>
 {metric("Model", claude.get("model"), code=True)}
-{metric("Task execution time", format_seconds(historical_request_seconds))}
+{metric("Task execution time", "Shared" if shared_usage else format_seconds(historical_request_seconds))}
 {metric("Estimated API-equivalent cost", format_cost("claude"), comparison=comparison("claude"))}
 <table><tbody>{usage_rows("claude")}</tbody></table>
 </article>

@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Bakeoff"
   short_description: "Open independent Replay sessions in the available browser"
-  default_prompt: "Use $codex-bakeoff to open Codex Bakeoff in the Codex in-app browser, or the system browser in Codex CLI. Start an independent session on an automatically available loopback port. Do not run the workflow in chat."
+  default_prompt: "Use $codex-bakeoff to open Codex Bakeoff in the available browser. Start an independent session on an automatically available loopback port. Do not run the workflow in chat."

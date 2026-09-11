@@ -98,10 +98,15 @@ class LeanReplayTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_manual_model_is_accepted_when_catalog_discovery_is_unavailable(self) -> None:
-        self.assertEqual(
-            replay_engine._selected_model("gpt-manually-reviewed", self.root / "missing.json"),
-            "gpt-manually-reviewed",
-        )
+        with mock.patch.object(
+            replay_engine,
+            "_app_server_codex_models",
+            side_effect=replay_engine.ReplayError("Model discovery unavailable"),
+        ):
+            self.assertEqual(
+                replay_engine._selected_model("gpt-manually-reviewed", self.root / "missing.json"),
+                "gpt-manually-reviewed",
+            )
         with self.assertRaisesRegex(replay_engine.ReplayError, "not locally available"):
             replay_engine._selected_model("gpt-manually-reviewed", self.root / "models.json")
 
@@ -1083,7 +1088,7 @@ class LeanReplayTests(unittest.TestCase):
         self.assertEqual(target["environment"]["type"], "worktree")
         self.assertEqual(target["environment"]["startingState"]["branchName"], "a" * 40)
 
-    def test_non_git_baseline_requires_file_classification(self) -> None:
+    def test_non_git_baseline_defaults_current_files_to_excluded(self) -> None:
         repository = self.root / "greenfield"
         repository.mkdir()
         (repository / "page.html").write_text("created\n", encoding="utf-8")
@@ -1113,7 +1118,12 @@ class LeanReplayTests(unittest.TestCase):
         )
         self.assertEqual(classified["kind"], "unclassified_directory")
         self.assertFalse(file_selection["complete"])
-        self.assertEqual(file_selection["unclassified_files"], ["page.html"])
+        self.assertEqual(file_selection["unclassified_files"], [])
+        self.assertEqual(
+            [item["path"] for item in file_selection["classifications"]["exclude"]],
+            ["page.html"],
+        )
+        self.assertEqual(file_selection["transcript_inferred_files"], [])
 
         prepare_args.created_by_claude = ["page.html"]
         prepare_args.confirm_file_selection = True
@@ -1125,6 +1135,214 @@ class LeanReplayTests(unittest.TestCase):
         self.assertTrue(file_selection["complete"])
         self.assertEqual(classified["kind"], "empty_directory")
         self.assertEqual(baseline["kind"], "unclassified_directory")
+
+    def test_non_git_transcript_files_are_included_by_default(self) -> None:
+        repository = self.root / "greenfield"
+        repository.mkdir()
+        created = repository / "created.html"
+        created.write_text("created\n", encoding="utf-8")
+        (repository / "local.txt").write_text("local\n", encoding="utf-8")
+        baseline = {
+            "kind": "unclassified_directory",
+            "repository": str(repository),
+            "source_kind": "non_git",
+            "beginning_kind": "non_git",
+            "ending_kind": "non_git",
+        }
+        replay = {"historical_changed_files": [str(created)]}
+
+        _, file_selection = replay_engine._classified_baseline(
+            _args(self.root, kind="empty_directory"),
+            baseline,
+            replay,
+        )
+
+        self.assertEqual(file_selection["transcript_inferred_files"], ["created.html"])
+        self.assertEqual(file_selection["transcript_inferred_file_count"], 1)
+        self.assertEqual(
+            [item["path"] for item in file_selection["classifications"]["created_by_claude"]],
+            ["created.html"],
+        )
+        self.assertEqual(
+            [item["path"] for item in file_selection["classifications"]["exclude"]],
+            ["local.txt"],
+        )
+        self.assertEqual(file_selection["unclassified_files"], [])
+
+    def test_explicit_non_git_classification_beats_transcript_inference(self) -> None:
+        repository = self.root / "greenfield"
+        repository.mkdir()
+        inferred = repository / "inferred.txt"
+        inferred.write_text("Claude\n", encoding="utf-8")
+        (repository / "explicit.txt").write_text("chosen\n", encoding="utf-8")
+        baseline = {
+            "kind": "unclassified_directory",
+            "repository": str(repository),
+            "source_kind": "non_git",
+            "beginning_kind": "non_git",
+            "ending_kind": "non_git",
+        }
+        replay = {"historical_changed_files": [str(inferred)]}
+        args = _args(self.root, kind="empty_directory")
+        args.created_by_claude = ["explicit.txt"]
+        args.exclude_file = ["inferred.txt"]
+
+        _, file_selection = replay_engine._classified_baseline(args, baseline, replay)
+
+        self.assertEqual(file_selection["transcript_inferred_files"], ["inferred.txt"])
+        self.assertEqual(
+            [item["path"] for item in file_selection["classifications"]["created_by_claude"]],
+            ["explicit.txt"],
+        )
+        self.assertEqual(
+            [item["path"] for item in file_selection["classifications"]["exclude"]],
+            ["inferred.txt"],
+        )
+
+    def test_dirty_git_transcript_files_are_included_until_user_confirms(self) -> None:
+        repository = self._git_repository("dirty-inference")
+        inferred = repository / "inferred.txt"
+        inferred.write_text("Claude\n", encoding="utf-8")
+        (repository / "local.txt").write_text("local\n", encoding="utf-8")
+        baseline = {
+            "kind": "git_commit",
+            "repository": str(repository),
+            "source_kind": "git",
+            "beginning_kind": "git",
+            "ending_kind": "git",
+        }
+        replay = {"historical_changed_files": [str(inferred)]}
+        args = _args(self.root, kind="git_commit")
+
+        _, file_selection = replay_engine._classified_baseline(args, baseline, replay)
+
+        self.assertEqual(file_selection["transcript_inferred_files"], ["inferred.txt"])
+        self.assertEqual(
+            [item["path"] for item in file_selection["claude_output_changes"]],
+            ["inferred.txt"],
+        )
+
+        args.confirm_file_selection = True
+        _, overridden = replay_engine._classified_baseline(args, baseline, replay)
+        self.assertEqual(overridden["transcript_inferred_files"], ["inferred.txt"])
+        self.assertEqual(overridden["claude_output_changes"], [])
+
+    def test_explicit_git_selection_beats_transcript_inference(self) -> None:
+        repository = self._git_repository("dirty-explicit")
+        inferred = repository / "inferred.txt"
+        inferred.write_text("Claude\n", encoding="utf-8")
+        (repository / "explicit.txt").write_text("chosen\n", encoding="utf-8")
+        baseline = {
+            "kind": "git_commit",
+            "repository": str(repository),
+            "source_kind": "git",
+            "beginning_kind": "git",
+            "ending_kind": "git",
+        }
+        replay = {"historical_changed_files": [str(inferred)]}
+        args = _args(self.root, kind="git_commit")
+        args.claude_output_file = ["explicit.txt"]
+
+        _, file_selection = replay_engine._classified_baseline(args, baseline, replay)
+
+        self.assertEqual(file_selection["transcript_inferred_files"], ["inferred.txt"])
+        self.assertEqual(
+            [item["path"] for item in file_selection["claude_output_changes"]],
+            ["explicit.txt"],
+        )
+
+    def test_recovered_transcript_diff_files_are_included_by_default(self) -> None:
+        repository = self.root / "greenfield"
+        repository.mkdir()
+        (repository / "recovered.txt").write_text("Claude\n", encoding="utf-8")
+        baseline = {
+            "kind": "unclassified_directory",
+            "repository": str(repository),
+            "source_kind": "non_git",
+            "beginning_kind": "non_git",
+            "ending_kind": "non_git",
+        }
+        replay = {
+            "source_path": str(self.root / "transcript.jsonl"),
+            "message_uuid": "message-1",
+        }
+        with mock.patch.object(
+            replay_engine._discovery(),
+            "recover_historical_solution",
+            return_value={"changed_files": ["recovered.txt"]},
+        ):
+            _, file_selection = replay_engine._classified_baseline(
+                _args(self.root, kind="empty_directory"),
+                baseline,
+                replay,
+            )
+
+        self.assertEqual(file_selection["transcript_inferred_files"], ["recovered.txt"])
+        self.assertEqual(
+            [item["path"] for item in file_selection["classifications"]["created_by_claude"]],
+            ["recovered.txt"],
+        )
+
+    def test_transcript_inference_ignores_outside_and_unselectable_files(self) -> None:
+        repository = self.root / "greenfield"
+        repository.mkdir()
+        selectable = repository / "selectable.txt"
+        selectable.write_text("Claude\n", encoding="utf-8")
+        unselectable = repository / "protected.txt"
+        unselectable.write_text("protected\n", encoding="utf-8")
+        outside = self.root / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        selection = {
+            "source_root": str(repository),
+            "candidates": [
+                {"path": "selectable.txt", "selectable": True},
+                {"path": "protected.txt", "selectable": False},
+            ],
+        }
+        replay = {
+            "historical_changed_files": [
+                str(selectable),
+                str(unselectable),
+                str(outside),
+            ]
+        }
+
+        inferred = replay_engine._transcript_inferred_paths(replay, {}, selection)
+
+        self.assertEqual(inferred, ["selectable.txt"])
+
+    def test_reviewed_ending_commit_is_not_used_as_transcript_evidence(self) -> None:
+        repository = self.root / "reviewed-ending"
+        repository.mkdir()
+        (repository / "recovered.txt").write_text("Claude\n", encoding="utf-8")
+        baseline = {
+            "beginning_kind": "git",
+            "ending_kind": "git",
+            "commit": "a" * 40,
+            "ending_commit": "b" * 40,
+            "ending_commit_reviewed_override": True,
+        }
+        replay = {
+            "source_path": str(self.root / "transcript.jsonl"),
+            "message_uuid": "message-1",
+        }
+        selection = {
+            "source_root": str(repository),
+            "candidates": [{"path": "recovered.txt", "selectable": True}],
+        }
+        with mock.patch.object(
+            replay_engine._discovery(),
+            "recover_historical_solution",
+            return_value={"changed_files": ["recovered.txt"]},
+        ) as recover:
+            inferred = replay_engine._transcript_inferred_paths(
+                replay,
+                baseline,
+                selection,
+            )
+
+        self.assertEqual(inferred, ["recovered.txt"])
+        self.assertIsNone(recover.call_args.kwargs["ending_commit"])
 
     def test_reviewed_git_commit_recovers_from_failed_baseline_discovery(self) -> None:
         repository = self._git_repository("reviewed-baseline")
@@ -1769,6 +1987,7 @@ class LeanReplayTests(unittest.TestCase):
             {
                 "source_path": str(self.root / "rollout.jsonl"),
                 "message_uuid": "message-1",
+                "historical_usage_shared": True,
             }
         )
         candidate = replay_engine._execution().CandidateSolution(
@@ -1871,6 +2090,7 @@ class LeanReplayTests(unittest.TestCase):
             )
         self.assertEqual(completed["status"], "completed")
         restored = generate_report.call_args.kwargs["claude_candidate"]
+        self.assertTrue(generate_report.call_args.kwargs["historical_usage_shared"])
         self.assertEqual(restored.diff, candidate.diff)
         self.assertEqual(restored.final_response, "historical response")
 
